@@ -476,7 +476,17 @@ async def lifespan(app: FastAPI):
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # Cluster mode. No-op unless cluster.enabled is set; see omlx/cluster/.
+    if _server_state.global_settings is not None:
+        from .cluster import bootstrap as cluster_bootstrap
+
+        cluster_bootstrap.install(_server_state.global_settings)
+
     yield
+
+    from .cluster import bootstrap as cluster_bootstrap
+
+    cluster_bootstrap.shutdown()
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
     if preload_task is not None and not preload_task.done():

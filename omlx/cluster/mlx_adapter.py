@@ -41,38 +41,47 @@ from __future__ import annotations
 import logging
 import pickle
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
-# Model families that implement `shard(group)` in mlx-lm 0.31.3. This is only a
-# fast pre-flight answer for the admin UI; the authoritative check is
-# `hasattr(model, "shard")` after loading, since the list moves upstream.
-KNOWN_TENSOR_PARALLEL_ARCHITECTURES = frozenset(
-    {
-        "llama",
-        "qwen2",
-        "qwen3",
-        "qwen3_5",
-        "qwen3_5_moe",
-        "deepseek_v2",
-        "deepseek_v3",
-        "deepseek_v3_2",
-        "glm4_moe",
-        "glm4_moe_lite",
-        "gpt_oss",
-        "kimi_k25",
-        "minimax",
-        "step3p5",
-        "longcat_flash",
-        "longcat_flash_ngram",
-        "exaone_moe",
-        "ministral3",
-        "iquestloopcoder",
-    }
-)
+@lru_cache(maxsize=1)
+def tensor_parallel_architectures() -> frozenset[str]:
+    """Model families whose `Model` class implements `shard(group)`.
+
+    Derived by inspecting the installed mlx-lm rather than hard-coded. The set
+    moves with every mlx-lm release, and a stale allow-list is worse than none:
+    it either refuses a model that would have worked or promises one that will
+    not. A hand-written version of this list was wrong in three places against
+    mlx-lm 0.31.3.
+
+    This is only a fast answer for the admin UI and preflight. The
+    authoritative check is `parallelism_support()` on the loaded model.
+    """
+    import importlib
+    import io
+    import pkgutil
+    from contextlib import redirect_stderr, redirect_stdout
+
+    import mlx_lm.models
+
+    found: set[str] = set()
+    # Some model modules print installation hints on import; keep that noise
+    # out of the daemon's own stdout.
+    sink = io.StringIO()
+    with redirect_stdout(sink), redirect_stderr(sink):
+        for module in pkgutil.iter_modules(mlx_lm.models.__path__):
+            try:
+                loaded = importlib.import_module(f"mlx_lm.models.{module.name}")
+            except BaseException:  # noqa: BLE001 - optional deps, bad imports
+                continue
+            model_cls = getattr(loaded, "Model", None)
+            if model_cls is not None and hasattr(model_cls, "shard"):
+                found.add(module.name)
+    return frozenset(found)
 
 
 @dataclass(frozen=True)
@@ -199,6 +208,12 @@ def load_sharded(model_path: str, session: DistributedSession, *, pipeline: bool
     group arguments is ever a real group. `pipeline=True` splits by layer depth
     and requires the model to expose `pipeline(group)`; the default splits by
     tensor and requires `shard(group)`.
+
+    Note that **no model shipped in mlx-lm 0.31.3 defines `pipeline`** - all 21
+    shardable families implement `shard` only. The pipeline path is therefore
+    unreachable with the current mlx-lm and is kept because upstream is
+    actively adding pipeline support for the largest models. `load` refuses
+    rather than proceeding if the loaded model cannot do what was asked.
     """
     from mlx_lm.utils import sharded_load
 

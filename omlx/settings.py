@@ -25,7 +25,7 @@ import json
 import logging
 import os
 import shutil
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -776,6 +776,42 @@ class IntegrationSettings:
 
 
 @dataclass
+class ClusterSettings:
+    """Multi-machine cluster serving settings.
+
+    Off by default. While `enabled` is False the daemon never imports the
+    cluster machinery, never advertises over Bonjour, and never spawns a rank
+    process, so behaviour is identical to a build without the feature.
+    """
+
+    enabled: bool = False
+    # Shared secret. Peers only form a cluster with matching keys, and only a
+    # truncated hash of it is ever advertised - the Bonjour TXT record is
+    # broadcast to the whole LAN.
+    cluster_key: str = ""
+    # "auto" picks the fastest transport the cabling and RDMA state allow,
+    # falling back to TCP "ring". Pin to a specific backend to override.
+    backend: str = "auto"
+    # The model sharded across the cluster. Each node continues to serve its
+    # own local models alongside this one.
+    model: str = ""
+    # Split by layer depth instead of by tensor. No model in mlx-lm 0.31.3
+    # supports this yet; see omlx/cluster/mlx_adapter.py.
+    pipeline: bool = False
+    discovery_interval_seconds: float = 5.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ClusterSettings:
+        """Create from dictionary."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
 class GlobalSettings:
     """
     Global settings for oMLX.
@@ -806,6 +842,7 @@ class GlobalSettings:
     idle_timeout: ModelIdleTimeoutSettings = field(
         default_factory=ModelIdleTimeoutSettings
     )
+    cluster: ClusterSettings = field(default_factory=ClusterSettings)
 
     @classmethod
     def load(
@@ -903,6 +940,8 @@ class GlobalSettings:
                 self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
                     data["idle_timeout"]
                 )
+            if "cluster" in data:
+                self.cluster = ClusterSettings.from_dict(data["cluster"])
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse settings file {path}: {e}")
@@ -1178,6 +1217,7 @@ class GlobalSettings:
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
+            "cluster": self.cluster.to_dict(),
         }
 
         try:
@@ -1462,6 +1502,7 @@ class GlobalSettings:
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
+            "cluster": self.cluster.to_dict(),
         }
 
 
