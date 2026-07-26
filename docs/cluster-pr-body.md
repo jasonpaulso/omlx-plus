@@ -4,8 +4,14 @@ Adds an `omlx/cluster/` package that shards a single model across several
 machines using `mlx.distributed`, so a model too large for any one Mac fits on
 the group.
 
-**Off by default.** Nothing in the package is touched at request time unless
-cluster mode is enabled, and single-node behaviour is unchanged.
+**Off by default** (`cluster.enabled = false`). The daemon's only contact with
+the package is `bootstrap.install()` at startup, which returns immediately when
+the setting is off. Single-node behaviour is unchanged.
+
+**Scope:** this is the foundation — the launch contract, the rank worker,
+topology detection, preflight and discovery, all hardware-verified. It does
+**not** include scheduler or KV-cache integration, and no HTTP request is
+served by a cluster yet. See "What is NOT verified" for the precise boundary.
 
 ## Why this shape
 
@@ -70,8 +76,20 @@ null matrix entry and downgrades the backend rather than launching a run that
 would hang.
 
 **Scheduler and paged-cache integration is not in this PR.** The worker runs
-its own lockstep greedy loop. Wiring the existing scheduler and tiered cache to
-be rank-aware is the deep work and is deliberately separate — see below.
+its own lockstep greedy decode loop, independent of oMLX's scheduler. Nothing
+routes an HTTP request to a cluster yet: `bootstrap.install()` starts peer
+discovery and no more. Concretely, still to build:
+
+- rank-aware admission, batch composition, prefill segmentation and eviction,
+  all decided on rank 0 and broadcast;
+- the paged KV cache made lockstep-safe, and `(world_size, rank, parallelism)`
+  folded into the SSD cold-tier block signature so a 4-node cluster's blocks
+  are not reused by a 2-node one;
+- the abort protocol, request routing, and the admin UI.
+
+The prerequisite for that work is an audit of every local-only divergence
+source in the 10.9k-line scheduler — local memory pressure, wall-clock
+decisions, local cache hits, iteration order. That audit has not been done.
 
 ## Findings that contradict the common understanding
 
