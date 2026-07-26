@@ -20,6 +20,7 @@ import logging
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -124,6 +125,43 @@ class LocalCluster:
             )
             self.ranks.append(RankProcess(rank=rank, process=process))
             logger.info("cluster: spawned rank %d (pid %d)", rank, process.pid)
+
+    def wait_until_ready(
+        self, port: int, host: str = "127.0.0.1", *, timeout: float = 60.0
+    ) -> bool:
+        """Block until it is safe to start peer ranks on other machines.
+
+        Peers must not be told to start before this returns. The ring backend
+        gives a connecting peer a bounded retry window; a peer that starts
+        first burns it against a socket that does not exist yet and dies with
+        `[ring] Couldn't connect (error: 65)`, which reads like a firewall or
+        routing fault and is not one.
+
+        The port being *closed* is ambiguous - it means either "not open yet"
+        or "already connected and moved on", and those cannot be told apart
+        from outside. So a closed port is not treated as failure. The only
+        real failure is a rank that died, which is checked directly. This
+        returns as soon as the socket appears, and otherwise waits out a short
+        grace period before letting the caller proceed.
+        """
+        import socket
+
+        grace_deadline = time.monotonic() + min(timeout, 5.0)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not all(r.alive for r in self.ranks):
+                logger.error("cluster: a rank exited before the world formed")
+                return False
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(1.0)
+                if probe.connect_ex((host, port)) == 0:
+                    return True
+            if time.monotonic() > grace_deadline:
+                # Never saw the socket, but nothing has died: the ranks are
+                # most likely already past init because they are colocated.
+                return True
+            time.sleep(0.25)
+        return all(r.alive for r in self.ranks)
 
     @property
     def leader(self) -> RankProcess | None:
