@@ -3,9 +3,15 @@
 Running one model across several Macs, so a model that does not fit on any
 single machine fits on the group.
 
-The feature is off by default. With `cluster.enabled = false` nothing in
-`omlx/cluster/` is touched at request time and single-node behaviour is
-unchanged.
+The feature is off by default. With `cluster.enabled = false` the daemon's only
+contact with `omlx/cluster/` is `bootstrap.install()` at startup, which returns
+immediately; single-node behaviour is unchanged.
+
+This document describes the foundation that exists today: the launch contract,
+the rank worker, topology detection, preflight and discovery. Scheduler and
+KV-cache integration are **not** built yet, so no HTTP request is served by a
+cluster — driving one currently means going through `LocalCluster` directly, as
+shown at the end.
 
 ## What this is built on
 
