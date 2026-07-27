@@ -279,13 +279,46 @@ class ClusterManager:
         try:
             self._form(model_id)
         except Exception as exc:  # noqa: BLE001 - reported, never half-formed
-            self._error = str(exc)
-            logger.exception("cluster: formation failed")
+            # Read the attempted backend before tearing down; teardown clears it.
+            attempted = self._backend
             self.teardown()
-            raise ClusterFormationError(str(exc)) from exc
+            if not self._may_fall_back(attempted):
+                self._error = str(exc)
+                logger.exception("cluster: formation failed")
+                raise ClusterFormationError(str(exc)) from exc
+
+            # `auto` means the fastest transport that *works*, not the fastest
+            # the cabling suggests. RDMA fails at init for reasons no amount of
+            # probing predicts - most often an exhausted protection-domain
+            # pool, whose only real fix is a reboot - and TCP `ring` needs
+            # nothing but an IP route. Refusing to serve because the fast path
+            # is unavailable would be the wrong answer.
+            logger.warning(
+                "cluster: %s failed to form (%s); retrying on TCP ring",
+                attempted,
+                exc,
+            )
+            fallback = f"{attempted} failed to start ({exc}); fell back to ring"
+            try:
+                self._form(model_id, force_backend="ring")
+            except Exception as retry:  # noqa: BLE001
+                self._error = str(retry)
+                logger.exception("cluster: ring fallback also failed")
+                self.teardown()
+                raise ClusterFormationError(str(retry)) from retry
+            self._reason = fallback
         return self.status()
 
-    def _form(self, model_id: str) -> None:
+    def _may_fall_back(self, attempted: str) -> bool:
+        """True when the operator asked for `auto` and RDMA was what failed."""
+        cluster = getattr(self._settings, "cluster", None)
+        return bool(
+            cluster
+            and cluster.backend == "auto"
+            and attempted in ("jaccl", "jaccl-ring")
+        )
+
+    def _form(self, model_id: str, *, force_backend: str | None = None) -> None:
         cluster_settings = getattr(self._settings, "cluster", None)
         if cluster_settings is None or not cluster_settings.enabled:
             raise ClusterFormationError("cluster.enabled is false")
@@ -299,17 +332,15 @@ class ClusterManager:
 
         reports, local_id = self._collect_reports(clients, model_id)
         chosen = topology.plan(reports)
-        backend = (
-            chosen.backend
-            if cluster_settings.backend == "auto"
-            else cluster_settings.backend
-        )
+        if force_backend is not None:
+            backend, reason = force_backend, f"retrying on {force_backend}"
+        elif cluster_settings.backend == "auto":
+            backend, reason = chosen.backend, chosen.reason
+        else:
+            backend = cluster_settings.backend
+            reason = f"pinned to {backend} by settings"
         self._backend = backend
-        self._reason = (
-            chosen.reason
-            if cluster_settings.backend == "auto"
-            else f"pinned to {backend} by settings"
-        )
+        self._reason = reason
         self._missing = list(chosen.missing)
 
         order = self._rank_order(chosen.order, local_id)

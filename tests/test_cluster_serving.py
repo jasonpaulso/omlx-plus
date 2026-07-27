@@ -864,3 +864,64 @@ class TestReplyReader:
         finally:
             os.close(read_fd)
             os.close(write_fd)
+
+
+# =============================================================================
+# Backend fallback
+# =============================================================================
+
+
+class TestBackendFallback:
+    """`auto` means the fastest transport that *works*.
+
+    RDMA fails at init for reasons no probe predicts - most often an exhausted
+    protection-domain pool, whose only real fix is a reboot. Refusing to serve
+    because the fast path is unavailable would be the wrong answer, and TCP
+    `ring` needs nothing but an IP route. Measured on real hardware: two
+    RDMA-ready, correctly cabled Macs still failed with
+    `[jaccl] Couldn't allocate protection domain`.
+    """
+
+    def _manager(self, backend: str, attempts: list) -> ClusterManager:
+        manager = ClusterManager(FakeSettings(), peers=list)
+        manager._settings.cluster.backend = backend
+
+        def fake_form(model_id, *, force_backend=None):
+            attempts.append(force_backend or "planned")
+            if force_backend is None:
+                manager._backend = "jaccl"
+                raise RuntimeError("Couldn't allocate protection domain")
+            manager._backend = force_backend
+
+        manager._form = fake_form
+        return manager
+
+    def test_auto_retries_on_ring(self):
+        attempts: list = []
+        status = self._manager("auto", attempts).form("big-model")
+        assert attempts == ["planned", "ring"]
+        assert status.backend == "ring"
+        assert "protection domain" in status.reason
+        assert "fell back to ring" in status.reason
+
+    def test_a_pinned_backend_is_never_silently_changed(self):
+        attempts: list = []
+        manager = self._manager("jaccl", attempts)
+        with pytest.raises(ClusterFormationError, match="protection domain"):
+            manager.form("big-model")
+        assert attempts == ["planned"]
+
+    def test_a_ring_failure_is_not_retried_as_ring(self):
+        attempts: list = []
+        manager = ClusterManager(FakeSettings(), peers=list)
+        manager._settings.cluster.backend = "auto"
+
+        def fake_form(model_id, *, force_backend=None):
+            attempts.append(force_backend or "planned")
+            manager._backend = "ring"
+            raise RuntimeError("no peers")
+
+        manager._form = fake_form
+        with pytest.raises(ClusterFormationError, match="no peers"):
+            manager.form("big-model")
+        assert attempts == ["planned"]
