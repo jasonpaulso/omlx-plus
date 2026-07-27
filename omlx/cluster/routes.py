@@ -142,6 +142,10 @@ async def report(payload: dict[str, Any]) -> dict[str, Any]:
                     "domain_uuid": b.domain_uuid,
                     "peer_domain_uuid": b.peer_domain_uuid,
                     "peer_model": b.peer_model,
+                    "receptacle": b.receptacle,
+                    # Resolved locally: only this node can map its own
+                    # receptacles to RDMA devices.
+                    "rdma_device": b.rdma_device,
                 }
                 for b in local.buses
             ],

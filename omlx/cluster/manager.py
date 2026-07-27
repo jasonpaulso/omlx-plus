@@ -809,6 +809,8 @@ def _report_from_dict(node_id: str, payload: dict[str, Any]) -> topology.NodeRep
             domain_uuid=b.get("domain_uuid", ""),
             peer_domain_uuid=b.get("peer_domain_uuid"),
             peer_model=b.get("peer_model"),
+            receptacle=b.get("receptacle"),
+            rdma_device=b.get("rdma_device"),
         )
         for b in payload.get("buses", [])
     ]
