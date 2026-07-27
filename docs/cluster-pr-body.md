@@ -87,9 +87,15 @@ discovery and no more. Concretely, still to build:
   are not reused by a 2-node one;
 - the abort protocol, request routing, and the admin UI.
 
-The prerequisite for that work is an audit of every local-only divergence
-source in the 10.9k-line scheduler — local memory pressure, wall-clock
-decisions, local cache hits, iteration order. That audit has not been done.
+The prerequisite for that work — an audit of every local-only divergence source
+in the 10.9k-line scheduler — is in `docs/cluster-scheduler-divergence-audit.md`.
+It found the surface far narrower than expected: **memory-gated admission is
+essentially the whole problem.** `_current_usage_bytes()` reads
+`mx.get_active_memory()` and `get_phys_footprint()`, both machine-local, and
+feeds six admission gates, so two ranks can decide differently about the same
+request and deadlock the collective. Wall-clock, RNG and iteration order are
+already benign for the reasons given there. Cache-hit lookups (49 sites) are
+the one class still unaudited.
 
 ## Findings that contradict the common understanding
 
