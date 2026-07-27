@@ -85,13 +85,16 @@ class ClusterEngine(BatchedEngine):
         if self._loaded:
             return
 
+        from pathlib import Path
+
         from mlx_lm.tokenizer_utils import load as load_tokenizer
 
         from ..utils.tokenizer import get_tokenizer_config
 
         self._tokenizer = await asyncio.to_thread(
             load_tokenizer,
-            self._model_name,
+            # mlx-lm indexes into this with `/`, so it must be a Path.
+            Path(self._model_name),
             get_tokenizer_config(
                 self._model_name, trust_remote_code=self._trust_remote_code
             ),

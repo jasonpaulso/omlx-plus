@@ -152,6 +152,21 @@ def test_parse_browse_line_rmv():
     assert _parse_browse_line(line) == ("Rmv", "omlx-discovery-test-19865")
 
 
+def test_parse_browse_line_before_ten_am():
+    """`dns-sd` pads the hour with a space, not a zero.
+
+    Captured verbatim from a real browse at 09:04. Every other test in this
+    file happened to use an afternoon timestamp, so a two-digit-hour pattern
+    passed all of them while finding no peers at all before 10am - which
+    presented as a LAN with nobody on it.
+    """
+    line = " 9:04:13.991  Add        3   5 local.               _omlx._tcp.          DB6FC0C8-FCE2-5498-B721-D140F6082D9B"
+    assert _parse_browse_line(line) == (
+        "Add",
+        "DB6FC0C8-FCE2-5498-B721-D140F6082D9B",
+    )
+
+
 def test_parse_browse_line_preserves_spaces_in_instance_name():
     line = "15:07:12.727  Add        3  31 local.               _omlx._tcp.          Jason's Mac Studio"
     assert _parse_browse_line(line) == ("Add", "Jason's Mac Studio")

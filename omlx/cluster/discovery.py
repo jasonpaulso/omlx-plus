@@ -290,7 +290,12 @@ def _run_windowed(argv: list[str], window_s: float) -> str:
     return output or ""
 
 
-_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d+$")
+# `dns-sd` pads the hour with a *space*, not a zero, so before 10:00 the
+# timestamp column is `9:04:13.991` and not `09:04:13.991`. Requiring two
+# digits made peer discovery work only after 10am - it found nothing at all
+# for the first ten hours of every day, and the failure looked exactly like a
+# LAN with no peers on it.
+_TIME_RE = re.compile(r"^\d{1,2}:\d{2}:\d{2}\.\d+$")
 
 
 def _parse_browse_line(line: str) -> tuple[str, str] | None:
