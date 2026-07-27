@@ -418,9 +418,11 @@ class FakeManager:
         self.aborted = 0
         self.formed_for = None
         self.torn_down = 0
+        self.formed = False
 
     def form(self, model_id):
         self.formed_for = model_id
+        self.formed = True
 
     def teardown(self):
         self.torn_down += 1

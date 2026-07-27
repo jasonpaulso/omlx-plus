@@ -26,7 +26,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 
 from omlx.admin.auth import require_admin
 from omlx.cluster import preflight, topology
-from omlx.cluster.launcher import LocalCluster, resolve_python
+from omlx.cluster.launcher import DeathWatch, LocalCluster, resolve_python
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,10 @@ _get_manager: Callable[[], Any] | None = None
 # This node's ranks when it is a *follower*. The leader's ranks live in its
 # ClusterManager; a follower has no manager because it decides nothing.
 _follower: LocalCluster | None = None
+# The follower's own deathwatch on itself and on the leader. Without it, a
+# leader that dies leaves this node's rank blocked in a collective holding
+# its shard of the weights until someone notices by hand.
+_follower_watch: DeathWatch | None = None
 
 # What `/cluster/report` worked out about this node, keyed by model id.
 #
@@ -195,6 +199,7 @@ async def start_ranks(payload: dict[str, Any]) -> dict[str, Any]:
             **extra,
         )
         _follower = cluster
+        _start_follower_watch(cluster, payload)
         return {"ok": True, "ranks": [r.rank for r in cluster.ranks]}
 
     try:
@@ -202,6 +207,24 @@ async def start_ranks(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - the leader needs the reason
         logger.exception("cluster: could not start ranks")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@peer_router.get("/ranks/alive", dependencies=[Depends(verify_cluster_key)])
+async def ranks_alive() -> dict[str, Any]:
+    """The ranks running on this machine, read from the process table.
+
+    This is what a deathwatch polls, so it must stay cheap - one process poll
+    per rank, no disk, no subprocess - and it must never probe a collective's
+    port to find out (a probe is not passive; it poisons the handshake).
+    Covers both roles: follower ranks and, on the leader, its own rank 0.
+    """
+    ranks: list[int] = []
+    if _follower is not None:
+        ranks += _follower.alive_ranks()
+    manager = _get_manager() if _get_manager is not None else None
+    if manager is not None:
+        ranks += manager.alive_local_ranks()
+    return {"ranks": sorted(set(ranks))}
 
 
 @peer_router.post("/ranks/stop", dependencies=[Depends(verify_cluster_key)])
@@ -218,8 +241,69 @@ async def stop_ranks() -> dict[str, Any]:
     return {"ok": True, "stopped": stopped}
 
 
+def _start_follower_watch(cluster: LocalCluster, payload: dict[str, Any]) -> None:
+    """Watch this node's own ranks, and the leader that owns them.
+
+    The leader's address is rank 0's ring IP - rank 0 is always on the
+    leader's machine - but its daemon port has to be told to us, so older
+    leaders that do not send one simply get no leader check.
+    """
+    global _follower_watch
+
+    checks: list[tuple[str, Any]] = [
+        ("this node's ranks", lambda: bool(cluster.alive_ranks()))
+    ]
+    leader_port = payload.get("leader_port")
+    ips = list(payload.get("ips") or [])
+    key = getattr(getattr(_settings(), "cluster", None), "cluster_key", "")
+    if leader_port and ips and key:
+        checks.append(
+            ("the leader", _leader_alive_check(ips[0], int(leader_port), key))
+        )
+
+    def on_death(label: str, reason: str) -> None:
+        import threading
+
+        # Runs on the watch thread; a watch that is no longer the current one
+        # belongs to a formation `ranks/start` has already replaced.
+        if threading.current_thread() is not _follower_watch:
+            return
+        logger.error(
+            "cluster: %s %s; stopping this node's ranks", label, reason
+        )
+        cluster.kill()
+        _stop_follower()
+
+    _follower_watch = DeathWatch(checks, on_death)
+    _follower_watch.start()
+
+
+def _leader_alive_check(host: str, port: int, key: str):
+    """True while the leader's daemon still runs a rank 0."""
+    import httpx
+
+    from omlx.cluster.manager import ALIVE_POLL_TIMEOUT_S
+
+    def check() -> bool | None:
+        try:
+            response = httpx.get(
+                f"http://{host}:{port}/cluster/ranks/alive",
+                headers={"X-Cluster-Key": key},
+                timeout=ALIVE_POLL_TIMEOUT_S,
+            )
+            response.raise_for_status()
+        except Exception:  # noqa: BLE001 - unreachable is a strike, not a death
+            return None
+        return 0 in response.json().get("ranks", [])
+
+    return check
+
+
 def _stop_follower() -> int:
-    global _follower
+    global _follower, _follower_watch
+    watch, _follower_watch = _follower_watch, None
+    if watch is not None:
+        watch.stop()
     cluster, _follower = _follower, None
     if cluster is None:
         return 0

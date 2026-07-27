@@ -30,7 +30,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterator
 
 from omlx.cluster import hostfile, preflight, topology
-from omlx.cluster.launcher import LocalCluster, resolve_python
+from omlx.cluster.launcher import DeathWatch, LocalCluster, resolve_python
 from omlx.cluster.protocol import CMD_GENERATE, CMD_LOAD, GenerationSpec
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,9 @@ GENERATE_IDLE_TIMEOUT_S = 600.0
 # empty. A browse plus a resolve is several seconds, and the first request
 # after a daemon restart arrives well inside that.
 PEER_DISCOVERY_GRACE_S = 20.0
+# A liveness poll is one process-table read on the far side; a peer that needs
+# longer than this to answer it is not healthy in any sense that matters.
+ALIVE_POLL_TIMEOUT_S = 3.0
 
 
 class ClusterFormationError(RuntimeError):
@@ -120,6 +123,18 @@ class PeerClient:
         )
         response.raise_for_status()
         return response.json()
+
+    def alive_ranks(self) -> list[int]:
+        """Which ranks the peer's daemon says are running, right now."""
+        import httpx
+
+        response = httpx.get(
+            f"{self.base_url}/cluster/ranks/alive",
+            headers={"X-Cluster-Key": self._key},
+            timeout=ALIVE_POLL_TIMEOUT_S,
+        )
+        response.raise_for_status()
+        return [int(r) for r in response.json().get("ranks", [])]
 
 
 def local_ip() -> str:
@@ -238,6 +253,11 @@ class ClusterManager:
         # Guards the rank-0 pipe. One request in flight, cluster-wide.
         self._pipe = threading.Lock()
         self._busy = False
+        # Guards formation itself: after a fast-fail teardown, every queued
+        # request tries to re-form at once, and they must take turns rather
+        # than race half-built clusters against each other.
+        self._form_lock = threading.Lock()
+        self._watch: DeathWatch | None = None
 
     # -- state -------------------------------------------------------------
 
@@ -270,6 +290,10 @@ class ClusterManager:
 
     def form(self, model_id: str) -> ClusterStatus:
         """Bring a cluster up for `model_id`. Blocking; call it off-loop."""
+        with self._form_lock:
+            return self._form_locked(model_id)
+
+    def _form_locked(self, model_id: str) -> ClusterStatus:
         if self.formed:
             if self._model_id == model_id:
                 return self.status()
@@ -410,8 +434,18 @@ class ClusterManager:
                     "pipeline": bool(cluster_settings.pipeline),
                     "coordinator": launch.get("coordinator"),
                     "ibv_devices": launch.get("ibv_devices"),
+                    # The follower's own deathwatch calls back to this daemon;
+                    # rank 0's ring address is this machine, but the daemon
+                    # port is not derivable from it.
+                    "leader_port": int(self._settings.server.port),
                 },
             )
+
+        # The watch starts before the load, because the load is where a death
+        # is most expensive: every rank is blocked in the collective reading
+        # weights, and without the watch a peer that dies here costs the whole
+        # load timeout before anyone notices.
+        self._start_watch(clients)
 
         reply = self._cluster.command({"op": CMD_LOAD}, timeout=LOAD_TIMEOUT_S)
         if not reply.get("ok"):
@@ -422,6 +456,55 @@ class ClusterManager:
             backend,
             model_id,
         )
+
+    def _start_watch(self, clients: dict[str, PeerClient]) -> None:
+        """Watch every rank, local and remote, from formation onward."""
+        cluster = self._cluster
+        if cluster is None:
+            return
+        checks: list[tuple[str, Any]] = [
+            ("local rank 0", lambda: bool(cluster.alive_ranks()))
+        ]
+        for slot in self._slots:
+            if slot.is_local:
+                continue
+            client = clients.get(slot.node_id)
+            if client is None:
+                continue
+            checks.append(
+                (
+                    f"rank {slot.rank} on {slot.node_id}",
+                    _peer_alive_check(client, slot.rank),
+                )
+            )
+        self._watch = DeathWatch(checks, self._on_rank_death)
+        self._watch.start()
+
+    def _on_rank_death(self, label: str, reason: str) -> None:
+        """A rank is gone. Kill ours, then tear the formation down.
+
+        Runs on the deathwatch thread. The kill comes first because it is the
+        part that matters: closing rank 0's reply pipe is what makes the
+        in-flight request fail now rather than at the idle timeout. Requests
+        queued behind it then find no cluster formed and fail immediately too -
+        and the next fresh request re-forms.
+        """
+        # The callback runs *on* the watch thread, which makes staleness
+        # checkable by identity: a watch the manager no longer owns belongs to
+        # a formation that is already gone, and acting on it would kill the
+        # healthy formation that replaced it.
+        if threading.current_thread() is not self._watch:
+            return
+        self._error = f"{label} died ({reason}); the cluster was torn down"
+        cluster = self._cluster
+        if cluster is not None:
+            cluster.kill()
+        self.teardown()
+
+    def alive_local_ranks(self) -> list[int]:
+        """This daemon's own leader-side ranks that are still running."""
+        cluster = self._cluster
+        return cluster.alive_ranks() if cluster is not None else []
 
     def _await_peers(self, cluster_settings: Any) -> dict[str, PeerClient]:
         """Wait for Bonjour to answer before declaring the fleet empty.
@@ -540,11 +623,16 @@ class ClusterManager:
         Holds the pipe lock for the whole generation: see the class docstring
         for why that is correctness rather than throughput policy.
         """
-        cluster = self._cluster
-        if cluster is None:
-            raise ClusterFormationError("no cluster is formed")
-
         with self._pipe:
+            # Re-read under the lock: a request that queued here may have
+            # outlived the cluster it queued for. The deathwatch tears down
+            # while the pipe is held, and failing now with the real reason
+            # beats writing into a dead process's stdin.
+            cluster = self._cluster
+            if cluster is None:
+                raise ClusterFormationError(
+                    self._error or "no cluster is formed"
+                )
             self._busy = True
             try:
                 for reply in cluster.stream(
@@ -554,6 +642,12 @@ class ClusterManager:
                     if not reply.get("ok", False):
                         raise RuntimeError(reply.get("error", "cluster generate failed"))
                     yield reply
+            except (RuntimeError, OSError, ValueError) as exc:
+                # A closed reply channel is the *symptom*; if the deathwatch
+                # recorded the cause, that is the error worth reporting.
+                if self._error:
+                    raise RuntimeError(self._error) from exc
+                raise
             finally:
                 self._busy = False
 
@@ -568,6 +662,10 @@ class ClusterManager:
 
     def teardown(self) -> None:
         """Stop every rank, local and remote. Safe to call when not formed."""
+        watch, self._watch = self._watch, None
+        if watch is not None:
+            watch.stop()
+
         cluster, self._cluster = self._cluster, None
         slots, self._slots = self._slots, []
 
@@ -589,6 +687,23 @@ class ClusterManager:
                 logger.exception("cluster: local teardown was not clean")
         self._model_id = ""
         self._backend = ""
+
+
+def _peer_alive_check(client: PeerClient, rank: int) -> Callable[[], bool | None]:
+    """A deathwatch check for one remote rank.
+
+    A reachable daemon that does not list the rank is a definitive death; a
+    daemon that cannot be reached at all might just be a LAN blip, so that is
+    only a strike.
+    """
+
+    def check() -> bool | None:
+        try:
+            return rank in client.alive_ranks()
+        except Exception:  # noqa: BLE001 - unreachable, not (yet) dead
+            return None
+
+    return check
 
 
 def _report_from_dict(node_id: str, payload: dict[str, Any]) -> topology.NodeReport:

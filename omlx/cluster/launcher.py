@@ -21,9 +21,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from omlx.cluster import hostfile
 
@@ -32,6 +34,78 @@ logger = logging.getLogger(__name__)
 # init() blocks until the whole world joins; past this we assume someone is
 # never arriving and tear the run down rather than hanging a request forever.
 DEFAULT_JOIN_TIMEOUT_S = 120
+
+# How often a DeathWatch looks, and how many unreachable polls in a row it
+# tolerates before declaring a node gone. A definitive answer ("your rank is
+# not running") fires immediately; unreachability gets patience because the
+# control plane shares the LAN with everything else on the machine, and a
+# wifi blink must not kill a healthy formation.
+DEATHWATCH_INTERVAL_S = 2.0
+DEATHWATCH_STRIKES = 5
+
+
+class DeathWatch(threading.Thread):
+    """Notices a dead rank in seconds, instead of at the idle timeout.
+
+    Without this, a rank that dies leaves every other rank blocked inside a
+    collective - mlx has no fault tolerance - and the only thing that ends the
+    wait is the generate idle timeout (minutes) or the load timeout (longer).
+    The watch polls liveness and fires `on_death` once, at which point the
+    owner kills its local ranks; killing them closes the reply pipe, which is
+    what turns "blocked for ten minutes" into "failed in seconds".
+
+    Each check returns True (alive), False (definitively dead - fires at
+    once), or None (could not tell - counts a strike, fires after
+    `strikes` consecutive misses). Liveness is read from process tables and
+    daemon HTTP, never by connecting to a collective's port: a TCP probe of a
+    ring port is not passive, it poisons the handshake.
+    """
+
+    def __init__(
+        self,
+        checks: list[tuple[str, Callable[[], bool | None]]],
+        on_death: Callable[[str, str], None],
+        *,
+        interval: float | None = None,
+        strikes: int | None = None,
+    ) -> None:
+        super().__init__(name="cluster-deathwatch", daemon=True)
+        self._checks = checks
+        self._on_death = on_death
+        self._interval = DEATHWATCH_INTERVAL_S if interval is None else interval
+        self._strikes = DEATHWATCH_STRIKES if strikes is None else strikes
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        """Stand the watch down. Safe to call from the watch's own callback."""
+        self._stop_event.set()
+        if threading.current_thread() is not self:
+            self.join(timeout=self._interval * 2)
+
+    def run(self) -> None:
+        misses = {label: 0 for label, _ in self._checks}
+        while not self._stop_event.wait(self._interval):
+            for label, check in self._checks:
+                try:
+                    verdict = check()
+                except Exception:  # noqa: BLE001 - a broken check is a miss
+                    verdict = None
+                if verdict is True:
+                    misses[label] = 0
+                    continue
+                if verdict is None:
+                    misses[label] += 1
+                    if misses[label] < self._strikes:
+                        continue
+                    reason = f"unreachable for {misses[label]} checks"
+                else:
+                    reason = "reported dead"
+                if self._stop_event.is_set():
+                    return
+                self._stop_event.set()
+                logger.error("cluster: deathwatch: %s %s", label, reason)
+                self._on_death(label, reason)
+                return
 
 
 @dataclass
@@ -388,6 +462,23 @@ class LocalCluster:
             yield reply
             if reply.get("done") or not reply.get("ok", False):
                 return
+
+    def alive_ranks(self) -> list[int]:
+        """The ranks on this machine whose processes are still running."""
+        return [r.rank for r in self.ranks if r.alive]
+
+    def kill(self) -> None:
+        """Hard-kill every local rank, no shutdown handshake.
+
+        The fast-fail path. A rank blocked in a collective ignores its
+        shutdown command by definition - it is not reading commands - and the
+        polite escalation in `stop()` would spend its whole timeout learning
+        that. Killing rank 0 closes the reply pipe, which is what unblocks a
+        request waiting on a dead cluster.
+        """
+        for entry in self.ranks:
+            if entry.alive:
+                entry.process.kill()
 
     def abort(self) -> bool:
         """Ask a running generation to stop, out of band.

@@ -198,6 +198,12 @@ class ClusterEngine(BatchedEngine):
     ) -> AsyncIterator[GenerationOutput]:
         if not self._loaded:
             await self.start()
+        if not self._manager.formed:
+            # The deathwatch tore the cluster down under us - a rank died.
+            # In-flight requests failed fast; this one arrived after, and
+            # re-forming is a better answer than reporting a death it did not
+            # witness. `form` serializes concurrent attempts itself.
+            await asyncio.to_thread(self._manager.form, self._model_id)
 
         spec = GenerationSpec(
             prompt_ids=self._tokenizer.encode(prompt),
