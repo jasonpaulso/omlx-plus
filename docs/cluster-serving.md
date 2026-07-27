@@ -137,6 +137,14 @@ From the graph: every pair cabled → `jaccl`; a Hamiltonian cycle →
 Thunderbolt cannot route, so a missing cable downgrades the whole cluster
 rather than costing one hop.
 
+**`auto` means the fastest transport that works, not the fastest the cabling
+suggests.** On two RDMA-ready, correctly cabled Macs the topology chose
+`jaccl` and rank 0 died instantly with `[jaccl] Couldn't allocate protection
+domain` — the exhausted pool described above, whose only real fix is a reboot.
+No probe predicts that, so a failed RDMA formation tears down and retries on
+TCP `ring`, and the admin panel reports which transport is actually in use and
+why. A backend pinned in settings is never silently changed.
+
 ## Preflight
 
 RDMA over Thunderbolt needs macOS 26.2+, TB5 silicon, RDMA armed once per
@@ -271,7 +279,8 @@ throughout.
 
 Two Macs on a LAN - an M5 Max MacBook Pro as rank 0 and an M3 Ultra Mac Studio
 as rank 1 - serving `mlx-community/Llama-3.2-1B-Instruct-4bit` tensor-sharded
-over the TCP `ring` backend:
+over the TCP `ring` backend, reached both by pinning `ring` and by leaving the
+default `auto` to try `jaccl` and fall back:
 
 ```
 POST /v1/chat/completions  "Name three colours, comma separated."

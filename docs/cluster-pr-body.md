@@ -69,11 +69,13 @@ client disconnect fails a sixth.
 
 ## What is NOT verified
 
-**JACCL has not been run.** It requires RDMA armed from the Recovery OS on
-every node; only one of the two available machines has it. The JACCL code path
-is written, unit-tested and dormant. Everything hardware-verified above used
-the TCP `ring` backend, which exercises the same launch contract, the same
-lockstep loop, and the same sharding.
+**JACCL has not completed a run.** Both machines now report RDMA armed and a
+bidirectional Thunderbolt edge, so `auto` selects `jaccl` — and rank 0 dies
+instantly with `[jaccl] Couldn't allocate protection domain`, the exhausted
+pool that only a reboot clears. That failure is now handled rather than
+hidden: `auto` retries on TCP `ring` and reports the downgrade. Everything
+hardware-verified above ran on `ring`, which exercises the same launch
+contract, the same lockstep loop and the same sharding.
 
 **The bus-to-RDMA-device mapping is positional.** It matches reality on the one
 cabled machine (`bus_0 → en1 → rdma_en1`, confirmed against the only active
