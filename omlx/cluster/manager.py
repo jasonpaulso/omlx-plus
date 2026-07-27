@@ -358,11 +358,7 @@ class ClusterManager:
             if backend == "ring"
             else hostfile.DEFAULT_JACCL_COORDINATOR_PORT
         )
-        # Probe the address rank 0 actually binds - the one in the hostfile.
-        # `127.0.0.1` never answers: the ring backend binds the specific
-        # interface it was given, so a loopback probe silently falls through to
-        # the grace-period path and the readiness check checks nothing.
-        if not self._cluster.wait_until_ready(ready_port, host=ips[0]):
+        if not self._cluster.wait_until_ready(ready_port):
             raise ClusterFormationError("rank 0 died before the world formed")
 
         for slot in slots[1:]:

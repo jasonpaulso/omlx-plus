@@ -179,9 +179,7 @@ class LocalCluster:
             )
             logger.info("cluster: spawned rank %d (pid %d)", rank, process.pid)
 
-    def wait_until_ready(
-        self, port: int, host: str = "127.0.0.1", *, timeout: float = 60.0
-    ) -> bool:
+    def wait_until_ready(self, port: int, *, timeout: float = 60.0) -> bool:
         """Block until it is safe to start peer ranks on other machines.
 
         Peers must not be told to start before this returns. The ring backend
@@ -190,31 +188,59 @@ class LocalCluster:
         `[ring] Couldn't connect (error: 65)`, which reads like a firewall or
         routing fault and is not one.
 
-        The port being *closed* is ambiguous - it means either "not open yet"
-        or "already connected and moved on", and those cannot be told apart
-        from outside. So a closed port is not treated as failure. The only
-        real failure is a rank that died, which is checked directly. This
-        returns as soon as the socket appears, and otherwise waits out a short
-        grace period before letting the caller proceed.
-        """
-        import socket
+        **Readiness is read from the process table, never by connecting.** A
+        TCP probe of the ring port is not a passive observation: the backend
+        accepts it, takes it for the peer it is waiting on, and the handshake
+        is then poisoned for the real peer - both ranks sit there until they
+        time out with error 60, on a network where nothing is wrong. That cost
+        an afternoon; do not reintroduce a connect here.
 
+        Nothing observable is not treated as failure - the ranks may already be
+        past init - so a short grace period lets the caller proceed. The only
+        real failure is a rank that died, which is checked directly.
+        """
         grace_deadline = time.monotonic() + min(timeout, 5.0)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if not all(r.alive for r in self.ranks):
                 logger.error("cluster: a rank exited before the world formed")
                 return False
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                probe.settimeout(1.0)
-                if probe.connect_ex((host, port)) == 0:
-                    return True
+            if self._is_listening(port):
+                return True
             if time.monotonic() > grace_deadline:
                 # Never saw the socket, but nothing has died: the ranks are
                 # most likely already past init because they are colocated.
                 return True
             time.sleep(0.25)
         return all(r.alive for r in self.ranks)
+
+    def _is_listening(self, port: int) -> bool:
+        """True when one of this node's ranks holds a listening socket on `port`.
+
+        Read-only by construction. The interpreter that ends up listening is
+        not always the direct child - a launcher shim re-execs - so the whole
+        subtree is inspected.
+        """
+        try:
+            import psutil
+        except ImportError:  # pragma: no cover - psutil is a hard dependency
+            return False
+
+        for entry in self.ranks:
+            try:
+                proc = psutil.Process(entry.process.pid)
+                candidates = [proc] + proc.children(recursive=True)
+            except Exception:  # noqa: BLE001 - the rank may have just exited
+                continue
+            for candidate in candidates:
+                try:
+                    connections = candidate.net_connections(kind="tcp")
+                except Exception:  # noqa: BLE001 - permissions, or it exited
+                    continue
+                for conn in connections:
+                    if conn.status == "LISTEN" and conn.laddr.port == port:
+                        return True
+        return False
 
     @property
     def leader(self) -> RankProcess | None:
