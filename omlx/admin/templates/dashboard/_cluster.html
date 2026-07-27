@@ -90,23 +90,29 @@
                 </ul>
             </div>
 
-            <!-- This node's own checklist -->
-            <div x-show="showPreflight && preflight" x-cloak class="border-t border-neutral-100 pt-4">
-                <div class="text-xs text-neutral-400 mb-2"
-                     x-text="`${preflight.chip} · macOS ${preflight.macos.join('.')} · ${preflight.tb_max_gbps}Gb/s`"></div>
-                <ul class="space-y-1.5">
-                    <template x-for="check in preflight.checks" :key="check.name">
-                        <li class="flex items-start gap-2">
-                            <span class="mt-0.5 w-1.5 h-1.5 rounded-full shrink-0"
-                                  :class="check.ok ? 'bg-green-500' : 'bg-amber-500'"></span>
-                            <div>
-                                <div class="text-xs text-neutral-700" x-text="check.detail"></div>
-                                <div x-show="check.remedy" class="text-xs text-neutral-400" x-text="check.remedy"></div>
-                            </div>
-                        </li>
-                    </template>
-                </ul>
-            </div>
+            <!--
+              This node's own checklist. `x-if`, not `x-show`: Alpine evaluates
+              x-text inside a hidden x-show block, so the inner expressions run
+              against a null `preflight` before it has been fetched.
+            -->
+            <template x-if="showPreflight && preflight">
+                <div class="border-t border-neutral-100 pt-4">
+                    <div class="text-xs text-neutral-400 mb-2"
+                         x-text="`${preflight.chip} · macOS ${preflight.macos.join('.')} · ${preflight.tb_max_gbps}Gb/s`"></div>
+                    <ul class="space-y-1.5">
+                        <template x-for="check in preflight.checks" :key="check.name">
+                            <li class="flex items-start gap-2">
+                                <span class="mt-0.5 w-1.5 h-1.5 rounded-full shrink-0"
+                                      :class="check.ok ? 'bg-green-500' : 'bg-amber-500'"></span>
+                                <div>
+                                    <div class="text-xs text-neutral-700" x-text="check.detail"></div>
+                                    <div x-show="check.remedy" class="text-xs text-neutral-400" x-text="check.remedy"></div>
+                                </div>
+                            </li>
+                        </template>
+                    </ul>
+                </div>
+            </template>
         </div>
     </div>
 </div>
