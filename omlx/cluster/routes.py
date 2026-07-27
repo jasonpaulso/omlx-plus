@@ -46,6 +46,17 @@ _get_manager: Callable[[], Any] | None = None
 # ClusterManager; a follower has no manager because it decides nothing.
 _follower: LocalCluster | None = None
 
+# What `/cluster/report` worked out about this node, keyed by model id.
+#
+# Not an optimisation. Resolving a model means scanning every model directory,
+# which on a machine with a large external volume takes tens of seconds - and
+# `/cluster/ranks/start` is called with rank 0 already up and inside the ring
+# backend's bounded connect window. Doing that work at report time, before rank
+# 0 exists, is the difference between a cluster forming and rank 0 timing out
+# against a peer that was still listing its disk.
+_resolved: dict[str, str] = {}
+_resolved_python: str = ""
+
 
 def configure(
     get_settings: Callable[[], Any], get_manager: Callable[[], Any]
@@ -103,16 +114,20 @@ async def report(payload: dict[str, Any]) -> dict[str, Any]:
         checks = preflight.run()
         local = topology.probe_local(default_node_id())
 
+        global _resolved_python
+
         has_model, python_error = False, ""
         if model_id:
             try:
-                resolve_model_path(settings, model_id)
+                _resolved[model_id] = resolve_model_path(settings, model_id)
                 has_model = True
             except Exception as exc:  # noqa: BLE001
+                _resolved.pop(model_id, None)
                 logger.info("cluster: peer cannot serve %s: %s", model_id, exc)
         try:
-            resolve_python()
+            _resolved_python = resolve_python()
         except Exception as exc:  # noqa: BLE001
+            _resolved_python = ""
             python_error = str(exc)
 
         return {
@@ -156,12 +171,17 @@ async def start_ranks(payload: dict[str, Any]) -> dict[str, Any]:
         global _follower
         from omlx.cluster.manager import resolve_model_path
 
+        model_id = payload["model"]
         cluster = LocalCluster(
-            model_path=resolve_model_path(settings, payload["model"]),
+            # Both of these were resolved at report time, before rank 0
+            # existed. Falling back to resolving here is correct but slow, and
+            # slow here means rank 0 times out waiting.
+            model_path=_resolved.get(model_id)
+            or resolve_model_path(settings, model_id),
             world_size=int(payload["world_size"]),
             backend=payload.get("backend", "ring"),
             pipeline=bool(payload.get("pipeline", False)),
-            python=resolve_python(),
+            python=_resolved_python or resolve_python(),
         )
         extra: dict[str, Any] = {}
         if payload.get("coordinator"):

@@ -36,8 +36,9 @@ from omlx.cluster.protocol import CMD_GENERATE, CMD_LOAD, GenerationSpec
 logger = logging.getLogger(__name__)
 
 # A peer that cannot answer a control call in this long is not going to make a
-# usable cluster member either.
-PEER_TIMEOUT_S = 30.0
+# usable cluster member either. Generous because `/cluster/report` scans every
+# model directory, which on an external volume takes tens of seconds.
+PEER_TIMEOUT_S = 180.0
 # Loading a shard reads weights off disk on every node at once.
 LOAD_TIMEOUT_S = 900.0
 # How long a formation waits for Bonjour to answer before calling the fleet
