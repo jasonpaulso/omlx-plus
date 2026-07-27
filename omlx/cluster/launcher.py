@@ -83,6 +83,11 @@ class DeathWatch(threading.Thread):
             self.join(timeout=self._interval * 2)
 
     def run(self) -> None:
+        # The liveness poll is an HTTP request every couple of seconds for as
+        # long as a cluster is formed; httpx logging each one at INFO turns
+        # the daemon log into a heartbeat monitor.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
         misses = {label: 0 for label, _ in self._checks}
         while not self._stop_event.wait(self._interval):
             for label, check in self._checks:
