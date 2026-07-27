@@ -10,6 +10,7 @@ model admitted against the local memory ceiling - not mlx itself.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sys
 from dataclasses import dataclass, field
@@ -689,40 +690,177 @@ class TestOrphanSweep:
     with a connect timeout that looks like a network fault.
     """
 
-    def test_kills_an_orphaned_rank(self):
+    @staticmethod
+    def _orphan(argv_tag: str) -> int:
+        """Spawn a decoy whose parent exits, so it reparents to launchd.
+
+        A decoy started directly by the test would be *our* child, and the
+        sweep deliberately spares those.
+        """
         import subprocess
+        import time
+
+        marker = f"/tmp/omlx-sweep-test-{argv_tag}-{os.getpid()}"
+        launcher = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import subprocess, sys, os\n"
+                    f"p = subprocess.Popen([sys.executable, '-c',"
+                    f" 'import time; time.sleep(60)', {argv_tag!r}])\n"
+                    f"open({marker!r}, 'w').write(str(p.pid))\n"
+                ),
+            ]
+        )
+        launcher.wait(timeout=10)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                return int(open(marker).read())
+            except (OSError, ValueError):
+                time.sleep(0.05)
+        raise AssertionError("decoy never reported its pid")
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        import psutil
+
+        return psutil.pid_exists(pid)
+
+    def test_kills_an_orphaned_rank(self):
         import time
 
         from omlx.cluster.launcher import WORKER_MODULE, sweep_orphaned_ranks
 
-        # A decoy that merely *looks* like a rank: same argv element, no mlx.
-        decoy = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(60)", WORKER_MODULE]
-        )
+        pid = self._orphan(WORKER_MODULE)
         try:
             deadline = time.monotonic() + 5
-            while decoy.poll() is None and time.monotonic() < deadline:
-                if sweep_orphaned_ranks():
-                    break
+            while self._alive(pid) and time.monotonic() < deadline:
+                sweep_orphaned_ranks()
                 time.sleep(0.1)
-            decoy.wait(timeout=5)
-            assert decoy.poll() is not None
+            assert not self._alive(pid)
         finally:
-            if decoy.poll() is None:
-                decoy.kill()
-                decoy.wait(timeout=5)
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, 9)
 
-    def test_leaves_everything_else_alone(self):
+    def test_spares_a_rank_this_process_owns(self):
+        """Two daemons on one machine is how this is tested without a 2nd Mac.
+
+        A peer forming its rank must not kill the leader's rank 0 next to it.
+        """
         import subprocess
 
-        from omlx.cluster.launcher import sweep_orphaned_ranks
+        from omlx.cluster.launcher import WORKER_MODULE, sweep_orphaned_ranks
 
-        bystander = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)", "some.other.module"]
+        mine = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)", WORKER_MODULE]
         )
         try:
             sweep_orphaned_ranks()
-            assert bystander.poll() is None
+            assert mine.poll() is None
         finally:
-            bystander.kill()
-            bystander.wait(timeout=5)
+            mine.kill()
+            mine.wait(timeout=5)
+
+    def test_leaves_everything_else_alone(self):
+        pid = self._orphan("some.other.module")
+        try:
+            from omlx.cluster.launcher import sweep_orphaned_ranks
+
+            sweep_orphaned_ranks()
+            assert self._alive(pid)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, 9)
+
+
+# =============================================================================
+# Reply reading
+# =============================================================================
+
+
+class TestReplyReader:
+    """The idle timeout has to be honest about buffered data.
+
+    `select` reports on the file descriptor, and a buffered reader routinely
+    pulls several replies out of the pipe at once - so a wrapper-based
+    implementation would sit waiting for bytes it already had.
+    """
+
+    def test_reads_lines_in_order(self):
+        from omlx.cluster.launcher import ReplyReader
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b'{"a": 1}\n{"b": 2}\n')
+            reader = ReplyReader(read_fd)
+            assert reader.readline(1.0) == '{"a": 1}'
+            assert reader.readline(1.0) == '{"b": 2}'
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_a_second_buffered_line_does_not_time_out(self):
+        """The exact failure a `select`-on-the-wrapper version would have."""
+        from omlx.cluster.launcher import ReplyReader
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b'{"a": 1}\n{"b": 2}\n')
+            reader = ReplyReader(read_fd)
+            reader.readline(1.0)
+            # Nothing new will ever arrive on the fd, but line two is in hand.
+            assert reader.readline(0.05) == '{"b": 2}'
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_silence_times_out(self):
+        from omlx.cluster.launcher import ReplyReader
+
+        read_fd, write_fd = os.pipe()
+        try:
+            assert ReplyReader(read_fd).readline(0.05) is None
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_a_closed_pipe_is_eof_not_a_timeout(self):
+        from omlx.cluster.launcher import ReplyReader
+
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        try:
+            assert ReplyReader(read_fd).readline(1.0) == ""
+        finally:
+            os.close(read_fd)
+
+    def test_no_timeout_blocks_until_the_line_arrives(self):
+        import threading
+
+        from omlx.cluster.launcher import ReplyReader
+
+        read_fd, write_fd = os.pipe()
+        try:
+            timer = threading.Timer(0.2, lambda: os.write(write_fd, b'{"late": 1}\n'))
+            timer.start()
+            assert ReplyReader(read_fd).readline(None) == '{"late": 1}'
+            timer.join()
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_a_partial_line_is_not_a_line(self):
+        from omlx.cluster.launcher import ReplyReader
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b'{"half"')
+            reader = ReplyReader(read_fd)
+            assert reader.readline(0.05) is None
+            os.write(write_fd, b': 1}\n')
+            assert reader.readline(1.0) == '{"half": 1}'
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)

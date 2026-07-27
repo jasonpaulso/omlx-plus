@@ -41,6 +41,11 @@ logger = logging.getLogger(__name__)
 PEER_TIMEOUT_S = 180.0
 # Loading a shard reads weights off disk on every node at once.
 LOAD_TIMEOUT_S = 900.0
+# The longest a generation may go without a single reply. Generous, because a
+# long prefill is silent - but finite, because a rank that dies mid-collective
+# leaves rank 0 blocked inside mlx with no way to notice, and the request would
+# otherwise hang until the client gives up.
+GENERATE_IDLE_TIMEOUT_S = 600.0
 # How long a formation waits for Bonjour to answer before calling the fleet
 # empty. A browse plus a resolve is several seconds, and the first request
 # after a daemon restart arrives well inside that.
@@ -493,7 +498,10 @@ class ClusterManager:
         with self._pipe:
             self._busy = True
             try:
-                for reply in cluster.stream({"op": CMD_GENERATE, **spec.to_dict()}):
+                for reply in cluster.stream(
+                    {"op": CMD_GENERATE, **spec.to_dict()},
+                    timeout=GENERATE_IDLE_TIMEOUT_S,
+                ):
                     if not reply.get("ok", False):
                         raise RuntimeError(reply.get("error", "cluster generate failed"))
                     yield reply

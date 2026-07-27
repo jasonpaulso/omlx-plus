@@ -44,6 +44,8 @@ class RankProcess:
     # Write end of the out-of-band signal pipe. Only rank 0 gets one; peers
     # learn about an abort through the collective, from rank 0.
     control_w: int | None = None
+    # Reply reader, created on first use. Rank 0 only.
+    replies: "ReplyReader | None" = None
 
     @property
     def alive(self) -> bool:
@@ -78,8 +80,40 @@ def resolve_python(candidate: str | None = None) -> str:
 WORKER_MODULE = "omlx.cluster.worker"
 
 
+class ReplyReader:
+    """Reads rank 0's newline-delimited replies with an idle timeout.
+
+    Owns its buffering rather than using the `Popen` text wrapper, because the
+    timeout has to be honest. `select` reports on the *file descriptor*, and a
+    buffered reader routinely pulls several replies out of the pipe in one go -
+    so a wrapper-based implementation would sit in `select` waiting for bytes
+    that had already arrived and time out with the answer in its hand.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._buffer = b""
+
+    def readline(self, timeout: float | None) -> str | None:
+        """The next reply line, `""` at EOF, or `None` when it timed out."""
+        import select
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while b"\n" not in self._buffer:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([self._fd], [], [], remaining)[0]:
+                    return None
+            chunk = os.read(self._fd, 65536)
+            if not chunk:
+                return ""
+            self._buffer += chunk
+        line, _, self._buffer = self._buffer.partition(b"\n")
+        return line.decode("utf-8", "replace")
+
+
 def sweep_orphaned_ranks() -> int:
-    """Kill rank processes on this machine that no daemon is tracking.
+    """Kill rank processes on this machine that no live daemon is driving.
 
     A worker left alive by a failed run holds its ring port, and the next
     rank 0 then quietly fails to own it - the whole cluster dies with a connect
@@ -87,19 +121,26 @@ def sweep_orphaned_ranks() -> int:
     kill for this reason, but a daemon that was itself restarted has no handle
     on the children it left behind, and only the process table remembers them.
 
-    Safe because a rank is never long-lived on its own: it exists for exactly
-    as long as the daemon that spawned it is driving it. Anything found here is
-    by definition an orphan.
+    **Our own children are never swept.** Two daemons on one machine is exactly
+    how the stack is tested without a second Mac, and a peer forming its rank
+    must not kill the leader's rank 0 sitting next to it. A rank whose parent
+    is still alive belongs to somebody; only the reparented ones are orphans.
     """
     try:
         import psutil
     except ImportError:  # pragma: no cover - psutil is a hard dependency
         return 0
 
+    ours = os.getpid()
     killed = 0
-    for proc in psutil.process_iter(["pid", "cmdline"]):
+    for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
         cmdline = proc.info.get("cmdline") or []
         if WORKER_MODULE not in cmdline:
+            continue
+        parent = proc.info.get("ppid")
+        if parent == ours:
+            continue
+        if _parent_is_alive(parent):
             continue
         try:
             proc.kill()
@@ -108,6 +149,22 @@ def sweep_orphaned_ranks() -> int:
         except Exception:  # noqa: BLE001 - already gone, or not ours
             continue
     return killed
+
+
+def _parent_is_alive(pid: int | None) -> bool:
+    """True when `pid` is a live process other than init.
+
+    A rank reparented to launchd (ppid 1) lost its daemon and is an orphan by
+    definition; anything else still has somebody responsible for it.
+    """
+    if pid is None or pid <= 1:
+        return False
+    try:
+        import psutil
+
+        return psutil.pid_exists(pid)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 @dataclass
@@ -296,7 +353,16 @@ class LocalCluster:
         return next(self.stream(payload, timeout=timeout))
 
     def stream(self, payload: dict, *, timeout: float | None = None):
-        """Send one command and yield replies until `done`."""
+        """Send one command and yield replies until `done`.
+
+        `timeout` is an *idle* timeout - the longest this will wait for the
+        next reply, not for the whole command. It matters because the failure
+        it catches is not rare: a rank that dies mid-collective leaves rank 0
+        blocked inside mlx with no way to notice, and without this the HTTP
+        request hangs until the client gives up. JACCL has no fault tolerance
+        by design, so the timeout is the only thing standing between a dead
+        peer and a wedged daemon.
+        """
         leader = self.leader
         if leader is None:
             raise RuntimeError("this node does not own rank 0")
@@ -306,8 +372,16 @@ class LocalCluster:
         proc.stdin.write(json.dumps(payload) + "\n")
         proc.stdin.flush()
 
+        if leader.replies is None:
+            leader.replies = ReplyReader(proc.stdout.fileno())
+
         while True:
-            line = proc.stdout.readline()
+            line = leader.replies.readline(timeout)
+            if line is None:
+                raise RuntimeError(
+                    f"rank 0 sent nothing for {timeout:.0f}s; the collective is "
+                    "most likely blocked on a rank that died"
+                )
             if not line:
                 raise RuntimeError("rank 0 closed its reply channel")
             reply = json.loads(line)
