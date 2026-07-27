@@ -85,18 +85,14 @@
                         <div class="min-w-0">
                             <div class="text-sm font-medium text-neutral-900">{{ t('cluster.missing.title') }}</div>
                             <div class="text-xs text-neutral-500 mt-1"
-                                 x-text="repoId
+                                 x-text="(repoId
                                      ? window.t('cluster.missing.body')
+                                     : window.t('cluster.missing.no_repo'))
                                          .replace('{peers}', missingPeerNames)
-                                         .replace('{model}', checkedModel)
-                                     : window.t('cluster.missing.no_repo')
                                          .replace('{model}', checkedModel)"></div>
-                            <div x-show="repoId" x-cloak class="text-xs text-neutral-400 mt-1 font-mono"
-                                 x-text="repoId"></div>
                         </div>
                     </div>
-                    <div x-show="repoId" x-cloak
-                         class="flex items-center justify-end gap-2 px-6 py-3 border-t border-neutral-100 bg-neutral-50">
+                    <div class="flex items-center justify-end gap-2 px-6 py-3 border-t border-neutral-100 bg-neutral-50">
                         <button @click="dismissedMissing = true"
                                 class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-900 rounded-lg transition-all">
                             {{ t('cluster.missing.dismiss') }}
@@ -131,7 +127,7 @@
                                          :class="dl.task?.status === 'failed' ? 'bg-red-500' : 'bg-neutral-900'"
                                          :style="`width: ${dl.task?.progress || 0}%`"></div>
                                 </div>
-                                <div class="text-xs text-neutral-400 mt-1 font-mono" x-text="dl.repo_id"></div>
+                                <div class="text-xs text-neutral-400 mt-1" x-text="transferModeLabel(dl)"></div>
                                 <div x-show="dl.error || dl.task?.error" x-cloak
                                      class="text-xs text-red-600 mt-1" x-text="dl.error || dl.task?.error"></div>
                             </div>

@@ -485,21 +485,117 @@ def paired(node, monkeypatch):
     return client, settings, peer
 
 
-def test_a_model_with_no_repo_cannot_be_downloaded_anywhere(paired, monkeypatch):
-    """A locally quantised model has nothing for a peer to pull, and saying so
-    beats offering a button that cannot work."""
+def test_a_model_with_no_repo_is_still_sent_directly(paired, monkeypatch):
+    """A locally quantised model has no repo, which used to be a dead end.
+    The node that has the weights can hand them over itself."""
     client, _settings, _peer = paired
+    sent: list[tuple[str, dict]] = []
+    monkeypatch.setattr("omlx.cluster.manager.resolve_model_repo", lambda *a, **k: "")
     monkeypatch.setattr(
-        "omlx.cluster.manager.resolve_model_repo", lambda *a, **k: ""
+        routes, "transfer_sources", lambda port: [f"http://10.0.0.1:{port}"]
     )
 
-    response = client.post(
+    def _post(self, path, payload=None):
+        sent.append((path, payload or {}))
+        return {"ok": True, "task": {"task_id": "t-1", "status": "pending"}}
+
+    monkeypatch.setattr("omlx.cluster.manager.PeerClient.post", _post)
+
+    body = client.post(
         "/admin/api/cluster/peers/download",
         json={"model": "big-model", "node_ids": ["studio"]},
+    ).json()
+
+    assert sent[0][0] == "/cluster/models/fetch"
+    assert sent[0][1]["sources"] == ["http://10.0.0.1:8888"]
+    assert body["peers"][0]["mode"] == "transfer"
+
+
+def test_direct_transfer_is_preferred_over_huggingface(paired, monkeypatch):
+    """Both routes available: the cable beats a round trip through the
+    internet, and needs no upload first."""
+    client, _settings, _peer = paired
+    sent: list[str] = []
+    monkeypatch.setattr(
+        "omlx.cluster.manager.resolve_model_repo", lambda *a, **k: "org/big-model"
+    )
+    monkeypatch.setattr(
+        routes, "transfer_sources", lambda port: [f"http://10.0.0.1:{port}"]
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.manager.PeerClient.post",
+        lambda self, path, payload=None: (
+            sent.append(path), {"ok": True, "task": {"task_id": "t-1"}}
+        )[1],
     )
 
-    assert response.status_code == 400
-    assert "no source repository" in response.json()["detail"]
+    body = client.post(
+        "/admin/api/cluster/peers/download",
+        json={"model": "big-model", "node_ids": ["studio"]},
+    ).json()
+
+    assert sent == ["/cluster/models/fetch"]
+    assert body["peers"][0]["mode"] == "transfer"
+
+
+def test_an_unreachable_node_falls_back_to_huggingface(paired, monkeypatch):
+    """A peer that cannot open a connection back to us can still get the
+    model, as long as the model came from somewhere public."""
+    client, _settings, _peer = paired
+    monkeypatch.setattr(
+        "omlx.cluster.manager.resolve_model_repo", lambda *a, **k: "org/big-model"
+    )
+    monkeypatch.setattr(
+        routes, "transfer_sources", lambda port: [f"http://10.0.0.1:{port}"]
+    )
+    seen: list[str] = []
+
+    def _post(self, path, payload=None):
+        seen.append(path)
+        if path == "/cluster/models/fetch":
+            raise RuntimeError("no route back to the leader")
+        return {"ok": True, "task": {"task_id": "t-2"}}
+
+    monkeypatch.setattr("omlx.cluster.manager.PeerClient.post", _post)
+
+    body = client.post(
+        "/admin/api/cluster/peers/download",
+        json={"model": "big-model", "node_ids": ["studio"]},
+    ).json()
+
+    assert seen == ["/cluster/models/fetch", "/cluster/models/download"]
+    assert body["peers"][0]["mode"] == "download"
+
+
+@pytest.mark.parametrize(
+    "escape", ["../../../../etc/passwd", "/etc/passwd", "a/../../outside.txt"]
+)
+def test_a_peer_cannot_read_outside_the_model_directory(tmp_path, escape):
+    """The path arrives from the network, so confinement is checked after
+    symlinks are resolved - not by string matching."""
+    from fastapi import HTTPException
+
+    root = tmp_path / "model"
+    root.mkdir()
+    (root / "weights.safetensors").write_bytes(b"x")
+    (tmp_path / "outside.txt").write_bytes(b"secret")
+
+    assert routes._safe_member(root, "weights.safetensors").name == "weights.safetensors"
+    with pytest.raises(HTTPException) as caught:
+        routes._safe_member(root, escape)
+    assert caught.value.status_code in (400, 404)
+
+
+def test_a_symlink_out_of_the_model_directory_is_refused(tmp_path):
+    from fastapi import HTTPException
+
+    root = tmp_path / "model"
+    root.mkdir()
+    (tmp_path / "secret.txt").write_bytes(b"secret")
+    (root / "link.txt").symlink_to(tmp_path / "secret.txt")
+
+    with pytest.raises(HTTPException):
+        routes._safe_member(root, "link.txt")
 
 
 def test_the_check_reports_the_repo_a_peer_could_pull_from(paired, monkeypatch):
@@ -520,30 +616,33 @@ def test_the_check_reports_the_repo_a_peer_could_pull_from(paired, monkeypatch):
     assert body["peers"][0]["has_model"] is False
 
 
-def test_the_leader_sends_a_repo_id_and_never_the_weights(paired, monkeypatch):
-    """The peer pulls into its own model directory. Nothing streams through
-    this Mac, and no path from here is assumed to mean anything there."""
-    client, _settings, _peer = paired
-    sent: list[tuple[str, dict]] = []
+def test_the_leader_sends_addresses_and_never_a_filesystem_path(paired, monkeypatch):
+    """The peer resolves its own destination.
 
+    Same reason every node resolves the model itself rather than being handed
+    a path: the other Mac may keep its models on an external volume, under a
+    different user, or simply somewhere else.
+    """
+    client, _settings, _peer = paired
+    sent: list[dict] = []
+    monkeypatch.setattr("omlx.cluster.manager.resolve_model_repo", lambda *a, **k: "")
     monkeypatch.setattr(
-        "omlx.cluster.manager.resolve_model_repo", lambda *a, **k: "org/big-model"
+        routes, "transfer_sources", lambda port: [f"http://10.0.0.1:{port}"]
     )
 
     def _post(self, path, payload=None):
-        sent.append((path, payload or {}))
-        return {"ok": True, "task": {"task_id": "t-1", "status": "pending"}}
+        sent.append(payload or {})
+        return {"ok": True, "task": {"task_id": "t-1"}}
 
     monkeypatch.setattr("omlx.cluster.manager.PeerClient.post", _post)
 
-    body = client.post(
+    client.post(
         "/admin/api/cluster/peers/download",
         json={"model": "big-model", "node_ids": ["studio"]},
-    ).json()
+    )
 
-    assert sent == [("/cluster/models/download", {"repo_id": "org/big-model"})]
-    assert body["peers"][0]["ok"] is True
-    assert body["peers"][0]["task"]["task_id"] == "t-1"
+    assert set(sent[0]) == {"model", "sources"}
+    assert all(s.startswith("http://") for s in sent[0]["sources"])
 
 
 def test_a_mismatched_peer_is_never_asked_to_download(paired, monkeypatch):

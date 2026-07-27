@@ -263,6 +263,223 @@ async def stop_ranks() -> dict[str, Any]:
     return {"ok": True, "stopped": stopped}
 
 
+# =============================================================================
+# Moving a model between nodes
+#
+# The nodes are already cabled to each other and already authenticate to each
+# other, so a model one of them has and another needs does not have to make a
+# round trip through HuggingFace - and a locally quantised model, which has no
+# repo at all, could not make that trip anyway.
+#
+# The node that needs the weights pulls them. It is the only one that knows
+# where its own models live, and a pull keeps the transfer inside the same
+# direction of trust as every other peer call.
+# =============================================================================
+
+# Transfers this node is running as the *receiver*, keyed by task id.
+_fetches: dict[str, dict[str, Any]] = {}
+_FETCH_CHUNK = 8 * 1024 * 1024
+
+
+def _model_dir_for(model_id: str) -> Any:
+    """Where `model_id` lives on this node, resolved and confined."""
+    from pathlib import Path
+
+    from omlx.cluster.manager import resolve_model_path
+
+    return Path(resolve_model_path(_settings(), model_id)).resolve()
+
+
+def _safe_member(root: Any, relative: str) -> Any:
+    """Resolve `relative` inside `root`, or refuse.
+
+    The path arrives from the network. Confinement is checked after resolving
+    symlinks, so neither `..` nor a link pointing out of the model directory
+    can be used to read the rest of the disk.
+    """
+    from pathlib import Path
+
+    candidate = Path(relative)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise HTTPException(status_code=400, detail="invalid path")
+    resolved = (root / candidate).resolve()
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="no such file in this model")
+    return resolved
+
+
+@peer_router.get("/models/{model_id}/manifest", dependencies=[Depends(verify_cluster_key)])
+async def model_manifest(model_id: str) -> dict[str, Any]:
+    """Every file that makes up a model here, so a peer can mirror it."""
+    import asyncio
+
+    def _gather() -> dict[str, Any]:
+        root = _model_dir_for(model_id)
+        files = []
+        for path in sorted(root.rglob("*")):
+            # Resource forks and dotfiles are macOS noise, not weights.
+            if not path.is_file() or path.name.startswith("._"):
+                continue
+            files.append(
+                {"path": str(path.relative_to(root)), "size": path.stat().st_size}
+            )
+        return {
+            "model": model_id,
+            "files": files,
+            "total_bytes": sum(f["size"] for f in files),
+        }
+
+    try:
+        return await asyncio.to_thread(_gather)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@peer_router.get("/models/{model_id}/blob", dependencies=[Depends(verify_cluster_key)])
+async def model_blob(model_id: str, path: str):
+    """Stream one file of a model to a peer that is mirroring it."""
+    from fastapi.responses import FileResponse
+
+    try:
+        root = _model_dir_for(model_id)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(_safe_member(root, path), media_type="application/octet-stream")
+
+
+@peer_router.post("/models/fetch", dependencies=[Depends(verify_cluster_key)])
+async def start_model_fetch(payload: dict[str, Any]) -> dict[str, Any]:
+    """Mirror a model from another node onto this one.
+
+    `sources` is an ordered list of base URLs for the node that has the model,
+    best link first. This node uses the first one that answers - which is how
+    the transfer follows a Thunderbolt link the moment one carries IP, without
+    anything here having to know which cable is which.
+    """
+    import threading
+    import uuid
+
+    model_id = str(payload.get("model", "")).strip()
+    sources = [str(s) for s in (payload.get("sources") or [])]
+    if not model_id or not sources:
+        raise HTTPException(status_code=400, detail="model and sources are required")
+
+    settings = _settings()
+    dirs = list(settings.get_effective_model_dirs())
+    if not dirs:
+        raise HTTPException(status_code=400, detail="this node has no model directory")
+
+    key = getattr(getattr(settings, "cluster", None), "cluster_key", "")
+    task_id = uuid.uuid4().hex[:12]
+    _fetches[task_id] = {
+        "task_id": task_id,
+        "model": model_id,
+        "status": "pending",
+        "progress": 0.0,
+        "total_bytes": 0,
+        "received_bytes": 0,
+        "source": "",
+        "error": "",
+    }
+    threading.Thread(
+        target=_run_fetch,
+        args=(task_id, model_id, sources, dirs[0], key),
+        name=f"omlx-cluster-fetch-{task_id}",
+        daemon=True,
+    ).start()
+    return {"ok": True, "task": dict(_fetches[task_id])}
+
+
+def _run_fetch(
+    task_id: str, model_id: str, sources: list[str], model_dir: Any, key: str
+) -> None:
+    """Pull every file of `model_id` from the first source that answers."""
+    import shutil
+    from pathlib import Path
+
+    import httpx
+
+    state = _fetches[task_id]
+    headers = {"X-Cluster-Key": key}
+    # Land in a sibling directory first. A half-copied model inside the model
+    # directory would be discovered, offered, and fail to load.
+    destination = Path(model_dir) / model_id
+    staging = Path(model_dir) / f".{model_id}.incoming"
+
+    try:
+        manifest, base = None, ""
+        for candidate in sources:
+            try:
+                reply = httpx.get(
+                    f"{candidate}/cluster/models/{model_id}/manifest",
+                    headers=headers,
+                    timeout=15.0,
+                )
+                reply.raise_for_status()
+                manifest, base = reply.json(), candidate
+                break
+            except Exception:  # noqa: BLE001 - try the next link
+                continue
+        if manifest is None:
+            raise RuntimeError(
+                "no route to the node holding the model; tried " + ", ".join(sources)
+            )
+
+        state.update(
+            status="downloading",
+            source=base,
+            total_bytes=int(manifest.get("total_bytes", 0)),
+        )
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+
+        received = 0
+        for entry in manifest.get("files", []):
+            target = staging / entry["path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with httpx.stream(
+                "GET",
+                f"{base}/cluster/models/{model_id}/blob",
+                params={"path": entry["path"]},
+                headers=headers,
+                timeout=None,
+            ) as response:
+                response.raise_for_status()
+                with open(target, "wb") as handle:
+                    for chunk in response.iter_bytes(_FETCH_CHUNK):
+                        handle.write(chunk)
+                        received += len(chunk)
+                        state["received_bytes"] = received
+                        if state["total_bytes"]:
+                            state["progress"] = round(
+                                100.0 * received / state["total_bytes"], 1
+                            )
+
+        if destination.exists():
+            shutil.rmtree(destination, ignore_errors=True)
+        staging.rename(destination)
+        state.update(status="completed", progress=100.0)
+        logger.info("cluster: mirrored %s from %s", model_id, base)
+    except Exception as exc:  # noqa: BLE001 - the leader shows this verbatim
+        shutil.rmtree(staging, ignore_errors=True)
+        state.update(status="failed", error=str(exc))
+        logger.exception("cluster: could not mirror %s", model_id)
+
+
+@peer_router.get("/models/fetch/{task_id}", dependencies=[Depends(verify_cluster_key)])
+async def model_fetch_status(task_id: str) -> dict[str, Any]:
+    """Progress of a transfer this node is receiving."""
+    state = _fetches.get(task_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="no such transfer")
+    return {"task": dict(state)}
+
+
 @peer_router.post("/models/download", dependencies=[Depends(verify_cluster_key)])
 async def start_model_download(payload: dict[str, Any]) -> dict[str, Any]:
     """Fetch a model onto this node, so it can join a cluster that needs it.
@@ -797,6 +1014,46 @@ async def check_peers(payload: dict[str, Any]) -> dict[str, Any]:
 _peer_downloads: dict[str, dict[str, Any]] = {}
 
 
+def transfer_sources(port: int) -> list[str]:
+    """This node's base URLs, best link first.
+
+    Thunderbolt interfaces come first, so a transfer takes the cable rather
+    than the LAN whenever the cable carries IP. Today it usually does not -
+    macOS gives a Thunderbolt interface only a link-local address until
+    Thunderbolt Bridge is enabled, and RDMA does not use IP at all - so the
+    peer falls through to the LAN address. That is the point of sending an
+    ordered list instead of one address: enabling the bridge upgrades the
+    transfer with nothing here to change.
+
+    oMLX does not enable it. Detection is read-only; the network is the
+    operator's.
+    """
+    import psutil
+
+    fast: list[str] = []
+    slow: list[str] = []
+    try:
+        checks = preflight.run()
+        # `rdma_en2` names the RDMA device sitting on interface `en2`.
+        thunderbolt = {
+            d[len("rdma_") :] for d in checks.rdma_devices if d.startswith("rdma_")
+        }
+    except Exception:  # noqa: BLE001 - ordering is an optimisation, not a gate
+        thunderbolt = set()
+
+    import socket as _socket
+
+    for name, addresses in psutil.net_if_addrs().items():
+        for address in addresses:
+            if address.family != _socket.AF_INET:
+                continue
+            ip = address.address
+            if not ip or ip.startswith("127."):
+                continue
+            (fast if name in thunderbolt else slow).append(f"http://{ip}:{port}")
+    return fast + slow
+
+
 def _peer_by_node_id(node_id: str) -> Any:
     from omlx.cluster import bootstrap
 
@@ -808,11 +1065,12 @@ def _peer_by_node_id(node_id: str) -> Any:
 
 @admin_router.post("/peers/download")
 async def start_peer_downloads(payload: dict[str, Any]) -> dict[str, Any]:
-    """Ask the named peers to fetch the cluster model.
+    """Ask the named peers to get the cluster model.
 
-    The leader sends a repo id, never bytes. Each peer pulls into its own
-    model directory, which is the only place its discovery will look and the
-    only path its rank could load from.
+    Direct transfer from this node first, falling back to a HuggingFace pull
+    when the peer cannot reach us. Either way the peer pulls into its own
+    model directory - the only place its discovery looks, and the only path
+    its rank could load from.
     """
     import asyncio
 
@@ -828,19 +1086,20 @@ async def start_peer_downloads(payload: dict[str, Any]) -> dict[str, Any]:
     if not model_id:
         raise HTTPException(status_code=400, detail="model is required")
 
-    repo_id = await asyncio.to_thread(resolve_model_repo, _settings(), model_id)
-    if not repo_id:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"{model_id!r} has no source repository - it was quantised or "
-                "renamed locally - so a peer has nothing to download. Copy the "
-                "model directory to the other Mac by hand."
-            ),
-        )
-
     node_ids = [str(n) for n in (payload.get("node_ids") or [])]
     key = cluster.cluster_key
+    port = int(_settings().server.port)
+
+    # Direct transfer first. It is faster than a round trip through
+    # HuggingFace, it needs no upload, and it is the only option at all for a
+    # locally quantised model - which has no repo to pull from.
+    sources = await asyncio.to_thread(transfer_sources, port)
+    repo_id = await asyncio.to_thread(resolve_model_repo, _settings(), model_id)
+    if not sources and not repo_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"no way to get {model_id!r} onto another node",
+        )
 
     def _start(node_id: str) -> dict[str, Any]:
         peer = _peer_by_node_id(node_id)
@@ -853,28 +1112,56 @@ async def start_peer_downloads(payload: dict[str, Any]) -> dict[str, Any]:
                 "error": "this node advertises a different cluster key",
             }
         client = PeerClient(peer.host, peer.info.port, key)
-        try:
-            reply = client.post("/cluster/models/download", {"repo_id": repo_id})
-        except Exception as exc:  # noqa: BLE001 - the operator needs the reason
-            # A peer too old to know this route answers 404, which reads as a
-            # missing model rather than a missing feature unless we say so.
-            return {
-                "node_id": node_id,
-                "ok": False,
-                "error": f"{exc} (a peer running an older oMLX cannot be sent a download)",
-            }
-        task = reply.get("task", {})
-        _peer_downloads[node_id] = {
-            "task_id": task.get("task_id", ""),
-            "repo_id": repo_id,
-            "model": model_id,
+        attempts: list[str] = []
+
+        if sources:
+            try:
+                reply = client.post(
+                    "/cluster/models/fetch", {"model": model_id, "sources": sources}
+                )
+                task = reply.get("task", {})
+                _peer_downloads[node_id] = {
+                    "task_id": task.get("task_id", ""),
+                    "mode": "transfer",
+                    "source": model_id,
+                    "model": model_id,
+                }
+                return {"node_id": node_id, "ok": True, "mode": "transfer", "task": task}
+            except Exception as exc:  # noqa: BLE001 - fall back to the repo
+                attempts.append(f"direct transfer: {exc}")
+
+        if repo_id:
+            try:
+                reply = client.post("/cluster/models/download", {"repo_id": repo_id})
+                task = reply.get("task", {})
+                _peer_downloads[node_id] = {
+                    "task_id": task.get("task_id", ""),
+                    "mode": "download",
+                    "source": repo_id,
+                    "model": model_id,
+                }
+                return {"node_id": node_id, "ok": True, "mode": "download", "task": task}
+            except Exception as exc:  # noqa: BLE001
+                attempts.append(f"download from {repo_id}: {exc}")
+
+        # A peer too old to know either route answers 404, which reads as a
+        # missing model rather than a missing feature unless we say so.
+        return {
+            "node_id": node_id,
+            "ok": False,
+            "error": "; ".join(attempts)
+            + " (a peer running an older oMLX knows neither route)",
         }
-        return {"node_id": node_id, "ok": True, "task": task}
 
     results = await asyncio.gather(
         *(asyncio.to_thread(_start, node_id) for node_id in node_ids)
     )
-    return {"model": model_id, "repo_id": repo_id, "peers": list(results)}
+    return {
+        "model": model_id,
+        "repo_id": repo_id,
+        "sources": sources,
+        "peers": list(results),
+    }
 
 
 @admin_router.get("/peers/downloads")
@@ -895,10 +1182,13 @@ async def peer_download_progress() -> dict[str, Any]:
         if peer is None:
             return {**base, "ok": False, "error": "peer is no longer visible"}
         client = PeerClient(peer.host, peer.info.port, key)
+        route = (
+            "/cluster/models/fetch/"
+            if record.get("mode") == "transfer"
+            else "/cluster/models/download/"
+        )
         try:
-            reply = client.get_json(
-                f"/cluster/models/download/{record['task_id']}"
-            )
+            reply = client.get_json(f"{route}{record['task_id']}")
         except Exception as exc:  # noqa: BLE001
             return {**base, "ok": False, "error": str(exc)}
         return {**base, "ok": True, "task": reply.get("task", {})}

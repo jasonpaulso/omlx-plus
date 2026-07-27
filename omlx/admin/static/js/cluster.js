@@ -353,6 +353,12 @@ function clusterPanel() {
             return peer?.hostname || this.hostLabel(peer?.host) || nodeId;
         },
 
+        transferModeLabel(dl) {
+            return dl.mode === 'transfer'
+                ? window.t('cluster.download.mode_transfer')
+                : `${window.t('cluster.download.mode_download')} · ${dl.source || ''}`;
+        },
+
         downloadLabel(dl) {
             if (dl.error) return window.t('cluster.download.failed');
             const task = dl.task || {};
