@@ -325,7 +325,7 @@ class ClusterManager:
                 slots.append(
                     NodeSlot(
                         node_id=node_id,
-                        host=resolve_ipv4(client.host, client.port),
+                        host=client.host,
                         port=client.port,
                         rank=rank,
                     )
@@ -414,10 +414,25 @@ class ClusterManager:
             time.sleep(min(1.0, interval))
 
     def _peer_clients(self, key: str) -> dict[str, PeerClient]:
-        return {
-            peer.info.node_id: PeerClient(peer.host, peer.info.port, key)
-            for peer in self._peers_fn()
-        }
+        """Peers, addressed by IPv4 rather than by the name Bonjour gave.
+
+        The control plane talks to the address, not the `.local` name, because
+        resolving one from inside the daemon costs **over a minute** per call -
+        long enough that rank 0 spent its entire connect window waiting for an
+        HTTP request to leave the machine, and died with a timeout that looked
+        like the peer's fault. Discovery has already resolved the name once;
+        doing it again per request is both slow and a second chance to pick a
+        link-local address.
+        """
+        clients: dict[str, PeerClient] = {}
+        for peer in self._peers_fn():
+            try:
+                host = resolve_ipv4(peer.host, peer.info.port)
+            except ClusterFormationError as exc:
+                logger.warning("cluster: skipping peer %s: %s", peer.host, exc)
+                continue
+            clients[peer.info.node_id] = PeerClient(host, peer.info.port, key)
+        return clients
 
     def _collect_reports(
         self, clients: dict[str, PeerClient], model_id: str

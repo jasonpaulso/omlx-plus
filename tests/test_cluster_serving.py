@@ -83,6 +83,11 @@ def quick_formation(monkeypatch):
         "omlx.cluster.manager.resolve_python", lambda *a: sys.executable
     )
     monkeypatch.setattr("omlx.cluster.manager.PEER_DISCOVERY_GRACE_S", 0.3)
+    # Peer addressing has its own tests; here the fake peers are already
+    # literal addresses.
+    monkeypatch.setattr(
+        "omlx.cluster.manager.resolve_ipv4", lambda host, port: host
+    )
     return None
 
 
