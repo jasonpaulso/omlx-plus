@@ -97,6 +97,7 @@ class Preflight:
     chip: str
     rdma_enabled: bool
     rdma_devices: list[str]
+    rdma_active_devices: list[str]
     bridged_interfaces: list[str]
     tb_max_gbps: int
     checks: list[Check] = field(default_factory=list)
@@ -108,6 +109,7 @@ class Preflight:
             self.macos >= MIN_RDMA_MACOS
             and self.rdma_enabled
             and bool(self.rdma_devices)
+            and bool(self.rdma_active_devices)
             and not self.bridged_interfaces
             and self.tb_max_gbps >= MIN_TB5_GBPS
         )
@@ -172,6 +174,34 @@ def ibv_devices() -> list[str]:
     return sorted(devices)
 
 
+def rdma_port_states() -> dict[str, str]:
+    """Port state per RDMA device, e.g. ``{"rdma_en2": "PORT_ACTIVE"}``.
+
+    `ibv_devices` proves the driver enumerated a port; it says nothing about
+    whether a cable is plugged into it. `ibv_devinfo` does: the device whose
+    port is `PORT_ACTIVE` is the one the Thunderbolt cable is actually in.
+    Handing JACCL a `PORT_DOWN` device fails at protection-domain allocation
+    with an error that reads like a driver fault, which is why the distinction
+    is load-bearing (observed 2026-07-27: three enumerated devices, one
+    active, and the positional pick chose a down one).
+    """
+    rc, out = _run("ibv_devinfo")
+    if rc != 0:
+        return {}
+    states: dict[str, str] = {}
+    current = ""
+    for line in out.splitlines():
+        text = line.strip()
+        if text.startswith("hca_id:"):
+            current = text.split(":", 1)[1].strip()
+        elif text.startswith("state:") and current:
+            state = text.split(":", 1)[1].strip().split()[0]
+            # A device is as alive as its best port.
+            if states.get(current) != "PORT_ACTIVE":
+                states[current] = state
+    return states
+
+
 def thunderbolt_bridge_members() -> list[str]:
     """Thunderbolt interfaces currently captured by macOS's `bridge0`.
 
@@ -212,6 +242,8 @@ def run() -> Preflight:
     chip = _chip()
     enabled = rdma_status()
     devices = ibv_devices()
+    states = rdma_port_states()
+    active = sorted(d for d in devices if states.get(d) == "PORT_ACTIVE")
     bridged = thunderbolt_bridge_members()
     gbps = thunderbolt_max_gbps()
 
@@ -265,6 +297,23 @@ def run() -> Preflight:
             ),
         ),
         Check(
+            name="rdma_link_active",
+            ok=bool(active),
+            detail=(
+                ", ".join(f"{d} active" for d in active)
+                if active
+                else "no RDMA port is PORT_ACTIVE"
+            ),
+            remedy=(
+                ""
+                if active
+                else "Every RDMA port is down. Check that the Thunderbolt 5 "
+                "cable is seated at both ends and connects two RDMA-armed "
+                "Macs; a device that enumerates but stays PORT_DOWN carries "
+                "no link."
+            ),
+        ),
+        Check(
             name="thunderbolt_bridge_off",
             ok=not bridged,
             detail=(
@@ -289,6 +338,7 @@ def run() -> Preflight:
         chip=chip,
         rdma_enabled=enabled,
         rdma_devices=devices,
+        rdma_active_devices=active,
         bridged_interfaces=bridged,
         tb_max_gbps=gbps,
         checks=checks,

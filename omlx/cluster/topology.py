@@ -66,6 +66,9 @@ class NodeReport:
     node_id: str
     buses: list[Bus] = field(default_factory=list)
     rdma_devices: list[str] = field(default_factory=list)
+    # The subset of `rdma_devices` whose port is PORT_ACTIVE - i.e. the ones
+    # with a live cable. Empty when the node predates port-state reporting.
+    active_rdma_devices: list[str] = field(default_factory=list)
     rdma_ready: bool = False
 
     @property
@@ -204,35 +207,57 @@ def ibv_matrix(
 
     Null on the diagonal, and null wherever two nodes have no cable.
 
-    The bus-to-device mapping is positional: the Nth Thunderbolt bus
-    corresponds to the Nth RDMA device, both taken in sorted order. That held
-    on the hardware available here - the single cabled bus mapped to the single
-    active Thunderbolt interface, `bus_0` -> `en1` -> `rdma_en1` - but a
-    multi-cable machine has not been verified. When a node cannot supply a
-    device for a link, the entry is null and the caller falls back off `jaccl`
-    rather than launching a run that would hang.
+    Device selection prefers link state over position. A machine enumerates
+    an RDMA device for *every* Thunderbolt port, but only the port the cable
+    is in reports `PORT_ACTIVE` - and handing JACCL a `PORT_DOWN` device
+    fails at protection-domain allocation with an error that reads like a
+    driver fault (observed 2026-07-27: `[jaccl] Couldn't allocate protection
+    domain` because the positional pick chose a down device out of three).
+
+    - Exactly one active device: that is the cable; use it for every edge.
+    - Several active devices: the Nth cabled bus takes the Nth active device,
+      both in sorted order - positional between live cables, never a dead
+      port. A multi-cable machine has not been verified.
+    - No port-state information (a peer running older code): the original
+      positional map over all devices.
+
+    When a node cannot supply a device for a link, the entry is null and the
+    caller falls back off `jaccl` rather than launching a run that would hang.
     """
     by_id = {report.node_id: report for report in reports}
     domain_owner = {
         domain: report.node_id for report in reports for domain in report.domains
     }
 
+    def pick(report: NodeReport, cable_index: int) -> str | None:
+        devices = sorted(report.rdma_devices)
+        active = sorted(d for d in report.active_rdma_devices if d in devices)
+        if len(active) == 1:
+            return active[0]
+        pool = active or devices
+        return pool[cable_index] if cable_index < len(pool) else None
+
     matrix: list[list[str | None]] = []
     for src in order:
         row: list[str | None] = []
         report = by_id.get(src)
+        cabled: list[Bus] = []
+        if report is not None:
+            cabled = [
+                bus
+                for bus in sorted(report.buses, key=lambda b: b.name)
+                if bus.peer_domain_uuid
+                and domain_owner.get(bus.peer_domain_uuid) not in (None, src)
+            ]
         for dst in order:
             if src == dst or report is None:
                 row.append(None)
                 continue
             device = None
-            for index, bus in enumerate(sorted(report.buses, key=lambda b: b.name)):
-                if not bus.peer_domain_uuid:
-                    continue
+            for cable_index, bus in enumerate(cabled):
                 if domain_owner.get(bus.peer_domain_uuid) != dst:
                     continue
-                if index < len(sorted(report.rdma_devices)):
-                    device = sorted(report.rdma_devices)[index]
+                device = pick(report, cable_index)
                 break
             row.append(device)
         matrix.append(row)

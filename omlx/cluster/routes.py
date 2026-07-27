@@ -142,6 +142,7 @@ async def report(payload: dict[str, Any]) -> dict[str, Any]:
                 for b in local.buses
             ],
             "rdma_devices": list(checks.rdma_devices),
+            "active_rdma_devices": list(checks.rdma_active_devices),
             "rdma_ready": checks.rdma_ready,
             "blockers": [c.detail for c in checks.blockers()],
             "has_model": has_model,
@@ -279,6 +280,7 @@ async def cluster_preflight() -> dict[str, Any]:
         "chip": checks.chip,
         "rdma_enabled": checks.rdma_enabled,
         "rdma_devices": checks.rdma_devices,
+        "active_rdma_devices": checks.rdma_active_devices,
         "bridged_interfaces": checks.bridged_interfaces,
         "tb_max_gbps": checks.tb_max_gbps,
         "rdma_ready": checks.rdma_ready,

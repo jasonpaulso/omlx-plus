@@ -69,6 +69,46 @@ class TestIbvDevices:
         assert preflight.ibv_devices() == []
 
 
+_DEVINFO_MIXED = """\
+hca_id:\trdma_en1
+\ttransport:\t\t\tThunderbolt (100)
+\tphys_port_cnt:\t\t\t1
+\t\tport:\t1
+\t\t\tstate:\t\t\tPORT_DOWN (1)
+hca_id:\trdma_en7
+\t\tport:\t1
+\t\t\tstate:\t\t\tPORT_DOWN (1)
+hca_id:\trdma_en2
+\t\tport:\t1
+\t\t\tstate:\t\t\tPORT_ACTIVE (4)
+"""
+
+
+class TestRdmaPortStates:
+    """Parsed from `ibv_devinfo`, verbatim output of macOS 27.0."""
+
+    def test_reads_state_per_device(self, monkeypatch):
+        monkeypatch.setattr(preflight, "_run", lambda *a: (0, _DEVINFO_MIXED))
+        assert preflight.rdma_port_states() == {
+            "rdma_en1": "PORT_DOWN",
+            "rdma_en7": "PORT_DOWN",
+            "rdma_en2": "PORT_ACTIVE",
+        }
+
+    def test_command_failure_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(preflight, "_run", lambda *a: (127, "not found"))
+        assert preflight.rdma_port_states() == {}
+
+    def test_active_port_wins_on_a_multiport_device(self, monkeypatch):
+        out = (
+            "hca_id:\trdma_en1\n"
+            "\t\t\tstate:\t\t\tPORT_DOWN (1)\n"
+            "\t\t\tstate:\t\t\tPORT_ACTIVE (4)\n"
+        )
+        monkeypatch.setattr(preflight, "_run", lambda *a: (0, out))
+        assert preflight.rdma_port_states() == {"rdma_en1": "PORT_ACTIVE"}
+
+
 class TestThunderboltBridgeMembers:
     def test_extracts_member_interfaces(self, monkeypatch):
         monkeypatch.setattr(preflight, "_run", lambda *a: (0, _BRIDGE_WITH_MEMBERS))
@@ -110,6 +150,7 @@ def _ready_preflight(**overrides) -> Preflight:
         chip="Apple M5 Max",
         rdma_enabled=True,
         rdma_devices=["rdma_en1"],
+        rdma_active_devices=["rdma_en1"],
         bridged_interfaces=[],
         tb_max_gbps=80,
     )
@@ -131,6 +172,11 @@ class TestRdmaReady:
 
     def test_no_rdma_devices(self):
         assert _ready_preflight(rdma_devices=[]).rdma_ready is False
+
+    def test_no_active_rdma_port(self):
+        # Devices enumerate on every Thunderbolt port; only a live cable is
+        # PORT_ACTIVE. All-down means no link, however armed the driver is.
+        assert _ready_preflight(rdma_active_devices=[]).rdma_ready is False
 
     def test_bridged_interfaces_present(self):
         assert _ready_preflight(bridged_interfaces=["en2"]).rdma_ready is False

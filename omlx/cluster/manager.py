@@ -483,6 +483,7 @@ class ClusterManager:
         self._blockers = [f"{local_id}: {c.detail}" for c in local_pre.blockers()]
         local = topology.probe_local(local_id)
         local.rdma_devices = list(local_pre.rdma_devices)
+        local.active_rdma_devices = list(local_pre.rdma_active_devices)
         local.rdma_ready = local_pre.rdma_ready
         reports = [local]
 
@@ -588,6 +589,7 @@ def _report_from_dict(node_id: str, payload: dict[str, Any]) -> topology.NodeRep
         node_id=node_id,
         buses=buses,
         rdma_devices=list(payload.get("rdma_devices", [])),
+        active_rdma_devices=list(payload.get("active_rdma_devices", [])),
         rdma_ready=bool(payload.get("rdma_ready", False)),
     )
 

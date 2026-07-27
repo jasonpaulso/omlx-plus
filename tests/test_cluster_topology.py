@@ -404,6 +404,73 @@ class TestIbvMatrix:
         assert matrix[1][2] is None
         assert matrix[2][1] is None
 
+    def test_single_active_device_wins_over_position(self):
+        # The 2026-07-27 JACCL failure: three devices enumerate (one per
+        # Thunderbolt port), the cable is in the port behind rdma_en2, and
+        # the positional pick chose rdma_en1 - a PORT_DOWN device that fails
+        # protection-domain allocation. Link state must beat position.
+        a = NodeReport(
+            node_id="a",
+            buses=[Bus(name="bus_0", domain_uuid="A0", peer_domain_uuid="B0")],
+            rdma_devices=["rdma_en1", "rdma_en2", "rdma_en7"],
+            active_rdma_devices=["rdma_en2"],
+        )
+        b = NodeReport(
+            node_id="b",
+            buses=[Bus(name="bus_1", domain_uuid="B0", peer_domain_uuid="A0")],
+            rdma_devices=["rdma_en2", "rdma_en3", "rdma_en4"],
+            active_rdma_devices=["rdma_en3"],
+        )
+        matrix = ibv_matrix([a, b], order=["a", "b"])
+        assert matrix[0][1] == "rdma_en2"
+        assert matrix[1][0] == "rdma_en3"
+
+    def test_multiple_active_devices_map_positionally_between_cables(self):
+        # Two cables out of node a: the Nth cabled bus takes the Nth active
+        # device. Down devices never enter the pool.
+        a = NodeReport(
+            node_id="a",
+            buses=[
+                Bus(name="bus_0", domain_uuid="A0", peer_domain_uuid="B0"),
+                Bus(name="bus_1", domain_uuid="A1", peer_domain_uuid="C0"),
+            ],
+            rdma_devices=["rdma_en1", "rdma_en2", "rdma_en7"],
+            active_rdma_devices=["rdma_en1", "rdma_en2"],
+        )
+        b = NodeReport(
+            node_id="b",
+            buses=[Bus(name="bus_0", domain_uuid="B0", peer_domain_uuid="A0")],
+            rdma_devices=["rdma_en1"],
+            active_rdma_devices=["rdma_en1"],
+        )
+        c = NodeReport(
+            node_id="c",
+            buses=[Bus(name="bus_0", domain_uuid="C0", peer_domain_uuid="A1")],
+            rdma_devices=["rdma_en1"],
+            active_rdma_devices=["rdma_en1"],
+        )
+        matrix = ibv_matrix([a, b, c], order=["a", "b", "c"])
+        assert matrix[0][1] == "rdma_en1"
+        assert matrix[0][2] == "rdma_en2"
+
+    def test_active_device_unknown_to_devices_list_is_ignored(self):
+        # A stale or inconsistent report must not smuggle in a device name
+        # the node did not enumerate.
+        a = NodeReport(
+            node_id="a",
+            buses=[Bus(name="bus_0", domain_uuid="A0", peer_domain_uuid="B0")],
+            rdma_devices=["rdma_en1", "rdma_en2"],
+            active_rdma_devices=["rdma_en9"],
+        )
+        b = NodeReport(
+            node_id="b",
+            buses=[Bus(name="bus_0", domain_uuid="B0", peer_domain_uuid="A0")],
+            rdma_devices=["rdma_en1"],
+        )
+        matrix = ibv_matrix([a, b], order=["a", "b"])
+        # Falls back to the positional map over all enumerated devices.
+        assert matrix[0][1] == "rdma_en1"
+
 
 class TestPlan:
     def test_ring_when_a_node_is_not_rdma_ready(self):
