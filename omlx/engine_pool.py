@@ -2105,6 +2105,25 @@ class EnginePool:
             # subsequent loads until a server restart.
             self._schedule_failed_load_reclaim(model_id, pre_load_memory)
             if not entry.abort_loading and not entry_detached:
+                from omlx.cluster.manager import ClusterFormationError
+
+                if isinstance(exc, ClusterFormationError):
+                    # A peer that is down or unreachable is a condition of the
+                    # network, not of the weights. Caching it would refuse
+                    # every retry with "fix the files" until the next
+                    # discovery refresh, when the next attempt may simply
+                    # succeed.
+                    logger.warning(
+                        "Cluster formation failed for '%s'; not caching as a "
+                        "load failure: %s",
+                        model_id,
+                        exc,
+                    )
+                    raise ModelUnavailableError(
+                        model_id,
+                        f"Cluster formation failed for '{model_id}': {exc} "
+                        "Retry once the peer is reachable.",
+                    ) from exc
                 self._mark_load_failure(entry, exc)
                 logger.exception(
                     "Model load failed for '%s'; caching failure until next discovery refresh",

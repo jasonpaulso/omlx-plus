@@ -288,11 +288,12 @@ class ClusterManager:
                 raise ClusterFormationError(str(exc)) from exc
 
             # `auto` means the fastest transport that *works*, not the fastest
-            # the cabling suggests. RDMA fails at init for reasons no amount of
-            # probing predicts - most often an exhausted protection-domain
-            # pool, whose only real fix is a reboot - and TCP `ring` needs
-            # nothing but an IP route. Refusing to serve because the fast path
-            # is unavailable would be the wrong answer.
+            # the cabling suggests. RDMA can still fail at init for reasons
+            # preflight cannot fully predict (the 2026-07-27 failure blamed on
+            # an exhausted protection-domain pool turned out to be a PORT_DOWN
+            # device - now selected against - but the class remains), and TCP
+            # `ring` needs nothing but an IP route. Refusing to serve because
+            # the fast path is unavailable would be the wrong answer.
             logger.warning(
                 "cluster: %s failed to form (%s); retrying on TCP ring",
                 attempted,
@@ -476,6 +477,8 @@ class ClusterManager:
         naming the peer - rather than during `init()`, where it presents as the
         whole world hanging.
         """
+        import httpx
+
         from omlx.cluster.discovery import default_node_id
 
         local_id = default_node_id()
@@ -488,7 +491,21 @@ class ClusterManager:
         reports = [local]
 
         for node_id, client in clients.items():
-            payload = client.post("/cluster/report", {"model": model_id})
+            try:
+                payload = client.post("/cluster/report", {"model": model_id})
+            except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as exc:
+                # Name the peer and the route; the raw errno is useless in a
+                # log. The macOS hint is earned: Local Network privacy denies
+                # third-party interpreters (python) while Apple binaries
+                # (curl, nc) still get through, so "the peer answers curl but
+                # not oMLX" reads like a network fault and is a permission.
+                raise ClusterFormationError(
+                    f"cannot reach {node_id} at {client.host}:{client.port}: "
+                    f"{exc}. If other tools on this machine reach the peer "
+                    "while oMLX cannot, macOS Local Network privacy has "
+                    "likely denied this interpreter - check System Settings "
+                    "> Privacy & Security > Local Network."
+                ) from exc
             if not payload.get("has_model"):
                 raise ClusterFormationError(
                     f"{node_id} does not have {model_id!r} on disk"

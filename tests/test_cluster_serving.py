@@ -273,6 +273,24 @@ class TestClusterManager:
         assert "no peers" not in str(exc.value)
         assert calls["n"] >= 3
 
+    def test_an_unreachable_peer_is_named_in_the_error(
+        self, monkeypatch, quick_formation
+    ):
+        """The raw errno is useless; the error names the peer and the route.
+
+        It also carries the macOS Local Network privacy hint: a denied
+        interpreter fails with EHOSTUNREACH while curl still gets through,
+        which reads like a network fault and is a permission (2026-07-27).
+        """
+        manager = ClusterManager(
+            FakeSettings(), peers=lambda: [_FakePeer("studio", "127.0.0.1", 1)]
+        )
+        with pytest.raises(ClusterFormationError) as exc:
+            manager.form("big-model")
+        message = str(exc.value)
+        assert "studio at 127.0.0.1:1" in message
+        assert "Local Network" in message
+
     def test_streaming_without_a_cluster_is_refused(self):
         manager = ClusterManager(FakeSettings())
         with pytest.raises(ClusterFormationError, match="no cluster"):
@@ -925,3 +943,54 @@ class TestBackendFallback:
         with pytest.raises(ClusterFormationError, match="no peers"):
             manager.form("big-model")
         assert attempts == ["planned"]
+
+
+# =============================================================================
+# Formation errors and the engine pool
+# =============================================================================
+
+# Upstream fixtures reused by import, so the upstream test file stays
+# byte-identical (the merge-seam rule).
+from test_engine_pool import _make_pool, small_mock_model_dir  # noqa: E402,F401
+
+
+class TestFormationErrorNotCachedAsLoadFailure:
+    """A peer that is down is a network condition, not broken weights.
+
+    The engine pool makes ordinary load failures sticky until the next
+    discovery refresh - correct for corrupt files, wrong for a cluster whose
+    peer will be back in a minute. Observed 2026-07-27: one transient
+    EHOSTUNREACH turned into "Reload models after fixing the files" on every
+    subsequent request.
+    """
+
+    @pytest.mark.asyncio
+    async def test_formation_error_is_retried_on_the_next_request(
+        self, small_mock_model_dir
+    ):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from omlx.engine_pool import ModelUnavailableError
+
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock(
+            side_effect=ClusterFormationError("cannot reach studio")
+        )
+        mock_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            with pytest.raises(ModelUnavailableError, match="formation"):
+                await pool.get_engine("model-a")
+
+            entry = pool.get_entry("model-a")
+            assert entry is not None
+            assert entry.load_failed is False
+
+            # The next request tries again instead of parroting the cache.
+            with pytest.raises(ModelUnavailableError, match="formation"):
+                await pool.get_engine("model-a")
+
+        assert mock_engine.start.await_count == 2
