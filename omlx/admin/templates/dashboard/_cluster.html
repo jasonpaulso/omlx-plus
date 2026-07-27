@@ -262,6 +262,8 @@
                                     class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 <option value="">{{ t('cluster.config.model_none') }}</option>
                             </select>
+                            <p x-show="modelWarning" x-cloak
+                               class="mt-2 text-xs text-amber-700" x-text="modelWarning"></p>
                         </div>
 
                         <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">

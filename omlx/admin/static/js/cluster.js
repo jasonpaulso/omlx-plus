@@ -107,10 +107,9 @@ function clusterPanel() {
 
         async loadModels() {
             try {
-                const response = await fetch('/admin/api/models');
+                const response = await fetch('/admin/api/cluster/candidates');
                 if (!response.ok) return;
-                const data = await response.json();
-                this.models = data.models || [];
+                this.models = (await response.json()).candidates || [];
             } catch (e) {
                 // The picker degrades to whatever is already configured.
             }
@@ -389,22 +388,30 @@ function clusterPanel() {
         // answer to anything that asks. A plain assigned array is also what
         // every other dynamic select in this dashboard uses.
         rebuildModelOptions() {
-            // Only language models, and no helpers: a cluster shards one big
-            // model, and the small entries in this list are speculative-decode
-            // companions that would never be sharded.
-            const options = this.models
-                .filter((m) => m.model_type === 'llm' && !m.is_helper)
-                .map((m) => {
-                    const size = m.actual_size_formatted || m.estimated_size_formatted;
-                    const name = m.display_name || m.id;
-                    return { value: m.id, label: size ? `${name} · ${size}` : name };
-                });
-            // A model configured here but no longer on disk stays selectable,
-            // or saving any other field would silently drop it.
+            const options = this.models.map((m) => ({
+                value: m.id,
+                label: m.size_formatted ? `${m.display_name} · ${m.size_formatted}` : m.display_name,
+                // An ineligible model stays selectable. Being told a model
+                // cannot be sharded, and why, beats it silently not being in
+                // the list - which is how one gets picked that could never
+                // have formed.
+                disabled: !m.eligible,
+                reason: m.reason || '',
+            }));
             if (this.config.model && !this.models.some((m) => m.id === this.config.model)) {
-                options.unshift({ value: this.config.model, label: this.config.model });
+                options.unshift({ value: this.config.model, label: this.config.model, disabled: false, reason: '' });
             }
             this.modelOptions = options;
+        },
+
+        get selectedCandidate() {
+            return this.models.find((m) => m.id === this.config.model) || null;
+        },
+
+        // Why the currently selected model cannot be clustered, if it cannot.
+        get modelWarning() {
+            const chosen = this.selectedCandidate;
+            return chosen && !chosen.eligible ? chosen.reason : '';
         },
 
         // Driven by x-effect on the select. Reading `modelOptions` and
@@ -419,7 +426,10 @@ function clusterPanel() {
             for (const option of options) {
                 const el = document.createElement('option');
                 el.value = option.value;
-                el.textContent = option.label;
+                el.textContent = option.reason
+                    ? `${option.label} — ${option.reason}`
+                    : option.label;
+                el.disabled = !!option.disabled;
                 select.appendChild(el);
             }
             select.value = selected;
@@ -478,11 +488,13 @@ function clusterPanel() {
         // figure is what replaces the refusal the operator no longer gets.
         // Display only: it is a sanity check, not an admission decision.
         get modelSizeLabel() {
-            const model = this.models.find((m) => m.id === this.status.model || m.id === this.config.model);
-            if (!model) return '';
-            const size = model.actual_size_formatted || model.estimated_size_formatted;
-            if (!size) return '';
-            return this.fleetGb ? `${size} of ${this.fleetGb} GB` : size;
+            const chosen = this.models.find(
+                (m) => m.id === this.status.model || m.id === this.config.model
+            );
+            if (!chosen || !chosen.size_formatted) return '';
+            return this.fleetGb
+                ? `${chosen.size_formatted} of ${this.fleetGb} GB`
+                : chosen.size_formatted;
         },
 
         get fleetNodesLabel() {

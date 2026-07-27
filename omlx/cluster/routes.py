@@ -829,6 +829,37 @@ async def get_cluster_config() -> dict[str, Any]:
     return config
 
 
+@admin_router.get("/candidates")
+async def cluster_candidates() -> dict[str, Any]:
+    """This node's models, judged as sharded-model candidates.
+
+    Answers the two questions the picker was previously guessing at: can
+    mlx-lm split this architecture across ranks, and are all the weight files
+    actually here. Ineligible models are returned with a reason rather than
+    omitted - being told why a model cannot be clustered is the useful answer,
+    and hiding it is how one gets selected that could never have formed.
+    """
+    import asyncio
+
+    from omlx.cluster import inventory
+
+    models: list[dict[str, Any]] = []
+    try:
+        from omlx.server import _server_state
+
+        engine_pool = _server_state.engine_pool
+        if engine_pool is not None:
+            status = await asyncio.to_thread(engine_pool.get_status)
+            models = list(status.get("models", []))
+    except Exception:  # noqa: BLE001 - an empty list is a usable answer
+        logger.exception("cluster: could not list models for candidates")
+
+    # Off the event loop: judging a candidate stats its directory, and the
+    # first call for an architecture imports an mlx-lm module.
+    described = await asyncio.to_thread(inventory.candidates, models)
+    return {"candidates": described}
+
+
 @admin_router.post("/key")
 async def generate_cluster_key() -> dict[str, str]:
     """Mint a key for pairing. Not saved until the form is saved."""
