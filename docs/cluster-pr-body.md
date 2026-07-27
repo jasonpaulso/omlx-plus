@@ -62,13 +62,13 @@ mlx 0.32.0 / mlx-lm 0.31.3.
 | **A cluster serves an OpenAI request** | `POST /v1/chat/completions` on the MacBook → "Red, Blue, Yellow", `finish_reason: stop`, weights sharded across both Macs |
 | Formation is quick enough to be automatic | 12 s cold (discovery → preflight → topology → both ranks → sharded load); ~2 s for the next request |
 | Streaming works token by token | SSE deltas arrive one token at a time from the remote shard |
-| **Requests batch across the two machines** | 3 concurrent API requests, ~430 tokens total, wall time = the longest one alone (39.5 s), all outputs correct |
+| **Requests batch across the two machines** | 3 concurrent API requests, ~400 tokens total, wall time = the longest one alone — **0.8 s on `jaccl`**, 39.5 s on `ring` — all outputs correct |
 | A request joins a running batch | submitted mid-decode of another request, admitted between steps, both stream interleaved |
 | Per-request abort leaves the batch serving | one of two concurrent requests aborted at 20 tokens with `finish_reason: abort`; the other ran to completion |
 | Client disconnect frees only its slot | dropped a streaming 2000-token request at 5 s; ranks idle within seconds, an immediate follow-up served in 3 s |
-| **A dead rank fails the request in seconds** | Studio's rank killed mid-generation: the in-flight request failed **2.1 s** later naming the dead rank; the next request re-formed and served in ~10 s |
+| **A dead rank fails the request in seconds** | Studio's rank killed mid-generation: the in-flight request failed **1.7-2.1 s** later naming the dead rank; the next request re-formed and served in 7-10 s — verified on both `ring` and `jaccl` |
 | Stop strings and seeded sampling hold in lockstep | `stop: ["gamma"]` truncated mid-stream; `temperature 0.8, seed 42` produced coherent output |
-| JACCL (RDMA over Thunderbolt) forms and serves | 3 live formations, warm requests 0.12-0.14 s vs ~1.0 s on ring; device selection requires an ACTIVE link |
+| JACCL (RDMA over Thunderbolt) forms and serves batched | `auto` forms directly on `jaccl` and the whole battery above runs on it; device selection resolves the physical receptacle, because a Studio Display daisy-chained to both Macs puts a second live RDMA port on each machine and position picked the display's port |
 
 258 cluster unit tests, including a lockstep pair test: a real leader and
 follower loop linked only by queue-built collective semantics must make
@@ -121,10 +121,12 @@ specification for the day the cluster wants prefix-cache reuse and
 memory-aware admission, including folding `(world_size, rank, parallelism)`
 into the SSD block signature.
 
-**The bus-to-RDMA-device mapping on multi-cable machines.** Device selection
-now requires an ACTIVE link, verified on the one cabled pair; a machine with
-several cables is unverified. A missing device yields a null matrix entry and
-downgrades the backend rather than launching a run that would hang.
+**Rings of more than two RDMA machines.** Device selection is no longer
+guesswork — each node resolves its cabled buses to devices through the
+physical receptacle, verified on machines carrying two live Thunderbolt links
+each — but a `jaccl-ring` of three or more Macs has never been formed. A
+missing device yields a null matrix entry and downgrades the backend rather
+than launching a run that would hang.
 
 ## Findings that contradict the common understanding
 
