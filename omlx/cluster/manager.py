@@ -25,6 +25,7 @@ import asyncio
 import logging
 import socket
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterator
 
@@ -39,6 +40,10 @@ logger = logging.getLogger(__name__)
 PEER_TIMEOUT_S = 30.0
 # Loading a shard reads weights off disk on every node at once.
 LOAD_TIMEOUT_S = 900.0
+# How long a formation waits for Bonjour to answer before calling the fleet
+# empty. A browse plus a resolve is several seconds, and the first request
+# after a daemon restart arrives well inside that.
+PEER_DISCOVERY_GRACE_S = 20.0
 
 
 class ClusterFormationError(RuntimeError):
@@ -126,6 +131,55 @@ def local_ip() -> str:
         return "127.0.0.1"
     finally:
         probe.close()
+
+
+def resolve_ipv4(host: str, port: int) -> str:
+    """The address of `host` that this node can actually reach it on.
+
+    Bonjour resolves peers to `.local` names, and the ring backend's hostfile
+    wants `ip:port` - it is not a name resolver. Naming is not the hard part
+    though: a Mac with a Thunderbolt cable attached publishes **several** A
+    records, and the first one is routinely a link-local `169.254.x.x` that
+    belongs to a bridge nobody is serving on. A rank handed that address binds
+    somewhere its peers cannot see and the run dies with
+    `[ring] Couldn't connect (error: 60)` - a timeout that reads like a
+    firewall fault and is not one.
+
+    So the address is chosen by *evidence*: whichever candidate accepts a TCP
+    connection on the peer's daemon port is a route that demonstrably works.
+    Link-local addresses are skipped outright; they are never the answer for a
+    node whose daemon is on the LAN.
+    """
+    try:
+        info = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ClusterFormationError(f"cannot resolve {host!r} to an IPv4 address: {exc}")
+
+    candidates: list[str] = []
+    for entry in info:
+        address = entry[4][0]
+        if address.startswith("169.254.") or address.startswith("127."):
+            continue
+        if address not in candidates:
+            candidates.append(address)
+    if not candidates:
+        raise ClusterFormationError(f"{host!r} has no routable IPv4 address")
+
+    for address in candidates:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(2.0)
+            if probe.connect_ex((address, port)) == 0:
+                return address
+
+    # Nothing answered. The daemon may be mid-restart rather than unreachable,
+    # so take the first routable address rather than refusing to form.
+    logger.warning(
+        "cluster: no candidate address for %s answered on port %d; using %s",
+        host,
+        port,
+        candidates[0],
+    )
+    return candidates[0]
 
 
 def resolve_model_path(settings: Any, model_id: str) -> str:
@@ -235,11 +289,7 @@ class ClusterManager:
         model_path = resolve_model_path(self._settings, model_id)
         python = resolve_python()
 
-        clients = self._peer_clients(cluster_settings.cluster_key)
-        if not clients:
-            raise ClusterFormationError(
-                "no peers are visible; a cluster of one is just a local model"
-            )
+        clients = self._await_peers(cluster_settings)
 
         reports, local_id = self._collect_reports(clients, model_id)
         chosen = topology.plan(reports)
@@ -273,7 +323,10 @@ class ClusterManager:
                 client = clients[node_id]
                 slots.append(
                     NodeSlot(
-                        node_id=node_id, host=client.host, port=client.port, rank=rank
+                        node_id=node_id,
+                        host=resolve_ipv4(client.host, client.port),
+                        port=client.port,
+                        rank=rank,
                     )
                 )
         self._slots = slots
@@ -304,7 +357,11 @@ class ClusterManager:
             if backend == "ring"
             else hostfile.DEFAULT_JACCL_COORDINATOR_PORT
         )
-        if not self._cluster.wait_until_ready(ready_port, host="127.0.0.1"):
+        # Probe the address rank 0 actually binds - the one in the hostfile.
+        # `127.0.0.1` never answers: the ring backend binds the specific
+        # interface it was given, so a loopback probe silently falls through to
+        # the grace-period path and the readiness check checks nothing.
+        if not self._cluster.wait_until_ready(ready_port, host=ips[0]):
             raise ClusterFormationError("rank 0 died before the world formed")
 
         for slot in slots[1:]:
@@ -331,6 +388,29 @@ class ClusterManager:
             backend,
             model_id,
         )
+
+    def _await_peers(self, cluster_settings: Any) -> dict[str, PeerClient]:
+        """Wait for Bonjour to answer before declaring the fleet empty.
+
+        Discovery is a poll, not a subscription, and a browse plus a resolve
+        takes several seconds. The first request after a daemon restart
+        therefore arrives before any peer is known - and because the engine
+        pool marks a failed load sticky, failing instantly turns "Bonjour has
+        not answered yet" into "this model is broken until you reload".
+        """
+        interval = float(
+            getattr(cluster_settings, "discovery_interval_seconds", 5.0) or 5.0
+        )
+        deadline = time.monotonic() + max(PEER_DISCOVERY_GRACE_S, interval * 3)
+        while True:
+            clients = self._peer_clients(cluster_settings.cluster_key)
+            if clients:
+                return clients
+            if time.monotonic() >= deadline:
+                raise ClusterFormationError(
+                    "no peers are visible; a cluster of one is just a local model"
+                )
+            time.sleep(min(1.0, interval))
 
     def _peer_clients(self, key: str) -> dict[str, PeerClient]:
         return {

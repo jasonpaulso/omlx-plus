@@ -39,7 +39,9 @@ class FakeClusterSettings:
     backend: str = "auto"
     model: str = "big-model"
     pipeline: bool = False
-    discovery_interval_seconds: float = 5.0
+    # Real default is 5s. Formation waits three polls for Bonjour, and the
+    # tests would rather not.
+    discovery_interval_seconds: float = 0.05
 
 
 @dataclass
@@ -54,6 +56,34 @@ class FakeSettings:
 
     def get_effective_model_dirs(self):
         return []
+
+
+class _FakePeerInfo:
+    def __init__(self, node_id: str, port: int) -> None:
+        self.node_id = node_id
+        self.port = port
+        self.chip = "Apple M3 Ultra"
+        self.ram_gb = 96
+        self.version = "0.0.0"
+
+
+class _FakePeer:
+    def __init__(self, node_id: str, host: str, port: int) -> None:
+        self.info = _FakePeerInfo(node_id, port)
+        self.host = host
+
+
+@pytest.fixture
+def quick_formation(monkeypatch):
+    """Formation without the real disk, interpreter probe or discovery grace."""
+    monkeypatch.setattr(
+        "omlx.cluster.manager.resolve_model_path", lambda s, m: "/models/big"
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.manager.resolve_python", lambda *a: sys.executable
+    )
+    monkeypatch.setattr("omlx.cluster.manager.PEER_DISCOVERY_GRACE_S", 0.3)
+    return None
 
 
 class FakeProcess:
@@ -197,29 +227,45 @@ class TestClusterManager:
         with pytest.raises(ClusterFormationError, match="cluster_key"):
             ClusterManager(settings).form("big-model")
 
-    def test_a_cluster_of_one_is_refused(self, monkeypatch):
+    def test_a_cluster_of_one_is_refused(self, monkeypatch, quick_formation):
         """No peers is not a degenerate cluster, it is a local model."""
-        monkeypatch.setattr(
-            "omlx.cluster.manager.resolve_model_path", lambda s, m: "/models/big"
-        )
-        monkeypatch.setattr(
-            "omlx.cluster.manager.resolve_python", lambda *a: sys.executable
-        )
         with pytest.raises(ClusterFormationError, match="no peers"):
             ClusterManager(FakeSettings(), peers=list).form("big-model")
 
-    def test_a_failed_formation_leaves_nothing_running(self, monkeypatch):
-        monkeypatch.setattr(
-            "omlx.cluster.manager.resolve_model_path", lambda s, m: "/models/big"
-        )
-        monkeypatch.setattr(
-            "omlx.cluster.manager.resolve_python", lambda *a: sys.executable
-        )
+    def test_a_failed_formation_leaves_nothing_running(
+        self, monkeypatch, quick_formation
+    ):
         manager = ClusterManager(FakeSettings(), peers=list)
         with pytest.raises(ClusterFormationError):
             manager.form("big-model")
         assert manager.formed is False
         assert manager.status().error
+
+    def test_waits_for_bonjour_rather_than_failing_instantly(
+        self, monkeypatch, quick_formation
+    ):
+        """Discovery is a poll, and the engine pool makes a failed load sticky.
+
+        Failing on the first empty peer table would turn "Bonjour has not
+        answered yet" into "this model is broken until you reload".
+        """
+        calls = {"n": 0}
+
+        def peers_appear_late():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return []
+            # Refuses instantly, so formation fails at the report call rather
+            # than spending a timeout on an address that swallows packets.
+            return [_FakePeer("studio", "127.0.0.1", 1)]
+
+        manager = ClusterManager(FakeSettings(), peers=peers_appear_late)
+        # Formation gets past the peer check and fails later, on the report
+        # call to a peer that does not exist - which is the point.
+        with pytest.raises(ClusterFormationError) as exc:
+            manager.form("big-model")
+        assert "no peers" not in str(exc.value)
+        assert calls["n"] >= 3
 
     def test_streaming_without_a_cluster_is_refused(self):
         manager = ClusterManager(FakeSettings())
@@ -528,3 +574,99 @@ class TestClusterEngine:
         asyncio.run(engine.stop())
         assert manager.torn_down == 1
         assert engine._loaded is False
+
+
+# =============================================================================
+# Peer addressing
+# =============================================================================
+
+
+class FakeProbe:
+    """A socket whose `connect_ex` succeeds only for one address."""
+
+    reachable: str = ""
+    attempts: list[str] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def settimeout(self, _timeout):
+        pass
+
+    def connect_ex(self, address):
+        FakeProbe.attempts.append(address[0])
+        return 0 if address[0] == FakeProbe.reachable else 1
+
+
+class TestResolveIpv4:
+    """A Mac with a Thunderbolt cable publishes several A records.
+
+    The first is routinely a link-local `169.254.x.x` belonging to a bridge
+    nobody serves on. A rank handed that address binds where its peers cannot
+    see it, and the run dies with `[ring] Couldn't connect (error: 60)` - a
+    timeout that reads like a firewall fault and is not one. This was a real
+    two-machine failure, not a hypothetical.
+    """
+
+    def _addresses(self, monkeypatch, addresses):
+        import socket as socket_module
+
+        monkeypatch.setattr(
+            "omlx.cluster.manager.socket.getaddrinfo",
+            lambda *a, **k: [
+                (socket_module.AF_INET, socket_module.SOCK_STREAM, 6, "", (addr, 0))
+                for addr in addresses
+            ],
+        )
+
+    def _probe(self, monkeypatch, reachable):
+        FakeProbe.reachable = reachable
+        FakeProbe.attempts = []
+        monkeypatch.setattr("omlx.cluster.manager.socket.socket", FakeProbe)
+
+    def test_skips_link_local(self, monkeypatch):
+        from omlx.cluster import manager as manager_module
+
+        self._addresses(monkeypatch, ["169.254.214.89", "192.168.4.32"])
+        self._probe(monkeypatch, "192.168.4.32")
+        assert manager_module.resolve_ipv4("studio.local", 8888) == "192.168.4.32"
+        assert "169.254.214.89" not in FakeProbe.attempts
+
+    def test_prefers_the_address_that_answers(self, monkeypatch):
+        """Evidence, not ordering: a route that works is one that connects."""
+        from omlx.cluster import manager as manager_module
+
+        self._addresses(monkeypatch, ["10.9.9.9", "192.168.5.28"])
+        self._probe(monkeypatch, "192.168.5.28")
+        assert manager_module.resolve_ipv4("studio.local", 8888) == "192.168.5.28"
+
+    def test_falls_back_rather_than_refusing_to_form(self, monkeypatch):
+        """A peer mid-restart is not the same as a peer that is unreachable."""
+        from omlx.cluster import manager as manager_module
+
+        self._addresses(monkeypatch, ["192.168.4.32", "192.168.5.28"])
+        self._probe(monkeypatch, "nothing answers")
+        assert manager_module.resolve_ipv4("studio.local", 8888) == "192.168.4.32"
+
+    def test_no_routable_address_is_an_error(self, monkeypatch):
+        from omlx.cluster import manager as manager_module
+
+        self._addresses(monkeypatch, ["169.254.1.1", "127.0.0.1"])
+        with pytest.raises(ClusterFormationError, match="routable"):
+            manager_module.resolve_ipv4("studio.local", 8888)
+
+    def test_a_name_that_does_not_resolve_names_itself(self, monkeypatch):
+        from omlx.cluster import manager as manager_module
+
+        def boom(*args, **kwargs):
+            raise OSError("nodename nor servname provided")
+
+        monkeypatch.setattr("omlx.cluster.manager.socket.getaddrinfo", boom)
+        with pytest.raises(ClusterFormationError, match="studio.local"):
+            manager_module.resolve_ipv4("studio.local", 8888)
