@@ -17,16 +17,11 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
-import re
-from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from omlx import model_integrity
 
-# `model-00007-of-00126.safetensors` - the count is in the name, which makes
-# "is this download finished" a question about the directory listing rather
-# than about the weights.
-_SHARD_RE = re.compile(r"-of-(\d+)\.safetensors$")
+logger = logging.getLogger(__name__)
 
 _shardable: dict[str, bool] = {}
 
@@ -67,20 +62,10 @@ def shard_census(model_path: str) -> tuple[int, int]:
     """`(present, expected)` safetensors shards for a model directory.
 
     `(0, 0)` when the question does not apply - a directory with no shards at
-    all, or one whose files carry no `-of-N` suffix to compare against.
+    all, or one whose files carry no count to compare against.
     """
-    directory = Path(model_path)
-    if not directory.is_dir():
-        return (0, 0)
-    shards = sorted(directory.glob("*.safetensors"))
-    if not shards:
-        return (0, 0)
-    match = _SHARD_RE.search(shards[0].name)
-    if match is None:
-        # A single-file model, or a naming scheme we do not recognise. Present
-        # is all we can honestly report.
-        return (len(shards), len(shards))
-    return (len(shards), int(match.group(1)))
+    result = model_integrity.census(model_path)
+    return (result["present"], result["expected"])
 
 
 def _format_size(model: dict[str, Any]) -> str:

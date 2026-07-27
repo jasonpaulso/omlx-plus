@@ -140,6 +140,13 @@
                                                 <span class="text-sm font-medium text-neutral-900 truncate"
                                                       :title="model.display_name || model.name"
                                                       x-text="model.display_name || model.name"></span>
+                                                <template x-if="modelIntegrityFor(model.name)">
+                                                    <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-700 border border-amber-200 shrink-0"
+                                                          :title="window.t('models.incomplete_tooltip')
+                                                              .replace('{present}', modelIntegrityFor(model.name).present)
+                                                              .replace('{expected}', modelIntegrityFor(model.name).expected)"
+                                                          x-text="window.t('models.incomplete')"></span>
+                                                </template>
                                                 <template x-if="managerModelInfo(model.name)?.settings?.model_alias">
                                                     <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
                                                           x-text="managerModelInfo(model.name)?.settings?.model_alias"></span>

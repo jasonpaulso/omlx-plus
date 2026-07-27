@@ -89,5 +89,7 @@
   "cluster.form.now": "Start cluster",
   "cluster.form.starting": "Starting…",
   "cluster.download.mode_transfer": "direct from this Mac",
-  "cluster.download.mode_download": "from HuggingFace"
+  "cluster.download.mode_download": "from HuggingFace",
+  "models.incomplete": "Incomplete",
+  "models.incomplete_tooltip": "Only {present} of {expected} weight files are on disk. This model will fail to load until the rest are downloaded."
 }

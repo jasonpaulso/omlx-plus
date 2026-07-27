@@ -83,6 +83,7 @@
 
             // Main tab state (Status, Settings, or Logs)
             mainTab: 'status',
+            modelIntegrity: {},
 
             activeTab: 'global',
             settingsDropdown: false,
@@ -636,7 +637,7 @@
                     this.stopLogRefresh();
                 }
                 if (value === 'models') {
-                    const loads = [this.loadHFModels(), this.loadHFTasks(), this.loadOQTasks()];
+                    const loads = [this.loadHFModels(), this.loadHFTasks(), this.loadOQTasks(), this.loadModelIntegrity()];
                     if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
                         loads.push(this.loadRecommendedModels());
                     }
@@ -660,6 +661,9 @@
                     this.stopHFRefresh();
                     this.stopMSRefresh();
                     this.stopOQRefresh();
+                }
+                if (value === 'settings' && !Object.keys(this.modelIntegrity).length) {
+                    this.loadModelIntegrity();
                 }
                 if (value === 'bench') {
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
@@ -4259,6 +4263,24 @@
             // settings) for a manager row keyed by its model name.
             managerModelInfo(name) {
                 return this.models.find(m => m.id === name);
+            },
+
+            // A model whose weight files are not all on disk. Nothing said so
+            // before: it listed at the size of the fragment, and only failed
+            // when something tried to load it.
+            modelIntegrityFor(name) {
+                const found = this.modelIntegrity[name];
+                return found && !found.complete ? found : null;
+            },
+
+            async loadModelIntegrity() {
+                try {
+                    const response = await fetch('/admin/api/models/integrity');
+                    if (!response.ok) return;
+                    this.modelIntegrity = (await response.json()).integrity || {};
+                } catch (err) {
+                    // Absent badges are better than a broken model list.
+                }
             },
 
             filterModelsByName(list, query) {

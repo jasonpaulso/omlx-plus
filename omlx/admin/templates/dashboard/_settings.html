@@ -1144,6 +1144,14 @@
                                             <p class="text-sm font-medium text-neutral-900 break-all sm:truncate"
                                                :title="model.display_name || model.id"
                                                x-text="model.display_name || model.id"></p>
+                                            <template x-if="modelIntegrityFor(model.id)">
+                                                <span class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-700 border border-amber-200 flex-shrink-0"
+                                                      @mouseenter="showTip($event.currentTarget, window.t('models.incomplete_tooltip')
+                                                          .replace('{present}', modelIntegrityFor(model.id).present)
+                                                          .replace('{expected}', modelIntegrityFor(model.id).expected))"
+                                                      @mouseleave="hideTip()"
+                                                      x-text="window.t('models.incomplete')"></span>
+                                            </template>
                                             <span x-show="model.settings?.model_alias" x-cloak
                                                   class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>

@@ -1815,6 +1815,35 @@ def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
         return []
 
 
+@router.get("/api/models/integrity")
+async def model_integrity_report(is_admin: bool = Depends(require_admin)):
+    """Which models on disk are missing weight files.
+
+    Separate from `/api/models` and fetched on demand rather than folded into
+    it: this stats every model directory, and that list is polled. Answers are
+    cached against each directory's mtime, so a finished download invalidates
+    its own entry.
+    """
+    import asyncio
+
+    from omlx import model_integrity
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    def _gather() -> dict:
+        status = engine_pool.get_status()
+        report = {}
+        for model in status.get("models", []):
+            described = model_integrity.describe(model.get("model_path") or "")
+            if described["checked"]:
+                report[model.get("id", "")] = described
+        return report
+
+    return {"integrity": await asyncio.to_thread(_gather)}
+
+
 @router.get("/api/models")
 async def list_models(is_admin: bool = Depends(require_admin)):
     """
