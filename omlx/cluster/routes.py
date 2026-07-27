@@ -263,6 +263,47 @@ async def stop_ranks() -> dict[str, Any]:
     return {"ok": True, "stopped": stopped}
 
 
+@peer_router.post("/models/download", dependencies=[Depends(verify_cluster_key)])
+async def start_model_download(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fetch a model onto this node, so it can join a cluster that needs it.
+
+    Reuses the daemon's own downloader rather than inventing a transfer: the
+    weights land in this node's model directory, named the way this node's
+    discovery expects, and the existing task list can be polled for progress.
+    The leader never sends bytes - it sends a repo id, and this node pulls.
+    """
+    from omlx.admin import routes as admin_routes
+
+    downloader = admin_routes._hf_downloader
+    if downloader is None:
+        raise HTTPException(status_code=503, detail="downloader is not initialised")
+
+    repo_id = str(payload.get("repo_id", "")).strip()
+    if not repo_id:
+        raise HTTPException(status_code=400, detail="repo_id is required")
+
+    try:
+        task = await downloader.start_download(repo_id, payload.get("hf_token"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "task": task.to_dict()}
+
+
+@peer_router.get("/models/download/{task_id}", dependencies=[Depends(verify_cluster_key)])
+async def model_download_status(task_id: str) -> dict[str, Any]:
+    """Progress of a download this node was asked to start."""
+    from omlx.admin import routes as admin_routes
+
+    downloader = admin_routes._hf_downloader
+    if downloader is None:
+        raise HTTPException(status_code=503, detail="downloader is not initialised")
+
+    for task in downloader.get_tasks():
+        if task.get("task_id") == task_id:
+            return {"task": task}
+    raise HTTPException(status_code=404, detail="no such download task")
+
+
 def _start_follower_watch(cluster: LocalCluster, payload: dict[str, Any]) -> None:
     """Watch this node's own ranks, and the leader that owns them.
 
@@ -686,7 +727,7 @@ async def check_peers(payload: dict[str, Any]) -> dict[str, Any]:
     import asyncio
 
     from omlx.cluster import bootstrap
-    from omlx.cluster.manager import PeerClient
+    from omlx.cluster.manager import PeerClient, resolve_model_repo
 
     # A write in effect: it makes every matched peer scan its model
     # directories, which takes tens of seconds each.
@@ -725,7 +766,183 @@ async def check_peers(payload: dict[str, Any]) -> dict[str, Any]:
             "python_error": report.get("python_error", ""),
         }
 
+    # Off the event loop: resolving a repo scans every model directory, which
+    # is the same tens of seconds this endpoint sits behind a button for.
+    repo_id = (
+        await asyncio.to_thread(resolve_model_repo, _settings(), model_id)
+        if model_id
+        else ""
+    )
     results = await asyncio.gather(
         *(asyncio.to_thread(_check, peer) for peer in bootstrap.peers())
     )
-    return {"model": model_id, "peers": list(results)}
+    return {
+        "model": model_id,
+        # What a missing model can be fixed with. Empty means the model has no
+        # HuggingFace origin - locally quantised or renamed - so there is
+        # nothing for a peer to pull and the operator has to copy it across
+        # themselves.
+        "repo_id": repo_id,
+        "peers": list(results),
+    }
+
+
+# =============================================================================
+# Getting the model onto a peer
+# =============================================================================
+
+# Downloads this node has asked peers to run, keyed by node id. Kept so
+# progress can be polled without the browser having to remember task ids
+# across a reload.
+_peer_downloads: dict[str, dict[str, Any]] = {}
+
+
+def _peer_by_node_id(node_id: str) -> Any:
+    from omlx.cluster import bootstrap
+
+    for peer in bootstrap.peers():
+        if peer.info.node_id == node_id:
+            return peer
+    return None
+
+
+@admin_router.post("/peers/download")
+async def start_peer_downloads(payload: dict[str, Any]) -> dict[str, Any]:
+    """Ask the named peers to fetch the cluster model.
+
+    The leader sends a repo id, never bytes. Each peer pulls into its own
+    model directory, which is the only place its discovery will look and the
+    only path its rank could load from.
+    """
+    import asyncio
+
+    from omlx.cluster.manager import PeerClient, resolve_model_repo
+
+    _require_real_auth()
+
+    cluster = getattr(_settings(), "cluster", None)
+    if cluster is None or not cluster.cluster_key:
+        raise HTTPException(status_code=400, detail="no cluster key is configured")
+
+    model_id = str(payload.get("model", "")).strip()
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model is required")
+
+    repo_id = await asyncio.to_thread(resolve_model_repo, _settings(), model_id)
+    if not repo_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{model_id!r} has no source repository - it was quantised or "
+                "renamed locally - so a peer has nothing to download. Copy the "
+                "model directory to the other Mac by hand."
+            ),
+        )
+
+    node_ids = [str(n) for n in (payload.get("node_ids") or [])]
+    key = cluster.cluster_key
+
+    def _start(node_id: str) -> dict[str, Any]:
+        peer = _peer_by_node_id(node_id)
+        if peer is None:
+            return {"node_id": node_id, "ok": False, "error": "peer is no longer visible"}
+        if _fingerprint_matches(key, peer.info.key_fingerprint) is False:
+            return {
+                "node_id": node_id,
+                "ok": False,
+                "error": "this node advertises a different cluster key",
+            }
+        client = PeerClient(peer.host, peer.info.port, key)
+        try:
+            reply = client.post("/cluster/models/download", {"repo_id": repo_id})
+        except Exception as exc:  # noqa: BLE001 - the operator needs the reason
+            # A peer too old to know this route answers 404, which reads as a
+            # missing model rather than a missing feature unless we say so.
+            return {
+                "node_id": node_id,
+                "ok": False,
+                "error": f"{exc} (a peer running an older oMLX cannot be sent a download)",
+            }
+        task = reply.get("task", {})
+        _peer_downloads[node_id] = {
+            "task_id": task.get("task_id", ""),
+            "repo_id": repo_id,
+            "model": model_id,
+        }
+        return {"node_id": node_id, "ok": True, "task": task}
+
+    results = await asyncio.gather(
+        *(asyncio.to_thread(_start, node_id) for node_id in node_ids)
+    )
+    return {"model": model_id, "repo_id": repo_id, "peers": list(results)}
+
+
+@admin_router.get("/peers/downloads")
+async def peer_download_progress() -> dict[str, Any]:
+    """Progress of every download this node started on a peer."""
+    import asyncio
+
+    from omlx.cluster.manager import PeerClient
+
+    cluster = getattr(_settings(), "cluster", None)
+    key = cluster.cluster_key if cluster else ""
+    if not key or not _peer_downloads:
+        return {"downloads": []}
+
+    def _poll(node_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        peer = _peer_by_node_id(node_id)
+        base = {"node_id": node_id, **record}
+        if peer is None:
+            return {**base, "ok": False, "error": "peer is no longer visible"}
+        client = PeerClient(peer.host, peer.info.port, key)
+        try:
+            reply = client.get_json(
+                f"/cluster/models/download/{record['task_id']}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {**base, "ok": False, "error": str(exc)}
+        return {**base, "ok": True, "task": reply.get("task", {})}
+
+    results = await asyncio.gather(
+        *(
+            asyncio.to_thread(_poll, node_id, record)
+            for node_id, record in list(_peer_downloads.items())
+        )
+    )
+    return {"downloads": list(results)}
+
+
+@admin_router.post("/peers/downloads/clear")
+async def clear_peer_downloads() -> dict[str, Any]:
+    """Forget finished downloads so the page stops showing them."""
+    _peer_downloads.clear()
+    return {"ok": True}
+
+
+@admin_router.post("/form")
+async def form_cluster(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Form the cluster now, rather than waiting for the next request.
+
+    Formation is otherwise a side effect of loading the sharded model, which
+    means the first request after the weights land pays for it. Having it as
+    an action of its own is also what lets the page finish a peer download and
+    go straight to a running cluster.
+    """
+    from omlx.cluster.manager import form_async
+
+    _require_real_auth()
+
+    manager = _get_manager() if _get_manager is not None else None
+    if manager is None:
+        raise HTTPException(status_code=400, detail="clustering is not enabled here")
+
+    cluster = getattr(_settings(), "cluster", None)
+    model_id = str((payload or {}).get("model") or (cluster.model if cluster else ""))
+    if not model_id:
+        raise HTTPException(status_code=400, detail="no sharded model is configured")
+
+    try:
+        status = await form_async(manager, model_id)
+    except Exception as exc:  # noqa: BLE001 - the reason is the whole point
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "status": status.to_dict()}

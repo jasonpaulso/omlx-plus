@@ -189,6 +189,18 @@ class PeerClient:
         response.raise_for_status()
         return response.json()
 
+    def get_json(self, path: str, timeout: float | None = None) -> dict[str, Any]:
+        """GET one of the peer's cluster routes."""
+        import httpx
+
+        response = httpx.get(
+            f"{self.base_url}{path}",
+            headers={"X-Cluster-Key": self._key},
+            timeout=PEER_TIMEOUT_S if timeout is None else timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def alive_ranks(self) -> list[int]:
         """Which ranks the peer's daemon says are running, right now."""
         import httpx
@@ -287,6 +299,21 @@ def resolve_model_path(settings: Any, model_id: str) -> str:
             "every node needs its own copy of the weights"
         )
     return found.model_path
+
+
+def resolve_model_repo(settings: Any, model_id: str) -> str:
+    """The HuggingFace repo `model_id` came from, or `""` if it has none.
+
+    Only a model still backed by its HF cache entry can be fetched onto
+    another node. A locally quantised or renamed model has no repo to pull
+    from, and the honest answer is to say so rather than to offer a download
+    that cannot start.
+    """
+    from omlx.model_discovery import discover_models_from_dirs
+
+    discovered = discover_models_from_dirs(list(settings.get_effective_model_dirs()))
+    found = discovered.get(model_id)
+    return getattr(found, "source_repo_id", None) or "" if found else ""
 
 
 class ClusterManager:

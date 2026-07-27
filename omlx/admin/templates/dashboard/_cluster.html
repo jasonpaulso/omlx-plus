@@ -73,6 +73,72 @@
                     </div>
                 </div>
 
+                <!--
+                  The model is not everywhere yet. Shown when a peer answered
+                  and said it does not have the weights; what can be done about
+                  it depends on whether the model has a repo to pull from.
+                -->
+                <div x-show="peersMissingModel.length && !dismissedMissing" x-cloak
+                     class="mb-8 bg-white border border-amber-200 rounded-2xl overflow-hidden">
+                    <div class="px-6 py-4 flex items-start gap-3">
+                        <i data-lucide="download-cloud" class="w-4 h-4 mt-0.5 text-amber-600 shrink-0"></i>
+                        <div class="min-w-0">
+                            <div class="text-sm font-medium text-neutral-900">{{ t('cluster.missing.title') }}</div>
+                            <div class="text-xs text-neutral-500 mt-1"
+                                 x-text="repoId
+                                     ? window.t('cluster.missing.body')
+                                         .replace('{peers}', missingPeerNames)
+                                         .replace('{model}', checkedModel)
+                                     : window.t('cluster.missing.no_repo')
+                                         .replace('{model}', checkedModel)"></div>
+                            <div x-show="repoId" x-cloak class="text-xs text-neutral-400 mt-1 font-mono"
+                                 x-text="repoId"></div>
+                        </div>
+                    </div>
+                    <div x-show="repoId" x-cloak
+                         class="flex items-center justify-end gap-2 px-6 py-3 border-t border-neutral-100 bg-neutral-50">
+                        <button @click="dismissedMissing = true"
+                                class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-900 rounded-lg transition-all">
+                            {{ t('cluster.missing.dismiss') }}
+                        </button>
+                        <button @click="downloadOnPeers()" :disabled="startingDownload"
+                                class="px-4 py-1.5 text-xs font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 transition-all">
+                            <span x-show="!startingDownload">{{ t('cluster.missing.download') }}</span>
+                            <span x-show="startingDownload" x-cloak>{{ t('cluster.missing.starting') }}</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Downloads in flight on the peers -->
+                <div x-show="downloads.length" x-cloak
+                     class="mb-8 bg-white border border-neutral-200 rounded-2xl overflow-hidden">
+                    <div class="flex items-center justify-between px-6 py-4 border-b border-neutral-100">
+                        <h3 class="text-sm font-semibold text-neutral-900">{{ t('cluster.download.heading') }}</h3>
+                        <span x-show="forming" x-cloak class="text-xs text-neutral-500">
+                            {{ t('cluster.download.forming') }}
+                        </span>
+                    </div>
+                    <div class="divide-y divide-neutral-100">
+                        <template x-for="dl in downloads" :key="dl.node_id">
+                            <div class="px-6 py-3.5">
+                                <div class="flex items-center justify-between gap-4">
+                                    <span class="text-sm text-neutral-900 truncate" x-text="peerLabel(dl.node_id)"></span>
+                                    <span class="text-xs shrink-0"
+                                          :class="downloadTone(dl)" x-text="downloadLabel(dl)"></span>
+                                </div>
+                                <div class="mt-2 h-1.5 rounded-full bg-neutral-100 overflow-hidden">
+                                    <div class="h-full rounded-full transition-all"
+                                         :class="dl.task?.status === 'failed' ? 'bg-red-500' : 'bg-neutral-900'"
+                                         :style="`width: ${dl.task?.progress || 0}%`"></div>
+                                </div>
+                                <div class="text-xs text-neutral-400 mt-1 font-mono" x-text="dl.repo_id"></div>
+                                <div x-show="dl.error || dl.task?.error" x-cloak
+                                     class="text-xs text-red-600 mt-1" x-text="dl.error || dl.task?.error"></div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+
                 <!-- Nodes -->
                 <div class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-8">
                     <div class="flex items-center justify-between px-6 py-4 border-b border-neutral-100">

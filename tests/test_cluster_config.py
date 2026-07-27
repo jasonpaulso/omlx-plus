@@ -55,6 +55,9 @@ class FakeSettings:
     def save(self) -> None:
         self.saves += 1
 
+    def get_effective_model_dirs(self):
+        return []
+
 
 class FakeDiscovery:
     """Stands in for Bonjour. Real discovery shells out to `dns-sd`."""
@@ -459,6 +462,158 @@ def test_the_peer_check_does_not_call_a_mismatched_peer(node, monkeypatch):
     assert result["peers"][0]["ok"] is False
     assert result["peers"][0]["key_match"] is False
     assert "different cluster key" in result["peers"][0]["error"]
+
+
+# =============================================================================
+# Getting the model onto a peer
+# =============================================================================
+
+
+@pytest.fixture
+def paired(node, monkeypatch):
+    """A node with one matching peer that is missing the sharded model."""
+    from omlx.cluster.discovery import fingerprint
+
+    client, settings, app = node
+    key = "shared-cluster-key-" + "k" * 10
+    client.post(
+        "/admin/api/cluster/config",
+        json={"enabled": True, "cluster_key": key, "model": "big-model"},
+    )
+    peer = FakePeer("studio", fingerprint(key), "Studio")
+    monkeypatch.setattr(bootstrap, "peers", lambda: [peer])
+    return client, settings, peer
+
+
+def test_a_model_with_no_repo_cannot_be_downloaded_anywhere(paired, monkeypatch):
+    """A locally quantised model has nothing for a peer to pull, and saying so
+    beats offering a button that cannot work."""
+    client, _settings, _peer = paired
+    monkeypatch.setattr(
+        "omlx.cluster.manager.resolve_model_repo", lambda *a, **k: ""
+    )
+
+    response = client.post(
+        "/admin/api/cluster/peers/download",
+        json={"model": "big-model", "node_ids": ["studio"]},
+    )
+
+    assert response.status_code == 400
+    assert "no source repository" in response.json()["detail"]
+
+
+def test_the_check_reports_the_repo_a_peer_could_pull_from(paired, monkeypatch):
+    client, _settings, _peer = paired
+    monkeypatch.setattr(
+        "omlx.cluster.manager.resolve_model_repo", lambda *a, **k: "org/big-model"
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.manager.PeerClient.post",
+        lambda self, path, payload=None: {"has_model": False, "rdma_ready": True},
+    )
+
+    body = client.post(
+        "/admin/api/cluster/peers/check", json={"model": "big-model"}
+    ).json()
+
+    assert body["repo_id"] == "org/big-model"
+    assert body["peers"][0]["has_model"] is False
+
+
+def test_the_leader_sends_a_repo_id_and_never_the_weights(paired, monkeypatch):
+    """The peer pulls into its own model directory. Nothing streams through
+    this Mac, and no path from here is assumed to mean anything there."""
+    client, _settings, _peer = paired
+    sent: list[tuple[str, dict]] = []
+
+    monkeypatch.setattr(
+        "omlx.cluster.manager.resolve_model_repo", lambda *a, **k: "org/big-model"
+    )
+
+    def _post(self, path, payload=None):
+        sent.append((path, payload or {}))
+        return {"ok": True, "task": {"task_id": "t-1", "status": "pending"}}
+
+    monkeypatch.setattr("omlx.cluster.manager.PeerClient.post", _post)
+
+    body = client.post(
+        "/admin/api/cluster/peers/download",
+        json={"model": "big-model", "node_ids": ["studio"]},
+    ).json()
+
+    assert sent == [("/cluster/models/download", {"repo_id": "org/big-model"})]
+    assert body["peers"][0]["ok"] is True
+    assert body["peers"][0]["task"]["task_id"] == "t-1"
+
+
+def test_a_mismatched_peer_is_never_asked_to_download(paired, monkeypatch):
+    from omlx.cluster.discovery import fingerprint
+
+    client, _settings, _peer = paired
+    monkeypatch.setattr(
+        bootstrap, "peers", lambda: [FakePeer("stranger", fingerprint("other"), "X")]
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.manager.resolve_model_repo", lambda *a, **k: "org/big-model"
+    )
+
+    body = client.post(
+        "/admin/api/cluster/peers/download",
+        json={"model": "big-model", "node_ids": ["stranger"]},
+    ).json()
+
+    assert body["peers"][0]["ok"] is False
+    assert "different cluster key" in body["peers"][0]["error"]
+
+
+def test_progress_is_polled_from_the_peer_that_holds_the_task(paired, monkeypatch):
+    client, _settings, _peer = paired
+    monkeypatch.setattr(
+        "omlx.cluster.manager.resolve_model_repo", lambda *a, **k: "org/big-model"
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.manager.PeerClient.post",
+        lambda self, path, payload=None: {
+            "ok": True, "task": {"task_id": "t-1", "status": "pending"}
+        },
+    )
+    client.post(
+        "/admin/api/cluster/peers/download",
+        json={"model": "big-model", "node_ids": ["studio"]},
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.manager.PeerClient.get_json",
+        lambda self, path, timeout=None: {
+            "task": {"task_id": "t-1", "status": "downloading", "progress": 42.0}
+        },
+    )
+
+    body = client.get("/admin/api/cluster/peers/downloads").json()
+
+    assert body["downloads"][0]["node_id"] == "studio"
+    assert body["downloads"][0]["task"]["progress"] == 42.0
+
+    client.post("/admin/api/cluster/peers/downloads/clear")
+    assert client.get("/admin/api/cluster/peers/downloads").json()["downloads"] == []
+
+
+def test_forming_on_demand_reports_why_it_could_not(paired, monkeypatch):
+    """Formation is otherwise a side effect of a request, so its failure
+    reached the operator as a failed completion rather than as a reason."""
+    from omlx.cluster.manager import ClusterFormationError
+
+    client, _settings, _peer = paired
+
+    async def _boom(manager, model_id):
+        raise ClusterFormationError("studio does not have 'big-model' on disk")
+
+    monkeypatch.setattr("omlx.cluster.manager.form_async", _boom)
+    monkeypatch.setattr(bootstrap, "_manager", object())
+
+    response = client.post("/admin/api/cluster/form", json={"model": "big-model"})
+
+    assert response.status_code == 409
+    assert "does not have" in response.json()["detail"]
 
 
 def test_a_stranger_on_the_lan_cannot_break_formation(clean_bootstrap):

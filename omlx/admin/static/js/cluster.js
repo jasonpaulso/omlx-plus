@@ -23,6 +23,13 @@ function clusterPanel() {
         models: [],
         modelOptions: [],
         peerChecks: {},
+        repoId: '',
+        checkedModel: '',
+        dismissedMissing: false,
+        startingDownload: false,
+        downloads: [],
+        downloadTimer: null,
+        forming: false,
         preflight: null,
         showPreflight: false,
         revealKey: false,
@@ -40,11 +47,19 @@ function clusterPanel() {
             // Formation happens out of band - loading the sharded model forms
             // the cluster - so the page polls rather than waiting to be told.
             this.$watch('mainTab', () => this.syncTimer());
+            this.$watch('config.model', () => {
+                this.peerChecks = {};
+                this.dismissedMissing = false;
+                if (this.config.model && this.status.peers?.length) this.checkPeers();
+            });
+            await this.pollDownloads();
+            if (this.downloads.length) this.startDownloadTimer();
             this.syncTimer();
         },
 
         destroy() {
             this.stopTimer();
+            this.stopDownloadTimer();
         },
 
         // `mainTab` is read from the dashboard scope this island sits inside.
@@ -166,8 +181,10 @@ function clusterPanel() {
         },
 
         async checkPeers() {
+            if (!this.config.model) return;
             this.checking = true;
             this.error = '';
+            this.dismissedMissing = false;
             try {
                 const response = await fetch('/admin/api/cluster/peers/check', {
                     method: 'POST',
@@ -182,10 +199,118 @@ function clusterPanel() {
                 const checks = {};
                 for (const peer of data.peers || []) checks[peer.node_id] = peer;
                 this.peerChecks = checks;
+                // Empty when the model has no HuggingFace origin, which is the
+                // difference between "we can fix this for you" and "copy it
+                // across yourself".
+                this.repoId = data.repo_id || '';
+                this.checkedModel = data.model || '';
             } catch (e) {
                 this.error = String(e);
             } finally {
                 this.checking = false;
+            }
+        },
+
+        // Peers that answered and do not have the sharded model. A peer we
+        // could not reach is a different problem and gets its own error line.
+        get peersMissingModel() {
+            return Object.values(this.peerChecks)
+                .filter((c) => c.ok && c.has_model === false);
+        },
+
+        get missingPeerNames() {
+            const byId = {};
+            for (const p of this.status.peers || []) byId[p.node_id] = p;
+            return this.peersMissingModel
+                .map((c) => (byId[c.node_id]?.hostname) || c.node_id)
+                .join(', ');
+        },
+
+        async downloadOnPeers() {
+            this.startingDownload = true;
+            this.error = '';
+            try {
+                const response = await fetch('/admin/api/cluster/peers/download', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: this.config.model,
+                        node_ids: this.peersMissingModel.map((c) => c.node_id),
+                    }),
+                });
+                if (!response.ok) {
+                    this.error = await this.errorText(response);
+                    return;
+                }
+                const data = await response.json();
+                const failed = (data.peers || []).filter((p) => !p.ok);
+                if (failed.length) {
+                    this.error = failed.map((p) => `${p.node_id}: ${p.error}`).join('; ');
+                }
+                this.dismissedMissing = true;
+                await this.pollDownloads();
+                this.startDownloadTimer();
+            } catch (e) {
+                this.error = String(e);
+            } finally {
+                this.startingDownload = false;
+            }
+        },
+
+        startDownloadTimer() {
+            this.stopDownloadTimer();
+            this.downloadTimer = setInterval(() => this.pollDownloads(), 2000);
+        },
+
+        stopDownloadTimer() {
+            if (this.downloadTimer) clearInterval(this.downloadTimer);
+            this.downloadTimer = null;
+        },
+
+        async pollDownloads() {
+            try {
+                const response = await fetch('/admin/api/cluster/peers/downloads');
+                if (!response.ok) return;
+                this.downloads = (await response.json()).downloads || [];
+            } catch (e) {
+                return;
+            }
+            if (!this.downloads.length) {
+                this.stopDownloadTimer();
+                return;
+            }
+            const states = this.downloads.map((d) => d.task?.status || 'pending');
+            if (states.some((s) => s === 'pending' || s === 'downloading')) return;
+
+            this.stopDownloadTimer();
+            // Every download settled. Only a clean sweep earns an automatic
+            // formation; a failure stays on screen for the operator to read.
+            if (states.every((s) => s === 'completed')) {
+                await this.checkPeers();
+                if (!this.peersMissingModel.length) await this.formCluster();
+            }
+        },
+
+        async formCluster() {
+            this.forming = true;
+            this.error = '';
+            try {
+                const response = await fetch('/admin/api/cluster/form', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: this.config.model }),
+                });
+                if (!response.ok) {
+                    this.error = await this.errorText(response);
+                    return;
+                }
+                await fetch('/admin/api/cluster/peers/downloads/clear', { method: 'POST' });
+                this.downloads = [];
+                await this.refresh();
+            } catch (e) {
+                this.error = String(e);
+            } finally {
+                this.forming = false;
             }
         },
 
@@ -221,6 +346,27 @@ function clusterPanel() {
             } catch (e) {
                 return `${response.status} ${response.statusText}`;
             }
+        },
+
+        peerLabel(nodeId) {
+            const peer = (this.status.peers || []).find((p) => p.node_id === nodeId);
+            return peer?.hostname || this.hostLabel(peer?.host) || nodeId;
+        },
+
+        downloadLabel(dl) {
+            if (dl.error) return window.t('cluster.download.failed');
+            const task = dl.task || {};
+            if (task.status === 'completed') return window.t('cluster.download.done');
+            if (task.status === 'failed') return window.t('cluster.download.failed');
+            if (task.status === 'downloading') return `${Math.round(task.progress || 0)}%`;
+            return window.t('cluster.download.waiting');
+        },
+
+        downloadTone(dl) {
+            const status = dl.error ? 'failed' : (dl.task?.status || 'pending');
+            if (status === 'completed') return 'text-green-700';
+            if (status === 'failed') return 'text-red-600';
+            return 'text-neutral-500';
         },
 
         // Bonjour hands back either a `.local` name or a bare address. Only

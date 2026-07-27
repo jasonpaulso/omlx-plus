@@ -73,5 +73,19 @@
   "cluster.config.backend_jaccl_ring": "RDMA ring over Thunderbolt (jaccl-ring)",
   "cluster.card.fleet_memory_hint_one": "on this Mac alone",
   "cluster.state.holding_ranks": "Holding ranks",
-  "cluster.follower_hint": "This Mac holds ranks for a cluster led by another Mac. Configuration is locked until that cluster is torn down from its leader."
+  "cluster.follower_hint": "This Mac holds ranks for a cluster led by another Mac. Configuration is locked until that cluster is torn down from its leader.",
+  "cluster.missing.title": "This model is not on every node yet",
+  "cluster.missing.body": "{peers} cannot join until it has {model}. Downloading it there is enough — the weights never travel through this Mac.",
+  "cluster.missing.no_repo": "{model} has no source repository — it was quantised or renamed locally, so there is nothing for the other Mac to download. Copy the model directory across by hand.",
+  "cluster.missing.download": "Download it there",
+  "cluster.missing.dismiss": "Not now",
+  "cluster.missing.starting": "Asking the peer…",
+  "cluster.download.heading": "Downloading on peers",
+  "cluster.download.waiting": "Starting…",
+  "cluster.download.done": "Downloaded",
+  "cluster.download.failed": "Download failed",
+  "cluster.download.forming": "Weights are in place — starting the cluster…",
+  "cluster.download.formed": "Cluster started.",
+  "cluster.form.now": "Start cluster",
+  "cluster.form.starting": "Starting…"
 }
