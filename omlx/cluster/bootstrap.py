@@ -6,10 +6,24 @@ Everything the server needs to know about clustering is `install()` and
 rather than being threaded through with cluster logic, and it gives the feature
 a single place to be switched off.
 
-Nothing here does real work while `cluster.enabled` is False. In particular the
-heavy imports - `mlx.distributed`, FastAPI route registration, the discovery
-backend - happen inside `install()` rather than at module scope, so a disabled
-cluster costs one attribute lookup at startup and adds no routes at all.
+Nothing here does real work while `cluster.enabled` is False. `mlx.distributed`
+and the discovery backend are imported inside `install()` rather than at module
+scope, so a disabled cluster costs one attribute lookup at startup.
+
+The two routers are installed on different conditions, and the difference is
+the whole security boundary:
+
+- `admin_router` is behind the daemon's own admin auth and is registered
+  unconditionally. It is *how* clustering gets turned on, so gating it on
+  clustering being on would make the feature unreachable from the UI - which
+  is exactly the state this file used to be in.
+- `peer_router` authenticates with the shared cluster key and spawns rank
+  processes on this machine. It appears only once the operator has opted in
+  with a key.
+
+Neither router can be removed once added: FastAPI has no route removal. That is
+survivable because `verify_cluster_key` reads live settings on every call, so
+disabling clustering leaves the peer paths present but fail-closed.
 """
 
 from __future__ import annotations
@@ -21,7 +35,16 @@ logger = logging.getLogger(__name__)
 
 _discovery: Any = None
 _manager: Any = None
-_installed = False
+# The live GlobalSettings. Held so `configure()` can hand the routes a getter
+# rather than a captured object - a hot-apply that ever swapped the settings
+# object would otherwise leave `verify_cluster_key` comparing against a key the
+# operator has already rotated away.
+_settings: Any = None
+# Tracked separately. One flag for both would mean the admin router's
+# registration at startup suppressed the peer router's registration on a later
+# live enable, and the leader's `/cluster/report` would 404 instead of forming.
+_admin_installed = False
+_peer_installed = False
 
 
 def install(app: Any, settings: Any) -> bool:
@@ -32,8 +55,23 @@ def install(app: Any, settings: Any) -> bool:
     would have nothing to authenticate against, and silently forming an
     unauthenticated cluster on whatever LAN the machine is attached to is not
     a reasonable default.
+
+    Safe to call again on a running daemon - that is how a configuration change
+    is applied without a restart - provided `shutdown()` ran first.
     """
-    global _discovery, _manager, _installed
+    global _discovery, _manager, _settings, _admin_installed, _peer_installed
+
+    _settings = settings
+
+    # Unconditional: the operator surface has to exist on a node that has never
+    # heard of clustering, because it is the thing that turns clustering on.
+    # Every handler on it already tolerates a None manager and no discovery.
+    from .routes import admin_router, configure
+
+    configure(lambda: _settings, lambda: _manager)
+    if app is not None and not _admin_installed:
+        app.include_router(admin_router)
+        _admin_installed = True
 
     cluster = getattr(settings, "cluster", None)
     if cluster is None or not cluster.enabled:
@@ -51,18 +89,16 @@ def install(app: Any, settings: Any) -> bool:
 
         from .discovery import ClusterDiscovery, default_node_id
         from .manager import ClusterManager
-        from .routes import admin_router, configure, peer_router
+        from .routes import peer_router
 
         _manager = ClusterManager(settings, peers)
-        configure(lambda: settings, lambda: _manager)
 
-        # Routes are added once per process. FastAPI has no remove, and a
-        # settings reload that re-ran install() would otherwise stack
-        # duplicate paths.
-        if not _installed and app is not None:
+        # Added once per process, but on the first *enable* rather than at
+        # startup - which may be now, on a live config write, long after the
+        # app was built.
+        if app is not None and not _peer_installed:
             app.include_router(peer_router)
-            app.include_router(admin_router)
-            _installed = True
+            _peer_installed = True
 
         _discovery = ClusterDiscovery(
             node_id=default_node_id(),
@@ -98,9 +134,13 @@ def shutdown() -> None:
         _manager = None
 
     try:
-        from .routes import shutdown_follower
+        from .routes import reset_resolved, shutdown_follower
 
         shutdown_follower()
+        # Model paths resolved at report time are only valid for the model
+        # directories that were configured when they were resolved. Carrying
+        # them across a settings change would spawn a worker on a stale path.
+        reset_resolved()
     except Exception:  # noqa: BLE001
         logger.exception("cluster: follower teardown was not clean")
 
@@ -112,6 +152,40 @@ def shutdown() -> None:
         logger.exception("cluster: discovery did not stop cleanly")
     finally:
         _discovery = None
+
+
+async def reapply(app: Any, settings: Any, *, previous_model: str = "") -> bool:
+    """Apply a changed cluster configuration without restarting the daemon.
+
+    A field write alone changes nothing that matters: `ClusterDiscovery` reads
+    the port and poll interval at construction, and a formed cluster holds a
+    `ClusterManager` built from the old settings. So the whole cycle runs -
+    including dropping any pooled engine that still points at the manager
+    `shutdown()` is about to discard.
+
+    That eviction is not housekeeping. `ClusterEngine` holds its manager by
+    reference, and while clustering is disabled the pool will not rebuild the
+    engine either, so a stale one would keep answering requests through a torn
+    down cluster until something else evicted it.
+    """
+    await _evict_cluster_engine(previous_model)
+    shutdown()
+    return install(app, settings)
+
+
+async def _evict_cluster_engine(model_id: str) -> None:
+    """Drop the pooled engine for `model_id`, if one is loaded."""
+    if not model_id:
+        return
+    try:
+        from omlx.server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is None:
+            return
+        await pool._unload_engine(model_id)
+    except Exception:  # noqa: BLE001 - a config write must not fail on this
+        logger.exception("cluster: could not unload the cluster engine for %s", model_id)
 
 
 def peers() -> list[Any]:

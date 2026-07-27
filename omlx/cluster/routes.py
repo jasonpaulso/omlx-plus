@@ -22,7 +22,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from pydantic import BaseModel
 
 from omlx.admin.auth import require_admin
 from omlx.cluster import preflight, topology
@@ -60,6 +61,23 @@ _follower_watch: DeathWatch | None = None
 # against a peer that was still listing its disk.
 _resolved: dict[str, str] = {}
 _resolved_python: str = ""
+
+# This machine's own description, for the operator surface. Cached because
+# resolving it shells out to `sysctl`, and the admin UI polls status every few
+# seconds; none of it changes while the process lives.
+_local_node: dict[str, Any] | None = None
+
+
+def reset_resolved() -> None:
+    """Forget what `/cluster/report` resolved.
+
+    Called on shutdown, which includes the shutdown half of a configuration
+    change. A path resolved under one set of model directories is not a path
+    under the next set.
+    """
+    global _resolved_python
+    _resolved.clear()
+    _resolved_python = ""
 
 
 def configure(
@@ -329,25 +347,74 @@ def shutdown_follower() -> None:
 # =============================================================================
 
 
+def _local_description() -> dict[str, Any]:
+    """This machine, as a peer would see it."""
+    global _local_node
+
+    if _local_node is None:
+        from omlx import __version__
+        from omlx.cluster.discovery import (
+            default_chip,
+            default_hostname,
+            default_node_id,
+            default_ram_gb,
+        )
+
+        _local_node = {
+            "node_id": default_node_id(),
+            "hostname": default_hostname(),
+            "chip": default_chip(),
+            "ram_gb": default_ram_gb(),
+            "version": str(__version__),
+        }
+    return dict(_local_node)
+
+
 @admin_router.get("/status")
 async def cluster_status() -> dict[str, Any]:
-    """Formation state, chosen backend, rank order and any blockers."""
+    """Formation state, chosen backend, rank order and any blockers.
+
+    Answers on a node where clustering has never been enabled, because that is
+    the node the operator is looking at when they come to turn it on. The
+    cluster key is deliberately absent: this is polled every few seconds, and
+    a secret does not belong in a heartbeat.
+    """
+    import asyncio
+
     from omlx.cluster import bootstrap
 
+    cluster = getattr(_settings(), "cluster", None)
     manager = _get_manager() if _get_manager is not None else None
     status = (
         manager.status().to_dict()
         if manager is not None
         else {"enabled": False, "formed": False}
     )
+
+    # Read from settings rather than from the manager: with clustering off
+    # there is no manager, and "off" is precisely what the UI needs to render.
+    status["enabled"] = bool(cluster and cluster.enabled)
+    status["configured"] = bool(cluster and cluster.enabled and cluster.cluster_key)
+
+    local = await asyncio.to_thread(_local_description)
+    local["port"] = _settings().server.port
+    status["local"] = local
+
+    key = cluster.cluster_key if cluster else ""
     status["peers"] = [
         {
             "node_id": p.info.node_id,
+            "hostname": p.info.hostname,
             "host": p.host,
             "port": p.info.port,
             "chip": p.info.chip,
             "ram_gb": p.info.ram_gb,
             "version": p.info.version,
+            # A peer advertising a different key will never join. Saying so is
+            # the difference between a pairing mistake and an empty list.
+            # Display only - the authorisation decision stays with
+            # `verify_cluster_key`, which compares the key itself.
+            "key_match": _fingerprint_matches(key, p.info.key_fingerprint),
         }
         for p in bootstrap.peers()
     ]
@@ -355,6 +422,15 @@ async def cluster_status() -> dict[str, Any]:
         r.rank for r in _follower.ranks
     ]
     return status
+
+
+def _fingerprint_matches(key: str, peer_fingerprint: str) -> bool | None:
+    """Whether a peer advertises our key. None when we have no key to compare."""
+    from omlx.cluster.discovery import matches_fingerprint
+
+    if not key or not peer_fingerprint:
+        return None
+    return matches_fingerprint(key, peer_fingerprint)
 
 
 @admin_router.get("/preflight")
@@ -389,3 +465,248 @@ async def cluster_teardown() -> dict[str, Any]:
         await asyncio.to_thread(manager.teardown)
     await asyncio.to_thread(_stop_follower)
     return {"ok": True}
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+BACKENDS = ("auto", "ring", "jaccl", "jaccl-ring")
+
+# Longer than the daemon's own API key minimum, and deliberately so. Every node
+# broadcasts a truncated digest of this key over Bonjour to the whole LAN, so a
+# short one can be recovered offline and then used to spawn processes here. A
+# generated key is 32 bytes; a typed one has to be non-trivial.
+KEY_MIN_LENGTH = 16
+
+
+class ClusterConfigRequest(BaseModel):
+    """A partial update. Every field left unset keeps its current value."""
+
+    enabled: bool | None = None
+    cluster_key: str | None = None
+    backend: str | None = None
+    model: str | None = None
+    pipeline: bool | None = None
+    max_batch_size: int | None = None
+    discovery_interval_seconds: float | None = None
+
+
+def _require_real_auth() -> None:
+    """Refuse configuration writes when admin auth has been switched off.
+
+    `auth.skip_api_key_verification` makes `require_admin` return True for
+    every caller. That is the operator's choice for the rest of the admin API,
+    but this endpoint is different in kind: writing a cluster key and enabling
+    clustering is what causes `peer_router` to be served, and `peer_router`
+    spawns processes on this machine. Turning an unauthenticated config write
+    into unauthenticated remote execution is not a trade anyone opted into by
+    skipping key verification.
+    """
+    auth = getattr(_settings(), "auth", None)
+    if auth is not None and getattr(auth, "skip_api_key_verification", False):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Cluster configuration cannot be changed while "
+                "auth.skip_api_key_verification is enabled. Configure an API "
+                "key first, or edit cluster settings in settings.json."
+            ),
+        )
+
+
+def _validate_cluster_key(key: str) -> None:
+    """The same wire constraints as the daemon's API key, plus a length floor.
+
+    The ASCII rule is not cosmetic: this key is sent as the `X-Cluster-Key`
+    header, which the ASGI layer decodes as latin-1, so a non-ASCII key can
+    never be matched over the wire and would fail as a silent 403 on every
+    peer call.
+    """
+    if not key:
+        return
+    if len(key) < KEY_MIN_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cluster key must be at least {KEY_MIN_LENGTH} characters",
+        )
+    if any(c.isspace() for c in key):
+        raise HTTPException(
+            status_code=400, detail="Cluster key must not contain whitespace"
+        )
+    if not key.isprintable() or not key.isascii():
+        raise HTTPException(
+            status_code=400,
+            detail="Cluster key must contain only printable ASCII characters",
+        )
+
+
+def _config_dict(cluster: Any) -> dict[str, Any]:
+    return {
+        "enabled": cluster.enabled,
+        "cluster_key": cluster.cluster_key,
+        "backend": cluster.backend,
+        "model": cluster.model,
+        "pipeline": cluster.pipeline,
+        "max_batch_size": cluster.max_batch_size,
+        "discovery_interval_seconds": cluster.discovery_interval_seconds,
+    }
+
+
+@admin_router.get("/config")
+async def get_cluster_config() -> dict[str, Any]:
+    """The cluster settings, for the admin form.
+
+    Returns the key in the clear, matching how `GET /admin/api/global-settings`
+    already treats the daemon's API key: the operator has to be able to read it
+    off one Mac to type it into the other, and this endpoint is fetched on
+    demand rather than polled.
+    """
+    cluster = getattr(_settings(), "cluster", None)
+    if cluster is None:
+        raise HTTPException(status_code=503, detail="settings are not loaded")
+    config = _config_dict(cluster)
+    config["backends"] = list(BACKENDS)
+    config["key_min_length"] = KEY_MIN_LENGTH
+    return config
+
+
+@admin_router.post("/key")
+async def generate_cluster_key() -> dict[str, str]:
+    """Mint a key for pairing. Not saved until the form is saved."""
+    import secrets
+
+    _require_real_auth()
+    return {"cluster_key": secrets.token_urlsafe(32)}
+
+
+@admin_router.post("/config")
+async def set_cluster_config(
+    payload: ClusterConfigRequest, request: Request
+) -> dict[str, Any]:
+    """Write the cluster settings and apply them without a restart.
+
+    Applying means tearing the cluster down and standing it back up, because
+    discovery reads its port and interval once at construction and a formed
+    cluster holds a manager built from the old settings. That is why a cluster
+    with a request in flight is refused rather than quietly interrupted.
+    """
+    from omlx.cluster import bootstrap
+
+    _require_real_auth()
+
+    settings = _settings()
+    cluster = getattr(settings, "cluster", None)
+    if cluster is None:
+        raise HTTPException(status_code=503, detail="settings are not loaded")
+
+    manager = _get_manager() if _get_manager is not None else None
+    if manager is not None:
+        status = manager.status()
+        if status.formed and status.busy:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The cluster is serving a request. Wait for it to finish, "
+                    "or tear the cluster down first."
+                ),
+            )
+
+    if payload.backend is not None and payload.backend not in BACKENDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid backend: {payload.backend!r} (expected one of {list(BACKENDS)})",
+        )
+    if payload.max_batch_size is not None and not 1 <= payload.max_batch_size <= 64:
+        raise HTTPException(
+            status_code=400, detail="max_batch_size must be between 1 and 64"
+        )
+    if payload.discovery_interval_seconds is not None and not (
+        1.0 <= payload.discovery_interval_seconds <= 300.0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="discovery_interval_seconds must be between 1 and 300",
+        )
+    if payload.cluster_key is not None:
+        _validate_cluster_key(payload.cluster_key)
+
+    # Enabling without a key would start discovery, advertise nothing anyone
+    # can authenticate against, and leave the operator staring at a peer list
+    # that never fills in.
+    key = cluster.cluster_key if payload.cluster_key is None else payload.cluster_key
+    enabled = cluster.enabled if payload.enabled is None else payload.enabled
+    if enabled and not key:
+        raise HTTPException(
+            status_code=400,
+            detail="Set a cluster key before enabling clustering.",
+        )
+
+    previous_model = cluster.model
+    for name, value in payload.model_dump(exclude_unset=True).items():
+        if value is not None:
+            setattr(cluster, name, value)
+
+    settings.save()
+
+    advertising = await bootstrap.reapply(
+        request.app, settings, previous_model=previous_model
+    )
+    logger.info(
+        "cluster: configuration applied (enabled=%s, advertising=%s)",
+        cluster.enabled,
+        advertising,
+    )
+    return {"ok": True, "advertising": advertising, "config": _config_dict(cluster)}
+
+
+@admin_router.post("/peers/check")
+async def check_peers(payload: dict[str, Any]) -> dict[str, Any]:
+    """Ask every peer whether it can serve a model, on demand.
+
+    Behind a button rather than on the status poll on purpose: with a model set
+    this makes each peer scan its model directories, which on a machine with a
+    large external volume takes tens of seconds.
+    """
+    import asyncio
+
+    from omlx.cluster import bootstrap
+    from omlx.cluster.manager import PeerClient
+
+    cluster = getattr(_settings(), "cluster", None)
+    if cluster is None or not cluster.cluster_key:
+        raise HTTPException(status_code=400, detail="no cluster key is configured")
+
+    model_id = str(payload.get("model", ""))
+    key = cluster.cluster_key
+
+    def _check(peer: Any) -> dict[str, Any]:
+        # Same rule as formation: a peer advertising a different key is not
+        # called at all. Calling it would hand our key to a machine that is
+        # not in this cluster, and return a raw 403 where the page already
+        # knows the answer.
+        if _fingerprint_matches(key, peer.info.key_fingerprint) is False:
+            return {
+                "node_id": peer.info.node_id,
+                "ok": False,
+                "key_match": False,
+                "error": "this node advertises a different cluster key",
+            }
+        client = PeerClient(peer.host, peer.info.port, key)
+        try:
+            report = client.post("/cluster/report", {"model": model_id})
+        except Exception as exc:  # noqa: BLE001 - the operator wants the reason
+            return {"node_id": peer.info.node_id, "ok": False, "error": str(exc)}
+        return {
+            "node_id": peer.info.node_id,
+            "ok": True,
+            "has_model": report.get("has_model", False),
+            "rdma_ready": report.get("rdma_ready", False),
+            "blockers": report.get("blockers", []),
+            "python_error": report.get("python_error", ""),
+        }
+
+    results = await asyncio.gather(
+        *(asyncio.to_thread(_check, peer) for peer in bootstrap.peers())
+    )
+    return {"model": model_id, "peers": list(results)}
