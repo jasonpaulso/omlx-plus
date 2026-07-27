@@ -1077,7 +1077,10 @@ def _make_t(locale: dict):
     """Return a Jinja2-compatible t() function for the given locale dict."""
 
     def t(key: str) -> str:
-        return locale.get(key, key)
+        # Fall back to English before falling back to the raw key. A string
+        # added to en.json but not yet translated then reads as English rather
+        # than as `cluster.heading`.
+        return locale.get(key) or _en_locale.get(key, key)
 
     return t
 

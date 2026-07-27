@@ -179,6 +179,12 @@ class EnginePool:
 
         self._scheduler_config.hot_cache_budget = SharedHotCacheBudget(hot_max)
 
+    def _is_cluster_model(self, model_id: str) -> bool:
+        """True when `model_id` is the model this fleet shards across nodes."""
+        from .cluster import bootstrap as cluster_bootstrap
+
+        return cluster_bootstrap.serves_cluster_model(model_id)
+
     def _current_ceiling(self) -> int:
         """Resolve the current memory ceiling via the enforcer callback.
 
@@ -897,9 +903,15 @@ class EnginePool:
             # ceiling (static, guard-independent) and keep evicting, but
             # never refuse the load under it — with the guard off the
             # user opted out of hard limits.
-            ceiling = self._current_ceiling()
+            # A cluster-served model's weights never enter this process. Rank 0
+            # is a child process holding one shard and the peers hold the rest,
+            # so admitting it against this daemon's own ceiling would refuse
+            # exactly the models clustering exists to serve. See
+            # docs/cluster-serving.md for what the operator owns instead.
+            cluster_served = self._is_cluster_model(model_id)
+            ceiling = 0 if cluster_served else self._current_ceiling()
             best_effort = False
-            if ceiling <= 0:
+            if ceiling <= 0 and not cluster_served:
                 ceiling = self._fallback_admission_ceiling()
                 best_effort = ceiling > 0
             if ceiling > 0:
@@ -1766,6 +1778,18 @@ class EnginePool:
                 return await self._evict_idle_lru_for_prefill(
                     exclude_model_id=_model_id,
                     eviction_request=eviction_request,
+                )
+
+            # Cluster serving takes priority over every local engine type:
+            # this model exists precisely because it does not fit here.
+            if engine is None:
+                from .cluster import bootstrap as cluster_bootstrap
+
+                engine = cluster_bootstrap.build_engine(
+                    model_id=model_id,
+                    model_path=entry.model_path,
+                    trust_remote_code=trc,
+                    model_settings=model_settings,
                 )
 
             # Create engine based on engine type (if DFlash not active)

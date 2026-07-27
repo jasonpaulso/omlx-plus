@@ -7,11 +7,10 @@ The feature is off by default. With `cluster.enabled = false` the daemon's only
 contact with `omlx/cluster/` is `bootstrap.install()` at startup, which returns
 immediately; single-node behaviour is unchanged.
 
-This document describes the foundation that exists today: the launch contract,
-the rank worker, topology detection, preflight and discovery. Scheduler and
-KV-cache integration are **not** built yet, so no HTTP request is served by a
-cluster — driving one currently means going through `LocalCluster` directly, as
-shown at the end.
+`/v1/chat/completions` is served by a cluster today, one request at a time. The
+rank-aware scheduler that would let a cluster batch is specified in
+`docs/cluster-scheduler-divergence-audit.md` and is not built; the section
+"What one-at-a-time means" below says exactly what that costs.
 
 ## What this is built on
 
@@ -136,6 +135,87 @@ Two traps worth knowing:
   the Thunderbolt interfaces enslaved, so the RDMA conflict outlives the
   setting that caused it. The bridge also returns after a reboot, which is why
   preflight runs on every cluster formation rather than once at setup.
+
+## Serving a request
+
+```
+POST /v1/chat/completions          leader daemon
+        |                               |
+        v                               v
+   ClusterEngine  ---- token ids ---> rank 0 worker  <=== collective ===> rank 1
+        ^                               |
+        +--------- text chunks ---------+
+```
+
+`ClusterEngine` subclasses `BatchedEngine`, so chat templating, tool
+conversion, Harmony preprocessing and thinking kwargs are the *same code* that
+serves local models — all of it is tokenizer work, and none of it cares where
+the weights are. What is replaced is only the two methods that touch weights:
+`start` loads a tokenizer instead of a model, and `generate` /`stream_generate`
+push token ids down a pipe instead of into a local scheduler.
+
+The prompt crosses the pipe **already tokenized**. The daemon holds the
+tokenizer it used to render the chat template, and re-encoding the string
+inside each worker would be one more chance for the ranks to disagree, for
+nothing.
+
+The engine is selected by model id: `cluster.model` names the one model this
+fleet shards. Every other model on every node keeps loading and serving
+locally, out of the same pool, at the same time.
+
+**Local memory admission is skipped for that model, deliberately.** Its weights
+never enter the daemon process — rank 0 is a child process holding one shard —
+so checking it against this machine's ceiling would refuse exactly the models
+clustering exists to serve. The trade is that the operator, not the pool, owns
+the headroom for the shard.
+
+### What one-at-a-time means
+
+`ClusterManager.stream` holds a lock for the whole generation. This is
+correctness, not a tuning parameter: under tensor parallelism every rank must
+run the same forward pass, so overlapping two requests means every rank
+agreeing, at every step, which sequences advance. That is the rank-aware
+scheduler, and it does not exist yet. A second concurrent request would not be
+slower, it would be wrong — so it queues.
+
+There is no prefix cache on this path either, for the same reason: a local
+cache hit is exactly the state ranks may not branch on. Each request starts
+from a fresh `make_prompt_cache`.
+
+## Aborting a running request
+
+Rank 0's stdin is occupied for the whole of a generation — it is inside the
+decode loop and cannot go back and read another command — so an abort needs
+somewhere else to arrive. It gets a second inherited pipe, polled between
+tokens, and the result is agreed through the collective like any other stop
+decision. Peers never hear about the abort directly; they hear rank 0's verdict.
+
+A client that disconnects mid-stream therefore does stop the cluster, which
+matters more here than locally: until those ranks leave the decode loop,
+nothing else can be served at all.
+
+## The control plane
+
+Every daemon serves the peer half:
+
+| route | who calls it | what it does |
+|---|---|---|
+| `POST /cluster/report` | a forming leader | topology, RDMA state, *and* whether this node has the model and an interpreter that can import oMLX |
+| `POST /cluster/ranks/start` | a forming leader | spawn this node's ranks |
+| `POST /cluster/ranks/stop` | a leader, or recovery | kill them |
+| `GET /admin/api/cluster/status` | the admin UI | formation state, backend, rank order, peers |
+| `GET /admin/api/cluster/preflight` | the admin UI | this node's checklist |
+| `POST /admin/api/cluster/teardown` | an operator | stop everything, everywhere |
+
+The peer routes authenticate with the shared `cluster_key`, not the node's API
+key. They are not the same permission: a cluster key says "you may make this
+machine a rank", not "you may use this machine's models".
+
+`/cluster/report` answers the model and interpreter questions *before* anything
+is spawned on purpose. Both failures are otherwise invisible: a rank whose
+interpreter cannot import oMLX dies before it listens, and the **other**
+machine reports `[ring] Couldn't connect (error: 65)` — which reads as a
+firewall fault and is not one.
 
 ## Correctness under lockstep
 

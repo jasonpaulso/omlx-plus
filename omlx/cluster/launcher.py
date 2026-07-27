@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -40,10 +41,38 @@ class RankProcess:
     rank: int
     process: subprocess.Popen
     node_id: str = "local"
+    # Write end of the out-of-band signal pipe. Only rank 0 gets one; peers
+    # learn about an abort through the collective, from rank 0.
+    control_w: int | None = None
 
     @property
     def alive(self) -> bool:
         return self.process.poll() is None
+
+
+def resolve_python(candidate: str | None = None) -> str:
+    """Pick an interpreter that can actually `import omlx`.
+
+    A peer daemon spawns ranks from whatever cwd and environment launchd gave
+    it, and an interpreter that cannot see oMLX fails in the least obvious way
+    available: the rank dies immediately with `ModuleNotFoundError`, nobody is
+    listening on its ring port, and *the other machine* reports
+    `[ring] Couldn't connect (error: 65)` - which reads as a firewall or
+    routing fault and is not one. Resolving this before spawning turns a
+    cross-machine mystery into a local error message.
+    """
+    python = candidate or sys.executable
+    probe = subprocess.run(
+        [python, "-c", "import omlx, sys; sys.stdout.write(omlx.__file__)"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(
+            f"{python} cannot import omlx: {probe.stderr.strip() or 'no output'}"
+        )
+    return python
 
 
 @dataclass
@@ -114,16 +143,40 @@ class LocalCluster:
             if self.pipeline:
                 argv.append("--pipeline")
 
-            process = subprocess.Popen(
-                argv,
-                env=hostfile.scrubbed_parent_env() | spec.env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=None,  # worker logs go to the daemon's stderr
-                text=True,
-                bufsize=1,
+            # Rank 0 gets a second, out-of-band pipe. Its stdin is occupied for
+            # the whole of a generation - it is inside the decode loop and
+            # cannot go back and read another command - so an abort that has to
+            # reach a *running* request needs somewhere else to arrive.
+            control_r = control_w = None
+            if rank == 0:
+                control_r, control_w = os.pipe()
+                os.set_inheritable(control_r, True)
+                argv += ["--control-fd", str(control_r)]
+
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    env=hostfile.scrubbed_parent_env() | spec.env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=None,  # worker logs go to the daemon's stderr
+                    text=True,
+                    bufsize=1,
+                    pass_fds=(control_r,) if control_r is not None else (),
+                )
+            except BaseException:
+                if control_w is not None:
+                    os.close(control_w)
+                raise
+            finally:
+                # The child owns the read end now; keeping it open here would
+                # mean the worker never sees the pipe close when we go away.
+                if control_r is not None:
+                    os.close(control_r)
+
+            self.ranks.append(
+                RankProcess(rank=rank, process=process, control_w=control_w)
             )
-            self.ranks.append(RankProcess(rank=rank, process=process))
             logger.info("cluster: spawned rank %d (pid %d)", rank, process.pid)
 
     def wait_until_ready(
@@ -200,6 +253,24 @@ class LocalCluster:
             if reply.get("done") or not reply.get("ok", False):
                 return
 
+    def abort(self) -> bool:
+        """Ask a running generation to stop, out of band.
+
+        Returns False when there is nothing to abort. The worker polls this
+        pipe between tokens and agrees the decision through the collective, so
+        every rank leaves the decode loop on the same step; nothing here
+        reaches the peers directly.
+        """
+        leader = self.leader
+        if leader is None or leader.control_w is None or not leader.alive:
+            return False
+        try:
+            os.write(leader.control_w, b'{"op": "abort"}\n')
+        except OSError:
+            logger.warning("cluster: abort signal could not be delivered")
+            return False
+        return True
+
     def stop(self, *, timeout: float = 10.0) -> None:
         """Shut every local rank down, politely then not.
 
@@ -222,5 +293,12 @@ class LocalCluster:
                 logger.warning("cluster: rank %d ignored shutdown, killing", entry.rank)
                 entry.process.kill()
                 entry.process.wait(timeout=timeout)
+            finally:
+                if entry.control_w is not None:
+                    try:
+                        os.close(entry.control_w)
+                    except OSError:
+                        pass
+                    entry.control_w = None
 
         self.ranks.clear()

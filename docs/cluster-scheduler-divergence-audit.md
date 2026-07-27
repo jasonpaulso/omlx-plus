@@ -65,12 +65,56 @@ Python dicts preserve insertion order, and the hot paths iterate dicts
 identical across ranks as long as insertion order is — which follows from
 broadcasting admission. No bare `set` iteration was found in a decision path.
 
-## Class E: cache lookups — not yet audited
+## Class E: cache lookups — one function, one field
 
-49 grep hits on `prefix_cache` / `cache_hit` / `lookup` / `reuse`. A local
-prefix-cache hit is a textbook divergence source: rank 0 hits, rank 1 misses,
-and they disagree about how many tokens to prefill. This class was **not**
-worked through and is the remaining piece of the audit.
+49 grep hits, and they collapse to a single entry point:
+**`_prepare_prefix_cache_for_request()` (line 6349)**, called once per
+admission at line 8111. Everything else in the class is either its helpers, its
+logging, or teardown.
+
+The function's only divergent output is **`request.remaining_tokens`**. That
+field is what line 8117 turns into the prefill's token count, so it decides the
+*shape of a forward pass*. Two ranks that disagree about it do not produce
+slightly different answers; they issue different collectives and hang.
+
+Everything it writes is per-request and derived from the same lookup:
+
+| field | set at | consequence of divergence |
+|---|---|---|
+| `remaining_tokens` | 6391, 6419, 6429, 6448, 6470, 6476, 6479 | different prefill length — **fatal** |
+| `prompt_cache` | 6386 | different KV state entering the pass |
+| `block_table`, `shared_prefix_blocks` | 6387, 6389 | paged bookkeeping only |
+| `cached_tokens` | 6388 | reported usage only |
+
+Three separate ways to reach a different `remaining_tokens` on two machines,
+all of them ordinary operation rather than edge cases:
+
+1. **The block store is per-node.** `fetch_cache` (6356) reads this machine's
+   paged/SSD cache. Rank 0 served the previous turn and has the blocks; rank 1
+   was idle and does not.
+2. **Reconstruction can fail locally** (6466) and silently downgrade a hit to a
+   miss on one rank — `reconstruct_cache` also truncates `block_table`
+   in place on partial validity (6375, 6453).
+3. **`_bypass_hot_cache_under_pressure()` (6364)** is Class B wearing a Class E
+   hat: it reads `_current_usage_bytes()`, so the *memory* divergence decides
+   whether blocks are preloaded, and the non-preloaded path can reconstruct a
+   different number of tokens.
+
+`_find_pending_store_for_lookup` (6233) waits on this node's in-flight store
+jobs before looking up, which is a fourth path to the same field and is also
+wall-clock dependent.
+
+**How it must be fixed.** Not by broadcasting the reconstructed cache — that is
+gigabytes per turn. The seam is the *decision*: rank 0 performs the lookup,
+agrees `len(remaining_tokens)` through the collective, and any rank whose local
+lookup produced a different number discards its cache and prefills the agreed
+count from scratch. Correct, cheap (one int per admission), and it degrades to
+"nobody uses the cache" only when the ranks genuinely disagree.
+
+**Until that exists, cluster mode runs with no prefix cache at all** — see
+`omlx/cluster/engine.py`, which starts every request from a fresh
+`make_prompt_cache`. That is why the current serving path is safe without any
+of this.
 
 ## Implication for the fix
 
@@ -91,3 +135,15 @@ verdict for a fixed request sequence.
 Grep by divergence class, then read every hit in context. Counts:
 timing 11, local-memory 40, RNG 5, iteration 14, cache 49. Reading the hits
 that actually gate a decision is a few hundred lines, not the whole file.
+
+## Status
+
+The audit is complete: all five classes have been worked through. Two of them
+need code before the scheduler can run inside a rank worker — **memory-gated
+admission** (Class B, six gates) and **the prefix-cache lookup** (Class E, one
+field). The other three are already safe.
+
+Neither is on the critical path for what ships today. The current cluster
+serves one request at a time from a fresh cache
+(`omlx/cluster/worker.py`), which is why it needs no part of this. This
+document is the specification for the batched successor.

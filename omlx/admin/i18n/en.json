@@ -840,5 +840,17 @@
   "js.error.delete_model_failed": "Failed to delete model",
   "js.error.delete_model_connection": "Failed to delete model. Check server connection.",
   "js.success.download_started": "Download started: {repo_id}",
-  "js.success.settings_saved": "Settings saved successfully"
+  "js.success.settings_saved": "Settings saved successfully",
+  "cluster.heading": "Cluster serving",
+  "cluster.ranks": "ranks",
+  "cluster.not_formed": "Not formed",
+  "cluster.serving": "Serving a request",
+  "cluster.preflight": "Preflight",
+  "cluster.teardown": "Tear down",
+  "cluster.model": "Sharded model",
+  "cluster.transport": "Transport",
+  "cluster.why": "Why this transport",
+  "cluster.this_node": "this node",
+  "cluster.idle_peers": "Visible but not in this run",
+  "cluster.blockers": "Blocking a faster transport"
 }
