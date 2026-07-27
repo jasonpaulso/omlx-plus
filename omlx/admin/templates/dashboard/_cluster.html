@@ -1,118 +1,284 @@
 <!--
-  Cluster panel. Renders nothing at all unless cluster.enabled is set on this
-  node, so a single-machine install never sees it.
+  Cluster tab.
+
+  Renders on every install, including one where clustering has never been
+  turned on - this page is *how* it gets turned on, so it cannot be gated on
+  the thing it configures. The disabled state is a first-class layout here,
+  not an empty page.
 -->
-<div x-data="clusterPanel()" x-init="init()" x-show="loaded && status.enabled" x-cloak
-     class="mt-8">
-    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
-        <div class="flex items-center justify-between px-6 py-4 border-b border-neutral-100">
-            <div class="flex items-center gap-3">
-                <h3 class="text-sm font-semibold text-neutral-900">{{ t('cluster.heading') }}</h3>
-                <span x-show="status.formed"
-                      class="px-2 py-0.5 text-xs font-medium rounded-full bg-green-50 text-green-700"
-                      x-text="`${status.world_size} ${window.t ? window.t('cluster.ranks') : 'ranks'}`"></span>
-                <span x-show="!status.formed"
-                      class="px-2 py-0.5 text-xs font-medium rounded-full bg-neutral-100 text-neutral-500">
-                    {{ t('cluster.not_formed') }}
-                </span>
-                <span x-show="status.busy" x-cloak
-                      class="px-2 py-0.5 text-xs font-medium rounded-full bg-amber-50 text-amber-700">
-                    {{ t('cluster.serving') }}
-                </span>
-            </div>
-            <div class="flex items-center gap-2">
-                <button @click="loadPreflight()"
-                        class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-700 hover:bg-neutral-100 rounded-lg transition-all">
-                    {{ t('cluster.preflight') }}
-                </button>
-                <button x-show="status.formed" @click="teardown()" :disabled="busy"
-                        class="px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 rounded-lg transition-all disabled:opacity-50">
-                    {{ t('cluster.teardown') }}
-                </button>
-            </div>
-        </div>
+            <div x-show="mainTab === 'cluster'" x-cloak x-data="clusterPanel()" x-init="init()">
 
-        <div class="px-6 py-4 space-y-4">
-            <p x-show="error" x-cloak class="text-xs text-red-600" x-text="error"></p>
-
-            <!-- What this cluster is -->
-            <div class="grid grid-cols-2 sm:grid-cols-3 gap-4">
-                <div>
-                    <div class="text-xs text-neutral-400 mb-0.5">{{ t('cluster.model') }}</div>
-                    <div class="text-sm font-mono text-neutral-900" x-text="status.model || '—'"></div>
-                </div>
-                <div>
-                    <div class="text-xs text-neutral-400 mb-0.5">{{ t('cluster.transport') }}</div>
-                    <div class="text-sm text-neutral-900" x-text="backendLabel || '—'"></div>
-                </div>
-                <div class="col-span-2 sm:col-span-1">
-                    <div class="text-xs text-neutral-400 mb-0.5">{{ t('cluster.why') }}</div>
-                    <div class="text-xs text-neutral-500" x-text="status.reason || '—'"></div>
-                </div>
-            </div>
-
-            <!-- Ranks, in rank order: for jaccl-ring that order is the cabling -->
-            <div x-show="ranks.length" x-cloak class="border border-neutral-100 rounded-xl divide-y divide-neutral-100">
-                <template x-for="node in ranks" :key="node.node_id">
-                    <div class="flex items-center justify-between px-4 py-2.5">
-                        <div class="flex items-center gap-3">
-                            <span class="w-6 h-6 flex items-center justify-center rounded-md bg-neutral-100 text-xs font-mono text-neutral-600"
-                                  x-text="node.rank"></span>
-                            <span class="text-sm text-neutral-900" x-text="node.node_id"></span>
-                            <span x-show="node.is_local"
-                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-900 text-white">
-                                {{ t('cluster.this_node') }}
-                            </span>
-                        </div>
-                        <code class="text-xs text-neutral-400" x-text="`${node.host}:${node.port}`"></code>
+                <!-- Header -->
+                <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-8">
+                    <div>
+                        <h2 class="text-2xl font-bold text-neutral-900 tracking-tight">{{ t('cluster.page.title') }}</h2>
+                        <p class="mt-1 text-sm text-neutral-500 max-w-lg">{{ t('cluster.page.subtitle') }}</p>
                     </div>
-                </template>
-            </div>
-
-            <!-- Peers that are visible but not part of the run -->
-            <div x-show="unusedPeers.length" x-cloak>
-                <div class="text-xs text-neutral-400 mb-1.5">{{ t('cluster.idle_peers') }}</div>
-                <div class="flex flex-wrap gap-2">
-                    <template x-for="peer in unusedPeers" :key="peer.node_id">
-                        <span class="px-2 py-1 text-xs rounded-lg bg-neutral-50 text-neutral-600"
-                              x-text="`${peer.node_id} · ${peer.chip} · ${peer.ram_gb}GB`"></span>
-                    </template>
+                    <div class="flex items-center gap-2 shrink-0">
+                        <span class="px-2.5 py-1 text-xs font-medium rounded-full"
+                              :class="stateClass" x-text="stateLabel"></span>
+                        <button @click="refresh(true)" :disabled="busy"
+                                class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all disabled:opacity-50 flex items-center gap-1.5">
+                            <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
+                            {{ t('cluster.refresh') }}
+                        </button>
+                        <button x-show="status.formed" x-cloak @click="teardown()" :disabled="busy"
+                                class="px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 rounded-lg transition-all disabled:opacity-50">
+                            {{ t('cluster.teardown') }}
+                        </button>
+                    </div>
                 </div>
-            </div>
 
-            <!-- Why a faster transport was not chosen -->
-            <div x-show="status.blockers && status.blockers.length" x-cloak>
-                <div class="text-xs text-neutral-400 mb-1.5">{{ t('cluster.blockers') }}</div>
-                <ul class="space-y-1">
-                    <template x-for="blocker in status.blockers" :key="blocker">
-                        <li class="text-xs text-amber-700" x-text="blocker"></li>
-                    </template>
-                </ul>
-            </div>
+                <p x-show="error" x-cloak
+                   class="mb-6 px-4 py-3 text-xs text-red-700 bg-red-50 border border-red-100 rounded-xl"
+                   x-text="error"></p>
 
-            <!--
-              This node's own checklist. `x-if`, not `x-show`: Alpine evaluates
-              x-text inside a hidden x-show block, so the inner expressions run
-              against a null `preflight` before it has been fetched.
-            -->
-            <template x-if="showPreflight && preflight">
-                <div class="border-t border-neutral-100 pt-4">
-                    <div class="text-xs text-neutral-400 mb-2"
-                         x-text="`${preflight.chip} · macOS ${preflight.macos.join('.')} · ${preflight.tb_max_gbps}Gb/s`"></div>
-                    <ul class="space-y-1.5">
-                        <template x-for="check in preflight.checks" :key="check.name">
-                            <li class="flex items-start gap-2">
-                                <span class="mt-0.5 w-1.5 h-1.5 rounded-full shrink-0"
-                                      :class="check.ok ? 'bg-green-500' : 'bg-amber-500'"></span>
-                                <div>
-                                    <div class="text-xs text-neutral-700" x-text="check.detail"></div>
-                                    <div x-show="check.remedy" class="text-xs text-neutral-400" x-text="check.remedy"></div>
+                <!-- Off on this Mac. Shown instead of a wall of empty cards. -->
+                <div x-show="loaded && !status.enabled" x-cloak
+                     class="mb-8 flex items-start gap-3 px-5 py-4 bg-neutral-50 border border-neutral-200 rounded-2xl">
+                    <i data-lucide="power-off" class="w-4 h-4 mt-0.5 text-neutral-400 shrink-0"></i>
+                    <div>
+                        <div class="text-sm font-medium text-neutral-900">{{ t('cluster.page.off_title') }}</div>
+                        <div class="text-xs text-neutral-500 mt-0.5">{{ t('cluster.page.off_body') }}</div>
+                    </div>
+                </div>
+
+                <!-- At-a-glance -->
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+                    <div class="bg-white border border-neutral-200 rounded-2xl px-5 py-4">
+                        <div class="text-[11px] font-medium uppercase tracking-wide text-neutral-400">{{ t('cluster.card.this_mac') }}</div>
+                        <div class="mt-2 text-sm font-semibold text-neutral-900 truncate"
+                             x-text="status.local?.hostname || status.local?.node_id || '—'"></div>
+                        <div class="text-xs text-neutral-500 mt-0.5"
+                             x-text="status.local?.chip || ''"></div>
+                    </div>
+                    <div class="bg-white border border-neutral-200 rounded-2xl px-5 py-4">
+                        <div class="text-[11px] font-medium uppercase tracking-wide text-neutral-400">{{ t('cluster.card.fleet_memory') }}</div>
+                        <div class="mt-2 text-sm font-semibold text-neutral-900" x-text="fleetMemoryLabel"></div>
+                        <div class="text-xs text-neutral-500 mt-0.5" x-text="fleetNodesLabel"></div>
+                    </div>
+                    <div class="bg-white border border-neutral-200 rounded-2xl px-5 py-4">
+                        <div class="text-[11px] font-medium uppercase tracking-wide text-neutral-400">{{ t('cluster.transport') }}</div>
+                        <div class="mt-2 text-sm font-semibold text-neutral-900" x-text="backendLabel || '—'"></div>
+                        <div class="text-xs text-neutral-500 mt-0.5 line-clamp-2" x-text="status.reason || ''"></div>
+                    </div>
+                    <div class="bg-white border border-neutral-200 rounded-2xl px-5 py-4">
+                        <div class="text-[11px] font-medium uppercase tracking-wide text-neutral-400">{{ t('cluster.model') }}</div>
+                        <div class="mt-2 text-sm font-semibold text-neutral-900 font-mono text-xs break-all"
+                             x-text="status.model || config.model || '—'"></div>
+                        <div class="text-xs text-neutral-500 mt-0.5" x-show="status.world_size"
+                             x-text="`${status.world_size} ${window.t('cluster.ranks')}`"></div>
+                    </div>
+                </div>
+
+                <!-- Nodes -->
+                <div class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-8">
+                    <div class="flex items-center justify-between px-6 py-4 border-b border-neutral-100">
+                        <div>
+                            <h3 class="text-sm font-semibold text-neutral-900">{{ t('cluster.nodes') }}</h3>
+                            <p class="text-xs text-neutral-400 mt-0.5">{{ t('cluster.nodes_hint') }}</p>
+                        </div>
+                        <button x-show="config.model && peerRows.length" x-cloak
+                                @click="checkPeers()" :disabled="checking"
+                                class="px-3 py-1.5 text-xs font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all disabled:opacity-50">
+                            <span x-show="!checking">{{ t('cluster.check_peers') }}</span>
+                            <span x-show="checking" x-cloak>{{ t('cluster.checking') }}</span>
+                        </button>
+                    </div>
+
+                    <div class="divide-y divide-neutral-100">
+                        <!-- This Mac, always first when it holds no rank yet -->
+                        <template x-for="node in nodeRows" :key="node.node_id">
+                            <div class="flex items-center justify-between gap-4 px-6 py-3.5">
+                                <div class="flex items-center gap-3 min-w-0">
+                                    <span class="w-7 h-7 shrink-0 flex items-center justify-center rounded-lg text-xs font-mono"
+                                          :class="node.rank === null
+                                              ? 'bg-neutral-50 text-neutral-300'
+                                              : 'bg-neutral-100 text-neutral-600'"
+                                          x-text="node.rank === null ? '·' : node.rank"></span>
+                                    <div class="min-w-0">
+                                        <div class="flex items-center gap-2">
+                                            <span class="text-sm text-neutral-900 truncate" x-text="node.label"></span>
+                                            <span x-show="node.is_local"
+                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-900 text-white shrink-0">
+                                                {{ t('cluster.this_node') }}
+                                            </span>
+                                            <span x-show="node.key_match === false" x-cloak
+                                                  class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-50 text-amber-700 shrink-0"
+                                                  :title="window.t('cluster.key_mismatch_hint')">
+                                                {{ t('cluster.key_mismatch') }}
+                                            </span>
+                                        </div>
+                                        <div class="text-xs text-neutral-400 truncate"
+                                             x-text="[node.chip, node.ram_gb ? `${node.ram_gb} GB` : '', node.version ? `oMLX ${node.version}` : ''].filter(Boolean).join(' · ')"></div>
+                                    </div>
                                 </div>
-                            </li>
+                                <div class="flex items-center gap-3 shrink-0">
+                                    <span x-show="node.has_model === true" x-cloak
+                                          class="text-xs text-green-700" x-text="window.t('cluster.has_model')"></span>
+                                    <span x-show="node.has_model === false" x-cloak
+                                          class="text-xs text-amber-700" x-text="window.t('cluster.missing_model')"></span>
+                                    <code class="text-xs text-neutral-400" x-text="node.host ? `${node.host}:${node.port}` : ''"></code>
+                                </div>
+                            </div>
                         </template>
-                    </ul>
+                    </div>
+
+                    <div x-show="loaded && !peerRows.length" x-cloak class="px-6 py-5 border-t border-neutral-100">
+                        <div class="text-sm text-neutral-500">{{ t('cluster.no_peers') }}</div>
+                        <div class="text-xs text-neutral-400 mt-0.5">{{ t('cluster.no_peers_hint') }}</div>
+                    </div>
+
+                    <!-- Why a faster transport was not chosen -->
+                    <div x-show="status.blockers && status.blockers.length" x-cloak
+                         class="px-6 py-4 border-t border-neutral-100 bg-neutral-50">
+                        <div class="text-xs text-neutral-400 mb-1.5">{{ t('cluster.blockers') }}</div>
+                        <ul class="space-y-1">
+                            <template x-for="blocker in status.blockers" :key="blocker">
+                                <li class="text-xs text-amber-700" x-text="blocker"></li>
+                            </template>
+                        </ul>
+                    </div>
                 </div>
-            </template>
-        </div>
-    </div>
-</div>
+
+                <!-- Configuration -->
+                <div class="bg-white border border-neutral-200 rounded-2xl overflow-hidden mb-8">
+                    <div class="px-6 py-4 border-b border-neutral-100">
+                        <h3 class="text-sm font-semibold text-neutral-900">{{ t('cluster.config') }}</h3>
+                    </div>
+
+                    <div class="px-6 py-5 space-y-6">
+                        <!-- Enable -->
+                        <label class="flex items-start gap-3 cursor-pointer">
+                            <input type="checkbox" x-model="config.enabled"
+                                   class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                            <span>
+                                <span class="block text-sm font-medium text-neutral-900">{{ t('cluster.config.enabled') }}</span>
+                                <span class="block text-xs text-neutral-400 mt-0.5">{{ t('cluster.config.enabled_hint') }}</span>
+                            </span>
+                        </label>
+
+                        <!-- Cluster key -->
+                        <div>
+                            <label class="block text-sm font-medium text-neutral-700">{{ t('cluster.config.key') }}</label>
+                            <p class="text-xs text-neutral-400 mt-0.5 mb-2">{{ t('cluster.config.key_hint') }}</p>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <input :type="revealKey ? 'text' : 'password'" x-model="config.cluster_key"
+                                       autocomplete="off" spellcheck="false"
+                                       class="flex-1 w-64 px-3 py-2 text-xs font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                <button @click="revealKey = !revealKey" type="button"
+                                        class="px-3 py-2 text-xs font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all">
+                                    <span x-show="!revealKey">{{ t('cluster.config.key_reveal') }}</span>
+                                    <span x-show="revealKey" x-cloak>{{ t('cluster.config.key_hide') }}</span>
+                                </button>
+                                <button @click="copyKey()" type="button" :disabled="!config.cluster_key"
+                                        class="px-3 py-2 text-xs font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all disabled:opacity-40">
+                                    <span x-show="!keyCopied">{{ t('cluster.config.key_copy') }}</span>
+                                    <span x-show="keyCopied" x-cloak class="text-green-600">{{ t('cluster.config.key_copied') }}</span>
+                                </button>
+                                <button @click="generateKey()" type="button"
+                                        class="px-3 py-2 text-xs font-medium text-neutral-600 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all">
+                                    {{ t('cluster.config.key_generate') }}
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Sharded model -->
+                        <div>
+                            <label class="block text-sm font-medium text-neutral-700">{{ t('cluster.config.model') }}</label>
+                            <p class="text-xs text-neutral-400 mt-0.5 mb-2">{{ t('cluster.config.model_hint') }}</p>
+                            <!--
+                              Options are synced imperatively rather than with
+                              `x-for`. An `x-for` template inside this select
+                              renders once, against the empty list it sees
+                              before the models are fetched, and never re-runs;
+                              `x-effect` re-runs on every read it tracked.
+                            -->
+                            <select x-model="config.model" x-effect="syncModelOptions($el)"
+                                    class="w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                <option value="">{{ t('cluster.config.model_none') }}</option>
+                            </select>
+                        </div>
+
+                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700">{{ t('cluster.config.backend') }}</label>
+                                <select x-model="config.backend"
+                                        class="mt-2 w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                    <option value="auto">{{ t('cluster.config.backend_auto') }}</option>
+                                    <option value="jaccl">{{ t('cluster.config.backend_jaccl') }}</option>
+                                    <option value="jaccl-ring">{{ t('cluster.config.backend_jaccl_ring') }}</option>
+                                    <option value="ring">{{ t('cluster.config.backend_ring') }}</option>
+                                </select>
+                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('cluster.config.backend_hint') }}</p>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700">{{ t('cluster.config.max_batch') }}</label>
+                                <input type="number" min="1" max="64" x-model.number="config.max_batch_size"
+                                       class="mt-2 w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('cluster.config.max_batch_hint') }}</p>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-medium text-neutral-700">{{ t('cluster.config.discovery_interval') }}</label>
+                                <input type="number" min="1" max="300" step="1" x-model.number="config.discovery_interval_seconds"
+                                       class="mt-2 w-full px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                <p class="text-xs text-neutral-400 mt-1.5">{{ t('cluster.config.discovery_interval_hint') }}</p>
+                            </div>
+                        </div>
+
+                        <label class="flex items-start gap-3 cursor-pointer">
+                            <input type="checkbox" x-model="config.pipeline"
+                                   class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
+                            <span>
+                                <span class="block text-sm font-medium text-neutral-900">{{ t('cluster.config.pipeline') }}</span>
+                                <span class="block text-xs text-neutral-400 mt-0.5">{{ t('cluster.config.pipeline_hint') }}</span>
+                            </span>
+                        </label>
+                    </div>
+
+                    <div class="flex items-center justify-between gap-4 px-6 py-4 border-t border-neutral-100 bg-neutral-50">
+                        <p class="text-xs text-neutral-400" x-text="saveHint"></p>
+                        <button @click="saveConfig()" :disabled="saving"
+                                class="px-4 py-2 text-sm font-medium text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50 transition-all shrink-0">
+                            <span x-show="!saving">{{ t('cluster.config.save') }}</span>
+                            <span x-show="saving" x-cloak>{{ t('cluster.config.saving') }}</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- This Mac's checks -->
+                <div class="bg-white border border-neutral-200 rounded-2xl overflow-hidden">
+                    <div class="flex items-center justify-between px-6 py-4"
+                         :class="showPreflight ? 'border-b border-neutral-100' : ''">
+                        <h3 class="text-sm font-semibold text-neutral-900">{{ t('cluster.checks') }}</h3>
+                        <button @click="togglePreflight()"
+                                class="px-3 py-1.5 text-xs font-medium text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all">
+                            <span x-show="!showPreflight">{{ t('cluster.checks_show') }}</span>
+                            <span x-show="showPreflight" x-cloak>{{ t('cluster.checks_hide') }}</span>
+                        </button>
+                    </div>
+                    <!--
+                      x-if, not x-show: Alpine evaluates x-text inside a hidden
+                      x-show block, so the inner expressions would run against a
+                      null preflight before it has been fetched.
+                    -->
+                    <template x-if="showPreflight && preflight">
+                        <div class="px-6 py-4">
+                            <div class="text-xs text-neutral-400 mb-3"
+                                 x-text="`${preflight.chip} · macOS ${preflight.macos.join('.')} · ${preflight.tb_max_gbps}Gb/s`"></div>
+                            <ul class="space-y-2">
+                                <template x-for="check in preflight.checks" :key="check.name">
+                                    <li class="flex items-start gap-2">
+                                        <span class="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0"
+                                              :class="check.ok ? 'bg-green-500' : 'bg-amber-400'"></span>
+                                        <div>
+                                            <div class="text-xs text-neutral-700" x-text="check.detail"></div>
+                                            <div x-show="check.remedy" class="text-xs text-neutral-400" x-text="check.remedy"></div>
+                                        </div>
+                                    </li>
+                                </template>
+                            </ul>
+                        </div>
+                    </template>
+                </div>
+            </div>
