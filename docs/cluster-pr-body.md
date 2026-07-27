@@ -8,10 +8,10 @@ the group.
 the package is `bootstrap.install()` at startup, which returns immediately when
 the setting is off. Single-node behaviour is unchanged.
 
-**Scope:** this is the foundation — the launch contract, the rank worker,
-topology detection, preflight and discovery, all hardware-verified. It does
-**not** include scheduler or KV-cache integration, and no HTTP request is
-served by a cluster yet. See "What is NOT verified" for the precise boundary.
+**Scope:** `/v1/chat/completions` is served by a cluster, one request at a
+time. It does **not** include the rank-aware scheduler, so a cluster does not
+batch and does not use the prefix cache — both are correctness, not tuning; see
+"One request at a time". "What is NOT verified" gives the precise boundary.
 
 ## Why this shape
 
@@ -56,10 +56,16 @@ mlx 0.32.0 / mlx-lm 0.31.3.
 | Preflight is correct both ways | MacBook → `jaccl`; Studio → `ring` naming all three blockers |
 | Topology matches real cabling | domain-UUID cross-match verified bidirectionally on a real cable |
 | Idle followers survive | 7 s blocked `recv` on `stream=mx.cpu` completes |
+| **A cluster serves an OpenAI request** | `POST /v1/chat/completions` on the MacBook → "Red, Blue, Yellow", `finish_reason: stop`, weights sharded across both Macs |
+| Formation is quick enough to be automatic | 12 s cold (discovery → preflight → topology → both ranks → sharded load); 1.0 s for the next request |
+| Streaming works token by token | SSE deltas arrive one token at a time from the remote shard |
+| Abort frees the cluster | client disconnects mid-2000-token run; the next request is served ~3 s later |
 
-122 unit tests. Topology tests use real `system_profiler` captures from the two
-cabled machines. The suite is mutation-checked — breaking the `bridge0`
-conflict rule fails exactly the test that covers it.
+202 unit tests. Topology tests use real `system_profiler` captures from the two
+cabled machines, and the `dns-sd` parser tests a line captured verbatim at
+09:04. The suite is mutation-checked — making a follower decide for itself
+instead of taking rank 0's verdict fails five tests, and removing the abort on
+client disconnect fails a sixth.
 
 ## What is NOT verified
 
@@ -75,17 +81,22 @@ interface) but a multi-cable machine is unverified. A missing device yields a
 null matrix entry and downgrades the backend rather than launching a run that
 would hang.
 
-**Scheduler and paged-cache integration is not in this PR.** The worker runs
-its own lockstep greedy decode loop, independent of oMLX's scheduler. Nothing
-routes an HTTP request to a cluster yet: `bootstrap.install()` starts peer
-discovery and no more. Concretely, still to build:
+**The rank-aware scheduler is not in this PR.** The worker runs its own
+lockstep decode loop with real sampling, stop sequences and aborts, but it is
+not oMLX's scheduler — so a cluster serves **one request at a time** and starts
+every request from a fresh KV cache. Both are correctness rather than tuning:
+under tensor parallelism every rank must run the same forward pass, so batching
+requires every rank to agree at every step which sequences advance, and a local
+prefix-cache hit is exactly the state ranks may not branch on. Concretely,
+still to build:
 
 - rank-aware admission, batch composition, prefill segmentation and eviction,
   all decided on rank 0 and broadcast;
 - the paged KV cache made lockstep-safe, and `(world_size, rank, parallelism)`
   folded into the SSD cold-tier block signature so a 4-node cluster's blocks
   are not reused by a 2-node one;
-- the abort protocol, request routing, and the admin UI.
+- batching on top of that, which is the only thing standing between this and
+  a cluster that is also fast under load.
 
 The prerequisite for that work — an audit of every local-only divergence source
 in the 10.9k-line scheduler — is in `docs/cluster-scheduler-divergence-audit.md`.
@@ -94,8 +105,10 @@ essentially the whole problem.** `_current_usage_bytes()` reads
 `mx.get_active_memory()` and `get_phys_footprint()`, both machine-local, and
 feeds six admission gates, so two ranks can decide differently about the same
 request and deadlock the collective. Wall-clock, RNG and iteration order are
-already benign for the reasons given there. Cache-hit lookups (49 sites) are
-the one class still unaudited.
+already benign for the reasons given there. The cache class is also now audited
+and turns out to be one function and one field: `remaining_tokens`, which
+decides the shape of a forward pass, so two ranks that disagree about it do not
+produce slightly different answers - they issue different collectives and hang.
 
 ## Findings that contradict the common understanding
 
@@ -128,6 +141,26 @@ fails with a JSON parse error inside `init()`.
 `[ring] Couldn't connect (error: 65)` — which reads exactly like a firewall
 fault and is not one.
 
+**Do not probe a rank's port to find out whether it is listening.** The backend
+accepts the probe, takes it for the peer it is waiting on, and the real peer's
+handshake never completes — both ranks then time out with error 60 on a network
+where nothing is wrong. A `nc` from the other machine *succeeds*, and by
+succeeding breaks the next attempt too. Readiness is read from the process
+table instead.
+
+**A Mac with a Thunderbolt cable publishes several A records** for its `.local`
+name, and the first is routinely a link-local `169.254.x.x` on a bridge nobody
+serves on. Resolving that name from inside a daemon also takes over a minute —
+long enough for rank 0's connect window to expire while an HTTP request is
+still trying to leave the machine. Peers are addressed by an IPv4 address
+chosen by evidence: whichever candidate accepts a connection on their daemon
+port.
+
+**`dns-sd` pads the hour with a space, not a zero.** Its browse output reads
+` 9:04:13.991` before 10:00, so a two-digit-hour pattern discards every line
+and peer discovery finds nothing for the first ten hours of every day. It looks
+exactly like a LAN with nobody on it.
+
 ## Correctness argument
 
 Rank 0 makes every decision and broadcasts it; all ranks step together. The
@@ -142,7 +175,9 @@ rank independently draws the same token, one collective cheaper.
 
 ## Review notes
 
-- `omlx/cluster/` is self-contained; no existing module is modified.
+- `omlx/cluster/` is self-contained apart from three small hunks: two lines in
+  `server.py` (install/shutdown), a `ClusterEngine` branch and a skipped memory
+  ceiling in `engine_pool.py`, and an English fallback in the admin `t()`.
 - Reviewing order: `hostfile.py` (the contract) → `mlx_adapter.py` (the
   constraints) → `worker.py` (the loop) → `launcher.py` → `topology.py` /
   `preflight.py` / `discovery.py`.
@@ -153,9 +188,10 @@ rank independently draws the same token, one collective cheaper.
 1. Rank-aware scheduler and paged-cache integration, including folding
    `(world_size, rank, parallelism scheme)` into the SSD block signature so a
    4-node cluster's cold blocks are not reused by a 2-node one.
-2. Abort protocol — broadcast an abort set at batch-step boundaries. mlx-lm
-   raises `NotImplementedError` here; oMLX's scheduler is better placed to do
-   it.
-3. Admin UI for the topology graph and preflight blockers.
+2. Batching, which the scheduler work unlocks — the abort protocol,
+   request routing, and the admin panel are in this PR.
+3. A liveness timeout on a formed cluster. JACCL has no fault tolerance by
+   design, so a rank that dies leaves rank 0 blocked in a collective and the
+   request hangs until the client gives up.
 4. JACCL validation once a second machine has RDMA armed, then shard
    pre-staging over JACCL's send/recv file transfer.

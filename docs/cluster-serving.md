@@ -75,6 +75,24 @@ escalates to kill for this reason.
 **`ring` recv works only between direct neighbours**, and `jaccl` has no
 `sum_scatter`.
 
+**Never probe a rank's port to see whether it is up.** The ring backend accepts
+the probe, takes it for the peer it is waiting on, and the real peer's
+handshake never completes; both ranks then sit there until they time out with
+`[ring] Couldn't connect (error: 60)`, on a network where nothing is wrong.
+Readiness is read from the process table instead (`LocalCluster._is_listening`).
+This cost an afternoon to find, because a `nc` from the other machine
+*succeeds* - and by succeeding, breaks the next attempt too.
+
+**A Mac with a Thunderbolt cable publishes several A records** for its `.local`
+name, and the first is routinely a link-local `169.254.x.x` on a bridge nobody
+serves on. A rank handed that address binds where its peers cannot see it -
+error 60 again. Addresses are chosen by evidence: whichever candidate accepts a
+TCP connection on the peer's *daemon* port.
+
+**Resolving a `.local` name from inside the daemon takes over a minute.**
+Long enough that rank 0 spent its whole connect window waiting for an HTTP
+request to leave the machine. The control plane addresses peers by IP.
+
 **Two "hostfiles" exist and are not the same file.** What
 `mlx.distributed_config` writes is a cluster description
 (`{"backend": ..., "hosts": [...]}`). What `MLX_HOSTFILE` must contain for the
@@ -248,6 +266,29 @@ until the Metal timeout kills them too. The response is to tear the session
 down and respawn, never to recover in-process — protection-domain exhaustion
 makes in-process recovery a reboot risk. Local models are unaffected
 throughout.
+
+## What has actually been run
+
+Two Macs on a LAN - an M5 Max MacBook Pro as rank 0 and an M3 Ultra Mac Studio
+as rank 1 - serving `mlx-community/Llama-3.2-1B-Instruct-4bit` tensor-sharded
+over the TCP `ring` backend:
+
+```
+POST /v1/chat/completions  "Name three colours, comma separated."
+  -> "Red, Blue, Yellow"   finish_reason "stop", 43 prompt / 5 completion
+```
+
+Formation (discovery, preflight, topology, both ranks, sharded load) takes
+about 12s cold; the second request on the formed cluster returns in 1.0s.
+Streaming arrives token by token. A client that disconnects mid-generation
+aborts the run, and the next request is served ~3s later - the ranks left the
+decode loop rather than finishing 2000 tokens nobody was reading.
+
+Reproduce with two daemons that have `cluster.enabled`, the same
+`cluster.cluster_key`, and the same model id on their own disks. One trap that
+is *not* oMLX's: starting a peer daemon with `nohup` over an ssh session that
+then closes leaves it unable to complete TCP connections from its children.
+Start it with `ssh -f` and no `nohup`.
 
 ## Testing without a second Mac
 
