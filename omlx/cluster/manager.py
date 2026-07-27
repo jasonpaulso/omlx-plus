@@ -618,9 +618,29 @@ class ClusterManager:
         like the peer's fault. Discovery has already resolved the name once;
         doing it again per request is both slow and a second chance to pick a
         link-local address.
+
+        Peers advertising a different key are skipped. Discovery deliberately
+        keeps them - the admin UI needs to be able to say "that Mac has a
+        different key" rather than show an empty list - but including one here
+        would send it our key, take a 403 from `/cluster/report`, and fail the
+        whole formation. One unrelated oMLX install on the LAN would otherwise
+        be enough to stop this cluster forming at all. The fingerprint is not
+        an authorisation decision: `verify_cluster_key` still compares the key
+        itself, and a peer filtered here is only ever excluded.
         """
+        from omlx.cluster.discovery import matches_fingerprint
+
         clients: dict[str, PeerClient] = {}
         for peer in self._peers_fn():
+            peer_fingerprint = getattr(peer.info, "key_fingerprint", "")
+            if peer_fingerprint and not matches_fingerprint(key, peer_fingerprint):
+                logger.info(
+                    "cluster: ignoring %s at %s - it advertises a different "
+                    "cluster key",
+                    peer.info.node_id,
+                    peer.host,
+                )
+                continue
             try:
                 host = resolve_ipv4(peer.host, peer.info.port)
             except ClusterFormationError as exc:
