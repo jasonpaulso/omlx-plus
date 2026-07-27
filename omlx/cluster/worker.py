@@ -27,35 +27,19 @@ lockstep. No rank may ever branch on something only it can see - local free
 memory, a local cache hit, wall-clock time - or the ranks silently diverge and
 produce garbage.
 
-That rule is the whole correctness argument, and this loop obeys it in three
-places worth naming:
-
-- the prompt arrives as **token ids** in the broadcast command, so no rank
-  tokenizes anything;
-- sampling is deliberately *not* broadcast. Logits are already all-reduced
-  under tensor parallelism and `seed_everyone` synchronises the RNG, so every
-  rank draws the same token independently - one collective cheaper per token;
-- **stopping** is a rank-0 decision (`agree_int`), because detokenized text and
-  the abort pipe are things only rank 0 can see.
-
-One request at a time
----------------------
-There is no batching here. Continuous batching means the scheduler decides,
-every step, which sequences advance - and under tensor parallelism that
-decision must be identical on every rank or the forward passes do not line up.
-That needs `omlx/scheduler.py` running inside every worker with its
-memory-derived admission gates made cluster-aware; see
-`docs/cluster-scheduler-divergence-audit.md`. Until then a cluster serves
-requests serially, which is the honest shape for a model that only exists
-because it did not fit on one machine.
+Serving is continuous batching, run in lockstep: see
+`omlx/cluster/batching.py` for the loop and its correctness argument. The
+worker's own job is the control plane around it - reading commands without
+double-buffering them, keeping the out-of-band signal pipe drained, and owning
+the model shard.
 
 Failure
 -------
 JACCL has no fault tolerance: a dead rank leaves its peers blocked in a
-collective until the Metal timeout kills them too. There is no in-process
-recovery here on purpose. A worker that loses its daemon exits, the daemon that
-loses a worker tears the session down and respawns it, and local models carry
-on serving throughout.
+collective until the daemons' deathwatch kills them. There is no in-process
+recovery here on purpose. A worker that loses its daemon exits, the daemon
+that loses a worker tears the session down and respawns it, and local models
+carry on serving throughout.
 """
 
 from __future__ import annotations
@@ -66,21 +50,15 @@ import os
 import select
 import sys
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any
 
+from omlx.cluster.batching import BatchConfig, BatchLoop
 from omlx.cluster.protocol import (
     CMD_GENERATE,
     CMD_LOAD,
     CMD_PING,
     CMD_SHUTDOWN,
-    FINISH_REASON,
     SIGNAL_ABORT,
-    STEP_ABORT,
-    STEP_CONTINUE,
-    STEP_EOS,
-    STEP_STOP_TEXT,
-    GenerationSpec,
-    StopTextBuffer,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,7 +68,8 @@ __all__ = [
     "CMD_LOAD",
     "CMD_PING",
     "CMD_SHUTDOWN",
-    "AbortChannel",
+    "CommandReader",
+    "ControlChannel",
     "Worker",
     "WorkerConfig",
     "main",
@@ -107,31 +86,79 @@ class WorkerConfig:
     control_fd: int | None = None
 
 
-class AbortChannel:
-    """Rank 0's out-of-band read side, polled between tokens.
+class CommandReader:
+    """Rank 0's command channel, with the buffering owned here.
 
-    Non-blocking by construction: a decode loop that blocked here would stall
-    every other rank waiting in the next collective. A closed pipe means the
-    daemon is gone, which is treated as an abort - there is nobody left to
-    stream to.
+    The batch loop needs two read shapes from the same pipe: block until the
+    next command while idle, and drain whatever has arrived between steps
+    while serving. A buffered file object cannot provide both - its
+    `readline` reads ahead, and a later `select` on the descriptor then
+    reports an empty pipe while commands sit in the Python buffer. Commands
+    stranded like that would admit a request only when the *next* event
+    happened to arrive.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._buffer = b""
+        self._eof = False
+
+    def readline(self) -> str:
+        """The next command line, blocking. `""` once the pipe is closed."""
+        while b"\n" not in self._buffer:
+            if self._eof:
+                return ""
+            select.select([self._fd], [], [])
+            if not self._fill():
+                return ""
+        line, _, self._buffer = self._buffer.partition(b"\n")
+        return line.decode("utf-8", "replace")
+
+    def drain_lines(self) -> list[str]:
+        """Every complete line that has already arrived, without blocking."""
+        while not self._eof and select.select([self._fd], [], [], 0)[0]:
+            if not self._fill():
+                break
+        lines: list[str] = []
+        while b"\n" in self._buffer:
+            line, _, self._buffer = self._buffer.partition(b"\n")
+            lines.append(line.decode("utf-8", "replace"))
+        return lines
+
+    def _fill(self) -> bool:
+        try:
+            chunk = os.read(self._fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError:
+            chunk = b""
+        if not chunk:
+            self._eof = True
+            return False
+        self._buffer += chunk
+        return True
+
+
+class ControlChannel:
+    """Rank 0's out-of-band read side, drained between batch steps.
+
+    Signals name the request they concern, so a late abort for a request that
+    already finished is a no-op by construction rather than a hazard to be
+    drained away. A closed pipe means the daemon is gone, which is reported as
+    an abort of everything - there is nobody left to stream to.
     """
 
     def __init__(self, fd: int | None) -> None:
         self._fd = fd
         self._buffer = b""
         self._closed = False
-        self._aborted = False
 
-    def poll(self) -> bool:
-        """True once an abort has been signalled (or the daemon vanished).
-
-        Latching, not edge-triggered: the loop polls once per token and the
-        answer must not depend on which poll happened to read the bytes.
-        """
+    def take_events(self) -> list[dict[str, Any]]:
+        """Parsed signals that have arrived since the last call."""
         if self._fd is None:
-            return False
-        if self._aborted or self._closed:
-            return True
+            return []
+        if self._closed:
+            return [{"op": SIGNAL_ABORT}]
 
         while select.select([self._fd], [], [], 0)[0]:
             try:
@@ -140,45 +167,32 @@ class AbortChannel:
                 break
             except OSError:
                 self._closed = True
-                return True
+                break
             if not chunk:
                 self._closed = True
-                return True
+                break
             self._buffer += chunk
 
-        if b"\n" not in self._buffer:
-            return False
-
-        lines, _, self._buffer = self._buffer.rpartition(b"\n")
-        for line in lines.split(b"\n"):
+        events: list[dict[str, Any]] = []
+        while b"\n" in self._buffer:
+            line, _, self._buffer = self._buffer.partition(b"\n")
             if not line.strip():
                 continue
             try:
-                if json.loads(line).get("op") == SIGNAL_ABORT:
-                    self._aborted = True
-                    return True
-            except (ValueError, AttributeError):
+                event = json.loads(line)
+            except ValueError:
                 logger.warning("cluster: unparseable control signal, ignoring")
-        return False
+                continue
+            if isinstance(event, dict) and event.get("op") == SIGNAL_ABORT:
+                events.append(event)
 
-    def drain(self) -> None:
-        """Discard anything buffered, so a stale abort cannot end the next run."""
-        self._buffer = b""
-        self._aborted = False
-        if self._fd is None or self._closed:
-            return
-        while select.select([self._fd], [], [], 0)[0]:
-            try:
-                if not os.read(self._fd, 4096):
-                    self._closed = True
-                    return
-            except OSError:
-                self._closed = True
-                return
+        if self._closed:
+            events.append({"op": SIGNAL_ABORT})
+        return events
 
 
 class Worker:
-    """One rank. Owns the session, the model, and the lockstep loop."""
+    """One rank. Owns the session, the model shard, and the batch loop."""
 
     def __init__(self, config: WorkerConfig) -> None:
         from omlx.cluster.mlx_adapter import DistributedSession
@@ -188,12 +202,21 @@ class Worker:
         self.world = self.session.world
         self.model: Any = None
         self.tokenizer: Any = None
-        self.abort = AbortChannel(config.control_fd if self.world.is_leader else None)
+        self.batch: BatchLoop | None = None
+        self.signals = ControlChannel(
+            config.control_fd if self.world.is_leader else None
+        )
+        self._commands: CommandReader | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
-    def load(self) -> dict[str, Any]:
-        """Load this rank's shard and agree that every rank managed it."""
+    def load(self, command: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Load this rank's shard and agree that every rank managed it.
+
+        The `load` command also carries the batching configuration, so every
+        rank builds its generator from the leader's settings rather than its
+        own - two nodes configured differently would admit differently.
+        """
         from omlx.cluster.mlx_adapter import load_sharded, parallelism_support
 
         model, tokenizer = load_sharded(
@@ -215,6 +238,14 @@ class Worker:
             )
 
         self.session.seed_everyone(self.config.seed)
+        self.batch = BatchLoop(
+            self.session,
+            model,
+            tokenizer,
+            BatchConfig.from_command(command or {}),
+            reply=self._reply,
+            gather_events=self._gather_events,
+        )
         return {
             "rank": self.world.rank,
             "world_size": self.world.size,
@@ -222,139 +253,20 @@ class Worker:
             "pipeline_parallel": pipeline_ok,
         }
 
-    # -- generation --------------------------------------------------------
-
-    def generate(self, spec: GenerationSpec) -> Iterator[dict[str, Any]]:
-        """Decode in lockstep, yielding streaming payloads on rank 0.
-
-        Followers run the identical loop and discard their output. They have to
-        run it: under tensor parallelism each rank owns a slice of every
-        attention head, so a forward pass only completes if all of them step
-        together. That is also why the loop must not `break` early on one rank
-        - `_step_verdict` is the single place a decision to stop is agreed.
-        """
-        import mlx.core as mx
-        from mlx_lm.generate import generate_step
-
-        if self.model is None:
-            raise RuntimeError("generate called before load")
-
-        # A seed pinned by the request beats the launch seed, but every rank
-        # has to take the same one, so it goes through the collective.
-        if spec.seed is not None:
-            self.session.seed_everyone(int(spec.seed))
-
-        self.abort.drain()
-
-        if not spec.prompt_ids:
-            raise ValueError("generate needs at least one prompt token")
-
-        detokenizer = self._detokenizer()
-        buffer = StopTextBuffer(spec.stop)
-        stop_ids = set(spec.stop_token_ids) | self._eos_ids()
-        leader = self.world.is_leader
-
-        generated = 0
-        verdict = STEP_CONTINUE
-        steps = generate_step(
-            mx.array(spec.prompt_ids),
-            self.model,
-            max_tokens=spec.max_tokens,
-            sampler=self._sampler(spec),
-            logits_processors=self._logits_processors(spec),
-        )
-
-        for token, _ in steps:
-            # mlx-lm 0.31.3 yields a plain int here, older versions an
-            # `mx.array`. Accept both rather than pinning to whichever this
-            # machine happens to have installed.
-            token_id = int(token.item() if hasattr(token, "item") else token)
-            text = ""
-            local = STEP_CONTINUE
-
-            if leader:
-                # Order matters. A stop token is never detokenized, or its
-                # text would land in the output it is supposed to end.
-                if self.abort.poll():
-                    local = STEP_ABORT
-                elif token_id in stop_ids:
-                    local = STEP_EOS
-                else:
-                    detokenizer.add_token(token_id)
-                    text = buffer.push(detokenizer.last_segment)
-                    if buffer.hit is not None:
-                        local = STEP_STOP_TEXT
-
-            verdict = self.session.agree_int(local)
-
-            # A stop token and an aborted step produce no output at all, so
-            # they are not counted either. A stop *string* was produced by a
-            # real token whose text the buffer truncated at the match.
-            if verdict in (STEP_EOS, STEP_ABORT):
-                break
-
-            generated += 1
-            if text:
-                yield {"chunk": text, "tokens": generated}
-            if verdict == STEP_STOP_TEXT:
-                break
-
-        if leader:
-            detokenizer.finalize()
-            tail = buffer.flush() if verdict == STEP_CONTINUE else ""
-            if tail:
-                yield {"chunk": tail, "tokens": generated}
-            yield {
-                "done": True,
-                "text": buffer.text,
-                "prompt_tokens": len(spec.prompt_ids),
-                "completion_tokens": generated,
-                "finish_reason": FINISH_REASON.get(verdict, "length"),
-            }
-
-    def _sampler(self, spec: GenerationSpec):
-        from mlx_lm.sample_utils import make_sampler
-
-        return make_sampler(
-            temp=spec.temperature,
-            top_p=spec.top_p,
-            min_p=spec.min_p,
-            top_k=spec.top_k,
-        )
-
-    def _logits_processors(self, spec: GenerationSpec):
-        from mlx_lm.sample_utils import make_logits_processors
-
-        processors = make_logits_processors(
-            repetition_penalty=spec.repetition_penalty,
-            repetition_context_size=spec.repetition_context_size,
-            presence_penalty=spec.presence_penalty,
-            frequency_penalty=spec.frequency_penalty,
-        )
-        return processors or None
-
-    def _detokenizer(self):
-        detokenizer = self.tokenizer.detokenizer
-        detokenizer.reset()
-        return detokenizer
-
-    def _eos_ids(self) -> set[int]:
-        eos = getattr(self.tokenizer, "eos_token_ids", None)
-        if eos:
-            return set(eos)
-        single = getattr(self.tokenizer, "eos_token_id", None)
-        return {single} if single is not None else set()
-
     # -- control loop ------------------------------------------------------
 
     def run(self, control: Any = None) -> None:
         """Serve commands until told to stop.
 
-        Rank 0 reads newline-delimited JSON from `control` (its daemon's pipe);
-        every other rank blocks in `broadcast` waiting to be told what rank 0
-        read. Both paths reach the same dispatch with the same command.
+        Rank 0 reads newline-delimited JSON from `control` (its daemon's
+        pipe); every other rank blocks in `broadcast` waiting to be told what
+        rank 0 read. Both paths reach the same dispatch with the same command.
+        A `generate` hands the loop over to the batch loop, which keeps
+        serving - and keeps reading commands - until the batch drains.
         """
-        control = control if control is not None else sys.stdin
+        if control is None:
+            control = CommandReader(sys.stdin.fileno())
+        self._commands = control
 
         while True:
             if self.world.is_leader:
@@ -368,6 +280,23 @@ class Worker:
                 logger.info("cluster: rank %d shutting down", self.world.rank)
                 return
 
+            if command.get("op") == CMD_GENERATE:
+                if self.batch is None:
+                    self._reply(
+                        {
+                            "ok": False,
+                            "request_id": str(command.get("request_id") or ""),
+                            "error": "generate called before load",
+                        }
+                    )
+                    continue
+                if self.batch.serve(command):
+                    logger.info(
+                        "cluster: rank %d shutting down", self.world.rank
+                    )
+                    return
+                continue
+
             try:
                 self._dispatch(command)
             except Exception as exc:  # noqa: BLE001 - report, do not die silently
@@ -379,12 +308,26 @@ class Worker:
         if op == CMD_PING:
             self._reply({"ok": True, "rank": self.world.rank})
         elif op == CMD_LOAD:
-            self._reply({"ok": True, **self.load()})
-        elif op == CMD_GENERATE:
-            for payload in self.generate(GenerationSpec.from_dict(command)):
-                self._reply({"ok": True, **payload})
+            self._reply({"ok": True, **self.load(command)})
         else:
             self._reply({"ok": False, "error": f"unknown op {op!r}"})
+
+    def _gather_events(self) -> list[dict[str, Any]]:
+        """Everything that arrived while the batch loop was stepping.
+
+        Leader only, called between steps: commands from the daemon's pipe
+        and abort signals from the out-of-band channel, in that order, each
+        already in arrival order.
+        """
+        events: list[dict[str, Any]] = []
+        if self._commands is not None:
+            for line in self._commands.drain_lines():
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    logger.warning("cluster: unparseable command, ignoring")
+        events += self.signals.take_events()
+        return events
 
     def _reply(self, payload: dict[str, Any], *, flush: bool = True) -> None:
         """Only rank 0 has a daemon listening; the rest stay quiet."""
@@ -411,6 +354,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
+
+    # A wedged rank is opaque from outside (py-spy needs root); SIGUSR2 makes
+    # it explain itself. Stacks go to stderr, which the daemon already owns.
+    import faulthandler
+    import signal
+
+    faulthandler.register(signal.SIGUSR2, all_threads=True)
 
     # Logs go to stderr; stdout is the reply channel and must stay clean JSON.
     logging.basicConfig(

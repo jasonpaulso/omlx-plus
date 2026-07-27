@@ -799,6 +799,10 @@ class ClusterSettings:
     # supports this yet; see omlx/cluster/mlx_adapter.py.
     pipeline: bool = False
     discovery_interval_seconds: float = 5.0
+    # How many requests may decode together in the cluster's shared batch.
+    # The leader's value is what every rank uses - it travels in the load
+    # command - because admission itself must be identical on all of them.
+    max_batch_size: int = 8
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""

@@ -257,6 +257,9 @@ class LocalCluster:
     python: str = field(default_factory=lambda: sys.executable)
     ranks: list[RankProcess] = field(default_factory=list)
     _workdir: Path | None = None
+    # Several requests write commands down the same stdin now that the worker
+    # batches; interleaved partial lines would be parsed as garbage.
+    _stdin_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def start(
         self,
@@ -426,6 +429,36 @@ class LocalCluster:
             raise RuntimeError("this node does not own rank 0")
         return next(self.stream(payload, timeout=timeout))
 
+    def submit(self, payload: dict) -> None:
+        """Write one command down rank 0's stdin, without reading a reply.
+
+        The serving path: replies come back tagged with the request id they
+        belong to and are routed by the manager's reply router, so writers
+        never touch the read side.
+        """
+        leader = self.leader
+        if leader is None:
+            raise RuntimeError("this node does not own rank 0")
+        proc = leader.process
+        assert proc.stdin is not None
+        with self._stdin_lock:
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+
+    def reply_reader(self) -> "ReplyReader":
+        """Rank 0's reply stream, created on first use and then shared.
+
+        Shared deliberately: the reader owns buffered bytes, and a second
+        reader on the same descriptor would split replies between the two.
+        """
+        leader = self.leader
+        if leader is None:
+            raise RuntimeError("this node does not own rank 0")
+        assert leader.process.stdout is not None
+        if leader.replies is None:
+            leader.replies = ReplyReader(leader.process.stdout.fileno())
+        return leader.replies
+
     def stream(self, payload: dict, *, timeout: float | None = None):
         """Send one command and yield replies until `done`.
 
@@ -443,8 +476,9 @@ class LocalCluster:
         proc = leader.process
         assert proc.stdin is not None and proc.stdout is not None
 
-        proc.stdin.write(json.dumps(payload) + "\n")
-        proc.stdin.flush()
+        with self._stdin_lock:
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
 
         if leader.replies is None:
             leader.replies = ReplyReader(proc.stdout.fileno())
@@ -480,19 +514,22 @@ class LocalCluster:
             if entry.alive:
                 entry.process.kill()
 
-    def abort(self) -> bool:
+    def abort(self, request_id: str = "") -> bool:
         """Ask a running generation to stop, out of band.
 
-        Returns False when there is nothing to abort. The worker polls this
-        pipe between tokens and agrees the decision through the collective, so
-        every rank leaves the decode loop on the same step; nothing here
-        reaches the peers directly.
+        Names the request, so aborting one stream leaves the rest of the
+        batch running; an empty id aborts everything. Returns False when the
+        signal could not be delivered. The worker drains this pipe between
+        steps and the eviction rides the event broadcast, so every rank drops
+        the same sequence on the same step; nothing here reaches the peers
+        directly.
         """
         leader = self.leader
         if leader is None or leader.control_w is None or not leader.alive:
             return False
+        payload = json.dumps({"op": "abort", "request_id": request_id})
         try:
-            os.write(leader.control_w, b'{"op": "abort"}\n')
+            os.write(leader.control_w, payload.encode() + b"\n")
         except OSError:
             logger.warning("cluster: abort signal could not be delivered")
             return False

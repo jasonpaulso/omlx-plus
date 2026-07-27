@@ -139,11 +139,16 @@ that actually gate a decision is a few hundred lines, not the whole file.
 ## Status
 
 The audit is complete: all five classes have been worked through. Two of them
-need code before the scheduler can run inside a rank worker — **memory-gated
+need code before *this scheduler* can run inside a rank worker — **memory-gated
 admission** (Class B, six gates) and **the prefix-cache lookup** (Class E, one
 field). The other three are already safe.
 
-Neither is on the critical path for what ships today. The current cluster
-serves one request at a time from a fresh cache
-(`omlx/cluster/worker.py`), which is why it needs no part of this. This
-document is the specification for the batched successor.
+The batched successor shipped without either fix, deliberately
+(`omlx/cluster/batching.py`): it runs mlx-lm's `BatchGenerator` in lockstep
+instead of this scheduler, and under that design both divergence classes are
+absent by construction — no rank consults local memory (admission is capped by
+the leader's broadcast `max_batch_size`), and there is no prefix cache in
+cluster mode. This document remains the specification for the day the cluster
+wants what only `omlx/scheduler.py` offers: memory-aware admission against
+real headroom, and prefix-cache reuse (rank 0 performs the lookup and agrees
+`len(remaining_tokens)` through the collective, as specified above).

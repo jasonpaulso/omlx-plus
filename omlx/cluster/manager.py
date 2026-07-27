@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
 import socket
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterator
 
@@ -57,6 +59,69 @@ ALIVE_POLL_TIMEOUT_S = 3.0
 
 class ClusterFormationError(RuntimeError):
     """Formation failed. The cluster has already been torn back down."""
+
+
+class ReplyRouter(threading.Thread):
+    """Routes rank 0's replies to the requests that own them.
+
+    The worker batches, so replies for several requests interleave on one
+    pipe. Exactly one thread may read that pipe - the reader owns buffered
+    bytes - and this is it; requests register a queue under their id and
+    consume from that. EOF means rank 0 is gone (the deathwatch's kill lands
+    here too), and every waiting request is told at once.
+    """
+
+    CLOSED = object()
+
+    def __init__(self, reader: Any) -> None:
+        super().__init__(name="cluster-replies", daemon=True)
+        self._reader = reader
+        self._lock = threading.Lock()
+        self._queues: dict[str, queue.SimpleQueue] = {}
+        self._closed = False
+
+    def register(self, request_id: str) -> queue.SimpleQueue:
+        with self._lock:
+            if self._closed:
+                q: queue.SimpleQueue = queue.SimpleQueue()
+                q.put(self.CLOSED)
+                return q
+            q = self._queues.setdefault(request_id, queue.SimpleQueue())
+            return q
+
+    def unregister(self, request_id: str) -> None:
+        with self._lock:
+            self._queues.pop(request_id, None)
+
+    def run(self) -> None:
+        import json
+
+        while True:
+            line = self._reader.readline(None)
+            if not line:
+                break
+            try:
+                reply = json.loads(line)
+            except ValueError:
+                logger.warning("cluster: unparseable reply line, ignoring")
+                continue
+            request_id = str(reply.get("request_id") or "")
+            with self._lock:
+                q = self._queues.get(request_id)
+            if q is not None:
+                q.put(reply)
+            elif not reply.get("ok", False):
+                # An error nobody is waiting for is still worth a log line.
+                logger.warning(
+                    "cluster: worker error with no owner: %s",
+                    reply.get("error", reply),
+                )
+        with self._lock:
+            self._closed = True
+            waiting = list(self._queues.values())
+            self._queues.clear()
+        for q in waiting:
+            q.put(self.CLOSED)
 
 
 @dataclass
@@ -225,14 +290,13 @@ def resolve_model_path(settings: Any, model_id: str) -> str:
 
 
 class ClusterManager:
-    """The leader's cluster: formation, teardown, and one request at a time.
+    """The leader's cluster: formation, serving, teardown.
 
-    Serialization is not a simplification to be removed later by tuning. Under
-    tensor parallelism every rank must run the same forward pass, so batching
-    two requests means every rank agreeing, every step, on which sequences
-    advance - that is the rank-aware scheduler described in
-    `docs/cluster-scheduler-divergence-audit.md`. Until it exists, a second
-    concurrent request would not be slower, it would be wrong.
+    Serving is concurrent: the worker runs continuous batching in lockstep
+    across the ranks (`omlx/cluster/batching.py`), so requests join and leave
+    a shared batch rather than queueing on a lock. This side's job is to
+    multiplex them onto rank 0's pipe - commands down stdin, replies routed
+    back by request id.
     """
 
     def __init__(
@@ -250,14 +314,13 @@ class ClusterManager:
         self._error = ""
         self._missing: list[tuple[str, str]] = []
         self._blockers: list[str] = []
-        # Guards the rank-0 pipe. One request in flight, cluster-wide.
-        self._pipe = threading.Lock()
-        self._busy = False
+        self._active = 0
         # Guards formation itself: after a fast-fail teardown, every queued
         # request tries to re-form at once, and they must take turns rather
         # than race half-built clusters against each other.
         self._form_lock = threading.Lock()
         self._watch: DeathWatch | None = None
+        self._router: ReplyRouter | None = None
 
     # -- state -------------------------------------------------------------
 
@@ -283,7 +346,7 @@ class ClusterManager:
             missing_cables=list(self._missing),
             blockers=list(self._blockers),
             error=self._error,
-            busy=self._busy,
+            busy=self._active > 0,
         )
 
     # -- formation ---------------------------------------------------------
@@ -447,9 +510,25 @@ class ClusterManager:
         # load timeout before anyone notices.
         self._start_watch(clients)
 
-        reply = self._cluster.command({"op": CMD_LOAD}, timeout=LOAD_TIMEOUT_S)
+        reply = self._cluster.command(
+            {
+                "op": CMD_LOAD,
+                # Batching is configured by the leader for every rank; a rank
+                # reading its own settings could admit differently and diverge.
+                "max_batch_size": int(
+                    getattr(cluster_settings, "max_batch_size", 8) or 8
+                ),
+            },
+            timeout=LOAD_TIMEOUT_S,
+        )
         if not reply.get("ok"):
             raise ClusterFormationError(reply.get("error", "load failed"))
+
+        # From here on, replies interleave across requests; the router owns
+        # the read side of the pipe. Nothing may call `command()` again on
+        # this cluster.
+        self._router = ReplyRouter(self._cluster.reply_reader())
+        self._router.start()
         logger.info(
             "cluster: formed %d ranks on %s for %s",
             len(slots),
@@ -620,43 +699,55 @@ class ClusterManager:
     def stream(self, spec: GenerationSpec) -> Iterator[dict[str, Any]]:
         """Run one generation, yielding the worker's replies.
 
-        Holds the pipe lock for the whole generation: see the class docstring
-        for why that is correctness rather than throughput policy.
+        Concurrent by design: the request joins the worker's batch, and its
+        replies come back through the router under its request id. The idle
+        timeout is a backstop - the deathwatch is what normally notices a
+        dead rank, in seconds.
         """
-        with self._pipe:
-            # Re-read under the lock: a request that queued here may have
-            # outlived the cluster it queued for. The deathwatch tears down
-            # while the pipe is held, and failing now with the real reason
-            # beats writing into a dead process's stdin.
-            cluster = self._cluster
-            if cluster is None:
-                raise ClusterFormationError(
-                    self._error or "no cluster is formed"
-                )
-            self._busy = True
-            try:
-                for reply in cluster.stream(
-                    {"op": CMD_GENERATE, **spec.to_dict()},
-                    timeout=GENERATE_IDLE_TIMEOUT_S,
-                ):
-                    if not reply.get("ok", False):
-                        raise RuntimeError(reply.get("error", "cluster generate failed"))
-                    yield reply
-            except (RuntimeError, OSError, ValueError) as exc:
-                # A closed reply channel is the *symptom*; if the deathwatch
-                # recorded the cause, that is the error worth reporting.
-                if self._error:
-                    raise RuntimeError(self._error) from exc
-                raise
-            finally:
-                self._busy = False
+        cluster = self._cluster
+        router = self._router
+        if cluster is None or router is None:
+            raise ClusterFormationError(self._error or "no cluster is formed")
 
-    def abort(self) -> bool:
-        """Ask a running generation to stop. False when nothing is running."""
+        if not spec.request_id:
+            spec.request_id = uuid.uuid4().hex
+        replies = router.register(spec.request_id)
+        self._active += 1
+        try:
+            cluster.submit({"op": CMD_GENERATE, **spec.to_dict()})
+            while True:
+                try:
+                    reply = replies.get(timeout=GENERATE_IDLE_TIMEOUT_S)
+                except queue.Empty:
+                    raise RuntimeError(
+                        f"rank 0 sent nothing for {GENERATE_IDLE_TIMEOUT_S:.0f}s; "
+                        "the collective is most likely blocked on a rank that died"
+                    ) from None
+                if reply is ReplyRouter.CLOSED:
+                    raise RuntimeError(
+                        self._error or "rank 0 closed its reply channel"
+                    )
+                if not reply.get("ok", False):
+                    raise RuntimeError(reply.get("error", "cluster generate failed"))
+                yield reply
+                if reply.get("done"):
+                    return
+        except (OSError, ValueError) as exc:
+            # Writing into a dead process's stdin is the symptom; if the
+            # deathwatch recorded the cause, that is the error worth raising.
+            if self._error:
+                raise RuntimeError(self._error) from exc
+            raise
+        finally:
+            self._active -= 1
+            router.unregister(spec.request_id)
+
+    def abort(self, request_id: str = "") -> bool:
+        """Stop one request - or all of them, for an empty id."""
         cluster = self._cluster
         if cluster is None:
             return False
-        return cluster.abort()
+        return cluster.abort(request_id)
 
     # -- teardown ----------------------------------------------------------
 
@@ -665,6 +756,10 @@ class ClusterManager:
         watch, self._watch = self._watch, None
         if watch is not None:
             watch.stop()
+
+        # The router thread needs no explicit stop: killing the ranks below
+        # closes the pipe, it sees EOF, and it wakes every waiting request.
+        self._router = None
 
         cluster, self._cluster = self._cluster, None
         slots, self._slots = self._slots, []

@@ -23,6 +23,7 @@ from omlx.cluster.manager import (
     ClusterFormationError,
     ClusterManager,
     NodeSlot,
+    ReplyRouter,
     local_ip,
 )
 from omlx.cluster.protocol import GenerationSpec
@@ -303,6 +304,209 @@ class TestClusterManager:
         assert ClusterManager(FakeSettings()).abort() is False
 
 
+# =============================================================================
+# The reply router, and streaming through it
+# =============================================================================
+
+
+class FeedReader:
+    """A reply stream the test writes into. `None` in the queue means EOF."""
+
+    def __init__(self) -> None:
+        import queue
+
+        self.lines: "queue.Queue[str | None]" = queue.Queue()
+
+    def feed(self, payload: dict) -> None:
+        import json
+
+        self.lines.put(json.dumps(payload))
+
+    def close(self) -> None:
+        self.lines.put(None)
+
+    def readline(self, timeout=None) -> str:
+        item = self.lines.get()
+        return "" if item is None else item
+
+
+class FakeSubmitCluster:
+    """Records what was submitted; the router supplies the replies."""
+
+    def __init__(self) -> None:
+        self.submitted: list[dict] = []
+        self.aborted: list[str] = []
+
+    def submit(self, payload: dict) -> None:
+        self.submitted.append(payload)
+
+    def abort(self, request_id: str = "") -> bool:
+        self.aborted.append(request_id)
+        return True
+
+
+def _streaming_manager():
+    manager = ClusterManager(FakeSettings())
+    manager._cluster = FakeSubmitCluster()
+    reader = FeedReader()
+    manager._router = ReplyRouter(reader)
+    manager._router.start()
+    return manager, manager._cluster, reader
+
+
+def _consume(manager, spec):
+    """Drive `manager.stream` on a thread, since replies arrive from a thread.
+
+    `stream` is a generator: nothing registers with the router until it is
+    iterated, so a test must start consuming before feeding replies - exactly
+    the shape the real engine has.
+    """
+    import threading
+
+    replies: list = []
+    outcome: list = []
+
+    def run() -> None:
+        try:
+            for reply in manager.stream(spec):
+                replies.append(reply)
+            outcome.append(None)
+        except Exception as exc:  # noqa: BLE001 - the test asserts on it
+            outcome.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, replies, outcome
+
+
+def _wait_until(predicate, timeout=5.0):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+class TestReplyRouter:
+    def test_replies_reach_the_request_that_owns_them(self):
+        manager, cluster, reader = _streaming_manager()
+        thread, replies, outcome = _consume(
+            manager, GenerationSpec(prompt_ids=[1], request_id="r1")
+        )
+        assert _wait_until(lambda: cluster.submitted)
+
+        reader.feed({"ok": True, "request_id": "r1", "chunk": "hi", "tokens": 1})
+        reader.feed({"ok": True, "request_id": "r1", "done": True, "text": "hi"})
+        thread.join(timeout=5)
+
+        assert outcome == [None]
+        assert replies[0]["chunk"] == "hi"
+        assert replies[-1]["done"] is True
+        assert cluster.submitted[0]["request_id"] == "r1"
+        reader.close()
+
+    def test_a_request_without_an_id_is_given_one(self):
+        manager, cluster, reader = _streaming_manager()
+        spec = GenerationSpec(prompt_ids=[1])
+        thread, _, outcome = _consume(manager, spec)
+        assert _wait_until(lambda: cluster.submitted)
+
+        assert spec.request_id != ""
+        assert cluster.submitted[0]["request_id"] == spec.request_id
+        reader.feed({"ok": True, "request_id": spec.request_id, "done": True})
+        thread.join(timeout=5)
+        assert outcome == [None]
+        reader.close()
+
+    def test_interleaved_replies_are_demultiplexed(self):
+        manager, cluster, reader = _streaming_manager()
+        t1, r1, o1 = _consume(manager, GenerationSpec(prompt_ids=[1], request_id="a"))
+        t2, r2, o2 = _consume(manager, GenerationSpec(prompt_ids=[2], request_id="b"))
+        assert _wait_until(lambda: len(cluster.submitted) == 2)
+
+        reader.feed({"ok": True, "request_id": "b", "chunk": "B", "tokens": 1})
+        reader.feed({"ok": True, "request_id": "a", "chunk": "A", "tokens": 1})
+        reader.feed({"ok": True, "request_id": "a", "done": True})
+        reader.feed({"ok": True, "request_id": "b", "done": True})
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert o1 == [None] and o2 == [None]
+        assert [r.get("chunk") for r in r1 if r.get("chunk")] == ["A"]
+        assert [r.get("chunk") for r in r2 if r.get("chunk")] == ["B"]
+        reader.close()
+
+    def test_a_worker_error_fails_only_its_request(self):
+        manager, cluster, reader = _streaming_manager()
+        thread, _, outcome = _consume(
+            manager, GenerationSpec(prompt_ids=[1], request_id="r1")
+        )
+        assert _wait_until(lambda: cluster.submitted)
+
+        reader.feed({"ok": False, "request_id": "r1", "error": "boom"})
+        thread.join(timeout=5)
+
+        assert isinstance(outcome[0], RuntimeError)
+        assert "boom" in str(outcome[0])
+        reader.close()
+
+    def test_a_closed_pipe_fails_every_waiting_request_at_once(self):
+        manager, cluster, reader = _streaming_manager()
+        t1, _, o1 = _consume(manager, GenerationSpec(prompt_ids=[1], request_id="a"))
+        t2, _, o2 = _consume(manager, GenerationSpec(prompt_ids=[2], request_id="b"))
+        assert _wait_until(lambda: len(cluster.submitted) == 2)
+
+        reader.close()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        for outcome in (o1, o2):
+            assert isinstance(outcome[0], RuntimeError)
+            assert "closed its reply channel" in str(outcome[0])
+
+    def test_the_deathwatch_reason_outranks_the_symptom(self):
+        manager, cluster, reader = _streaming_manager()
+        thread, _, outcome = _consume(
+            manager, GenerationSpec(prompt_ids=[1], request_id="r1")
+        )
+        assert _wait_until(lambda: cluster.submitted)
+        manager._error = (
+            "rank 1 on studio died (reported dead); the cluster was torn down"
+        )
+
+        reader.close()
+        thread.join(timeout=5)
+
+        assert "rank 1 on studio" in str(outcome[0])
+
+    def test_registering_after_close_fails_immediately(self):
+        manager, _, reader = _streaming_manager()
+        reader.close()
+        manager._router.join(timeout=5)
+
+        with pytest.raises(RuntimeError):
+            list(manager.stream(GenerationSpec(prompt_ids=[1], request_id="late")))
+
+    def test_a_finished_request_is_unregistered_and_not_busy(self):
+        manager, cluster, reader = _streaming_manager()
+        thread, _, outcome = _consume(
+            manager, GenerationSpec(prompt_ids=[1], request_id="r1")
+        )
+        assert _wait_until(lambda: cluster.submitted)
+        assert manager.status().busy is True
+
+        reader.feed({"ok": True, "request_id": "r1", "done": True})
+        thread.join(timeout=5)
+
+        assert outcome == [None]
+        assert "r1" not in manager._router._queues
+        assert manager.status().busy is False
+        reader.close()
+
+
 def test_local_ip_is_an_address():
     address = local_ip()
     assert address.count(".") == 3
@@ -427,8 +631,9 @@ class FakeManager:
     def teardown(self):
         self.torn_down += 1
 
-    def abort(self):
+    def abort(self, request_id=""):
         self.aborted += 1
+        self.aborted_ids = getattr(self, "aborted_ids", []) + [request_id]
         return True
 
     def status(self):

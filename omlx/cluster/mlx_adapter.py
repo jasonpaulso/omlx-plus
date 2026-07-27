@@ -149,6 +149,17 @@ class DistributedSession:
         scheduling metadata should travel over the TCP control plane instead.
         Two collectives are needed because receivers must size the buffer
         before filling it.
+
+        **Callers that interleave with model compute must drain the model's
+        stream first** (`mx.synchronize`). The backend requires every rank to
+        hand it collectives in one global order; an op here races whatever
+        the model still has in flight, and the race resolves differently on
+        different ranks, deadlocking the ring. Moving this op onto the
+        model's stream instead is not an option - ring `AllReduce` has no GPU
+        implementation and throws when forced onto a GPU stream (which also
+        means the CPU pin below is load-bearing, not stylistic; it is
+        additionally what lets an idle worker block here for minutes, past
+        Metal's ~5s command-buffer timeout).
         """
         if self.world.size == 1:
             return obj
@@ -179,7 +190,8 @@ class DistributedSession:
 
         Cheaper than `broadcast` for a single number, and used for the things
         that would otherwise diverge on local state - batch size, step counts,
-        whether to stop.
+        whether to stop. The same drain-first rule as `broadcast` applies when
+        model compute may still be in flight.
         """
         arr = mx.array([value if self.world.is_leader else 0], dtype=mx.int64)
         arr = mx.distributed.all_sum(arr, group=self._group, stream=mx.cpu)

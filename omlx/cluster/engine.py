@@ -17,18 +17,15 @@ What is overridden is exactly the part that differs: `start` loads a tokenizer
 instead of a model, and `generate`/`stream_generate` push token ids down a pipe
 to rank 0 instead of into a local scheduler.
 
-One request at a time
----------------------
-`ClusterManager.stream` holds a lock for the whole generation. Under tensor
-parallelism every rank must run the same forward pass, so overlapping two
-requests requires every rank to agree, at every step, on which sequences
-advance - the rank-aware scheduler described in
-`docs/cluster-scheduler-divergence-audit.md`. Concurrency here would not be
-faster, it would be incorrect, so requests queue on the lock instead.
+Concurrency
+-----------
+Requests batch. The worker runs continuous batching in lockstep across the
+ranks (`omlx/cluster/batching.py`), so concurrent requests join a shared batch
+and stream back interleaved, each under its own request id.
 
-No prefix cache either, for the same reason: a cache hit is local state, rank 0
-would hit where rank 1 missed, and they would disagree about how many tokens to
-prefill. Each cluster request starts from a fresh KV cache.
+No prefix cache, though: a cache hit is local state, rank 0 would hit where
+rank 1 missed, and they would disagree about how many tokens to prefill. Each
+cluster request starts from a fresh KV cache.
 """
 
 from __future__ import annotations
@@ -205,6 +202,8 @@ class ClusterEngine(BatchedEngine):
             # witness. `form` serializes concurrent attempts itself.
             await asyncio.to_thread(self._manager.form, self._model_id)
 
+        import uuid
+
         spec = GenerationSpec(
             prompt_ids=self._tokenizer.encode(prompt),
             max_tokens=max_tokens,
@@ -220,6 +219,9 @@ class ClusterEngine(BatchedEngine):
             frequency_penalty=kwargs.get("frequency_penalty") or None,
             stop=list(stop or []),
             seed=kwargs.get("seed"),
+            # The batch serves several requests at once; the id is how this
+            # one's replies and its abort find their way back to it.
+            request_id=uuid.uuid4().hex,
         )
 
         text = ""
@@ -261,10 +263,10 @@ class ClusterEngine(BatchedEngine):
         finally:
             self._active -= 1
             if not finished:
-                # The worker is still stepping the whole cluster. Nothing else
-                # can run until it stops, so this is not best-effort cleanup -
-                # it is how the next request gets served.
-                await asyncio.to_thread(self._manager.abort)
+                # This request's sequence is still in the batch, burning a
+                # slot and steps on every rank. Only this one is evicted;
+                # the rest of the batch keeps serving.
+                await asyncio.to_thread(self._manager.abort, spec.request_id)
 
     async def _bridge(self, spec: GenerationSpec) -> AsyncIterator[dict[str, Any]]:
         """Pump the worker's blocking pipe into the event loop.

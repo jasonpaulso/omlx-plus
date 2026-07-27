@@ -7,10 +7,11 @@ The feature is off by default. With `cluster.enabled = false` the daemon's only
 contact with `omlx/cluster/` is `bootstrap.install()` at startup, which returns
 immediately; single-node behaviour is unchanged.
 
-`/v1/chat/completions` is served by a cluster today, one request at a time. The
-rank-aware scheduler that would let a cluster batch is specified in
-`docs/cluster-scheduler-divergence-audit.md` and is not built; the section
-"What one-at-a-time means" below says exactly what that costs.
+`/v1/chat/completions` is served by a cluster with continuous batching:
+concurrent requests join a shared batch that every rank steps in lockstep. The
+section "Batching in lockstep" below explains how that is kept correct, and
+`docs/cluster-scheduler-divergence-audit.md` records why oMLX's own scheduler
+was *not* the vehicle for it.
 
 ## What this is built on
 
@@ -195,30 +196,60 @@ so checking it against this machine's ceiling would refuse exactly the models
 clustering exists to serve. The trade is that the operator, not the pool, owns
 the headroom for the shard.
 
-### What one-at-a-time means
+### Batching in lockstep
 
-`ClusterManager.stream` holds a lock for the whole generation. This is
-correctness, not a tuning parameter: under tensor parallelism every rank must
-run the same forward pass, so overlapping two requests means every rank
-agreeing, at every step, which sequences advance. That is the rank-aware
-scheduler, and it does not exist yet. A second concurrent request would not be
-slower, it would be wrong — so it queues.
+Under tensor parallelism every rank must run the same forward pass, so
+batching two requests means every rank agreeing, at every step, on which
+sequences advance. The divergence audit
+(`docs/cluster-scheduler-divergence-audit.md`) priced that out for oMLX's own
+scheduler: six memory-admission gates and a prefix-cache lookup, each a place
+a rank could branch on state only it can see.
 
-There is no prefix cache on this path either, for the same reason: a local
-cache hit is exactly the state ranks may not branch on. Each request starts
-from a fresh `make_prompt_cache`.
+The shipped design takes the other exit (`omlx/cluster/batching.py`). mlx-lm's
+`BatchGenerator` is a continuous batcher whose every decision is a
+deterministic function of its inputs: admission order comes from a deque,
+batch caps from configuration, stop detection from a token-id state machine,
+and sampling from an RNG the ranks keep synchronised, drawing on logits that
+tensor parallelism has already all-reduced. Every rank runs an identical
+generator, so the only thing to synchronise is the state only rank 0 can see:
+request arrivals and aborts. Each step begins with one small collective
+agreeing how many such events exist, and a broadcast of them only when there
+are any. There is **no per-token collective at all** — the serial loop's
+per-step verdict agreement disappeared with the serial loop.
+
+One part of the generator is deliberately never used: **its prompt
+processing**. Routing a prompt through `PromptProcessingBatch` on a
+tensor-sharded model deadlocks the ring in every shape it offers — padded
+multi-prompt batches, serial prefill, prefill overlapping decode, even
+mlx-lm's own server configuration — measured 0/5 each on mlx 0.32.0 /
+mlx-lm 0.31.3 with pure mlx-lm code, while decode-only batching measured 5/5.
+So `_admit` prefills each prompt by hand (one plain forward per chunk, fully
+evaluated while nothing else is in flight) and inserts the sequence with its
+cache already built, one token from decoding.
+
+The audit's two divergence classes are absent by construction rather than
+fixed: no rank ever consults local memory (admission is capped by
+`cluster.max_batch_size`, whose value travels from the leader to every rank in
+the load command), and there is no prefix cache in cluster mode - a local
+cache hit is exactly the state ranks may not branch on, so each request starts
+from a fresh cache.
+
+On the daemon side, requests join and leave concurrently: commands are written
+down rank 0's stdin under a lock, and replies come back tagged with the
+request id they belong to, routed to their waiting request by a single reader
+thread (`ReplyRouter`).
 
 ## Aborting a running request
 
-Rank 0's stdin is occupied for the whole of a generation — it is inside the
-decode loop and cannot go back and read another command — so an abort needs
-somewhere else to arrive. It gets a second inherited pipe, polled between
-tokens, and the result is agreed through the collective like any other stop
-decision. Peers never hear about the abort directly; they hear rank 0's verdict.
+Rank 0's stdin is drained between batch steps, but an abort still travels over
+the second inherited pipe so it cannot queue behind submissions. Signals name
+the request they concern: aborting one stream evicts one sequence — on every
+rank, since the eviction rides the event broadcast — and the rest of the batch
+keeps serving. A late abort for a request that already finished is a no-op by
+construction, which is what retired the old drain-between-runs dance.
 
-A client that disconnects mid-stream therefore does stop the cluster, which
-matters more here than locally: until those ranks leave the decode loop,
-nothing else can be served at all.
+A client that disconnects mid-stream therefore no longer stops the cluster;
+it frees its slot.
 
 ## The control plane
 
@@ -229,6 +260,7 @@ Every daemon serves the peer half:
 | `POST /cluster/report` | a forming leader | topology, RDMA state, *and* whether this node has the model and an interpreter that can import oMLX |
 | `POST /cluster/ranks/start` | a forming leader | spawn this node's ranks |
 | `POST /cluster/ranks/stop` | a leader, or recovery | kill them |
+| `GET /cluster/ranks/alive` | every deathwatch | which ranks run here, from the process table |
 | `GET /admin/api/cluster/status` | the admin UI | formation state, backend, rank order, peers |
 | `GET /admin/api/cluster/preflight` | the admin UI | this node's checklist |
 | `POST /admin/api/cluster/teardown` | an operator | stop everything, everywhere |
@@ -270,10 +302,25 @@ makes natural.
 ## Failure handling
 
 JACCL has no fault tolerance: a dead rank leaves peers blocked in a collective
-until the Metal timeout kills them too. The response is to tear the session
-down and respawn, never to recover in-process — protection-domain exhaustion
-makes in-process recovery a reboot risk. Local models are unaffected
-throughout.
+with no way to notice. The response is to tear the session down and respawn,
+never to recover in-process — protection-domain exhaustion makes in-process
+recovery a reboot risk. Local models are unaffected throughout.
+
+What makes that *fast* is the deathwatch (`DeathWatch` in
+`omlx/cluster/launcher.py`). Every daemon runs one while it owns ranks: the
+leader watches its rank 0 and every peer's ranks over
+`GET /cluster/ranks/alive`; a follower watches its own ranks and the leader.
+Liveness is read from process tables and daemon HTTP, never by connecting — a
+TCP probe of a collective's port poisons the handshake. On a death the watch
+hard-kills the local ranks first, because killing rank 0 closes the reply pipe
+and that is what turns "blocked until the idle timeout" (minutes) into "failed
+in seconds". In-flight requests fail with the recorded reason, and the next
+request re-forms the cluster.
+
+A reachable daemon reporting a rank gone is a definitive death and fires at
+once; an unreachable daemon is only a strike, fatal after several consecutive
+misses, because a wifi blink must not kill a healthy formation. The generate
+and load timeouts remain as backstops.
 
 ## What has actually been run
 
@@ -310,8 +357,10 @@ from omlx.cluster.launcher import LocalCluster
 
 c = LocalCluster(model_path="…", world_size=2, backend="ring")
 c.start(ranks=[0, 1])
-c.command({"op": "load"})
-for reply in c.stream({"op": "generate", "prompt": "…", "max_tokens": 32}):
+c.command({"op": "load", "max_batch_size": 8})
+for reply in c.stream(
+    {"op": "generate", "request_id": "r1", "prompt_ids": [1, 2, 3], "max_tokens": 32}
+):
     ...
 c.stop()
 ```

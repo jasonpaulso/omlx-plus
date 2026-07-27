@@ -24,20 +24,8 @@ CMD_PING = "ping"
 CMD_SHUTDOWN = "shutdown"
 
 # Out-of-band, sent over the control pipe while a generation is running.
+# Carries a `request_id` naming the sequence to drop; empty means all of them.
 SIGNAL_ABORT = "abort"
-
-# Why a decode loop ended. Rank 0 decides, and the value is agreed through the
-# collective, so every rank leaves the loop on the same iteration.
-STEP_CONTINUE = 0
-STEP_EOS = 1
-STEP_STOP_TEXT = 2
-STEP_ABORT = 3
-
-FINISH_REASON = {
-    STEP_EOS: "stop",
-    STEP_STOP_TEXT: "stop",
-    STEP_ABORT: "abort",
-}
 
 
 @dataclass
