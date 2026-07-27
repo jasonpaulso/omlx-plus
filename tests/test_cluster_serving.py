@@ -675,3 +675,54 @@ class TestResolveIpv4:
         monkeypatch.setattr("omlx.cluster.manager.socket.getaddrinfo", boom)
         with pytest.raises(ClusterFormationError, match="studio.local"):
             manager_module.resolve_ipv4("studio.local", 8888)
+
+
+# =============================================================================
+# Stale ranks
+# =============================================================================
+
+
+class TestOrphanSweep:
+    """A worker left alive by a failed run holds its ring port.
+
+    The next rank 0 then quietly fails to own it and the whole cluster dies
+    with a connect timeout that looks like a network fault.
+    """
+
+    def test_kills_an_orphaned_rank(self):
+        import subprocess
+        import time
+
+        from omlx.cluster.launcher import WORKER_MODULE, sweep_orphaned_ranks
+
+        # A decoy that merely *looks* like a rank: same argv element, no mlx.
+        decoy = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)", WORKER_MODULE]
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while decoy.poll() is None and time.monotonic() < deadline:
+                if sweep_orphaned_ranks():
+                    break
+                time.sleep(0.1)
+            decoy.wait(timeout=5)
+            assert decoy.poll() is not None
+        finally:
+            if decoy.poll() is None:
+                decoy.kill()
+                decoy.wait(timeout=5)
+
+    def test_leaves_everything_else_alone(self):
+        import subprocess
+
+        from omlx.cluster.launcher import sweep_orphaned_ranks
+
+        bystander = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)", "some.other.module"]
+        )
+        try:
+            sweep_orphaned_ranks()
+            assert bystander.poll() is None
+        finally:
+            bystander.kill()
+            bystander.wait(timeout=5)

@@ -75,6 +75,41 @@ def resolve_python(candidate: str | None = None) -> str:
     return python
 
 
+WORKER_MODULE = "omlx.cluster.worker"
+
+
+def sweep_orphaned_ranks() -> int:
+    """Kill rank processes on this machine that no daemon is tracking.
+
+    A worker left alive by a failed run holds its ring port, and the next
+    rank 0 then quietly fails to own it - the whole cluster dies with a connect
+    timeout that looks like a network fault. Every teardown path escalates to
+    kill for this reason, but a daemon that was itself restarted has no handle
+    on the children it left behind, and only the process table remembers them.
+
+    Safe because a rank is never long-lived on its own: it exists for exactly
+    as long as the daemon that spawned it is driving it. Anything found here is
+    by definition an orphan.
+    """
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil is a hard dependency
+        return 0
+
+    killed = 0
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        cmdline = proc.info.get("cmdline") or []
+        if WORKER_MODULE not in cmdline:
+            continue
+        try:
+            proc.kill()
+            killed += 1
+            logger.warning("cluster: killed orphaned rank process %d", proc.info["pid"])
+        except Exception:  # noqa: BLE001 - already gone, or not ours
+            continue
+    return killed
+
+
 @dataclass
 class LocalCluster:
     """Rank processes this daemon is responsible for.
@@ -106,6 +141,7 @@ class LocalCluster:
         needs it, not just its own entry, because the ring hostfile describes
         all ranks.
         """
+        sweep_orphaned_ranks()
         self._workdir = Path(tempfile.mkdtemp(prefix="omlx-cluster-"))
 
         launch_kwargs: dict = {}
