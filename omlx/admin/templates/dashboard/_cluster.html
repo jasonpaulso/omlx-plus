@@ -66,8 +66,10 @@
                         <div class="text-[11px] font-medium uppercase tracking-wide text-neutral-400">{{ t('cluster.model') }}</div>
                         <div class="mt-2 text-sm font-semibold text-neutral-900 font-mono text-xs break-all"
                              x-text="status.model || config.model || '—'"></div>
-                        <div class="text-xs text-neutral-500 mt-0.5" x-show="status.world_size"
-                             x-text="`${status.world_size} ${window.t('cluster.ranks')}`"></div>
+                        <div class="text-xs text-neutral-500 mt-0.5"
+                             x-text="status.world_size
+                                 ? `${status.world_size} ${window.t('cluster.ranks')}`
+                                 : modelSizeLabel"></div>
                     </div>
                 </div>
 

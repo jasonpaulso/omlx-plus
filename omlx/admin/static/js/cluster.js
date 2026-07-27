@@ -312,6 +312,18 @@ function clusterPanel() {
             return this.fleetGb ? `${this.fleetGb} GB` : '—';
         },
 
+        // The engine pool deliberately skips this daemon's memory ceiling for
+        // a cluster model - the weights are never in this process - so this
+        // figure is what replaces the refusal the operator no longer gets.
+        // Display only: it is a sanity check, not an admission decision.
+        get modelSizeLabel() {
+            const model = this.models.find((m) => m.id === this.status.model || m.id === this.config.model);
+            if (!model) return '';
+            const size = model.actual_size_formatted || model.estimated_size_formatted;
+            if (!size) return '';
+            return this.fleetGb ? `${size} of ${this.fleetGb} GB` : size;
+        },
+
         get fleetNodesLabel() {
             const nodes = this.joinablePeers.length + (this.status.local?.node_id ? 1 : 0);
             if (nodes <= 1) return window.t('cluster.card.fleet_memory_hint_one');

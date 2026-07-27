@@ -47,7 +47,9 @@ process table, never by connecting to a ring port.
 
 ## Slices
 
-Each slice is independently shippable and independently useful.
+Each slice is independently shippable and independently useful. All five have
+shipped; what follows is the design, kept because the reasoning behind each is
+not recoverable from the diff.
 
 ### 1. Make the surface reachable (prerequisite)
 
@@ -132,5 +134,23 @@ The default path is `enabled=false`. That is the configuration being shipped and
 the one every new surface has to be correct in, so it is the one to test — not
 just the enabled box.
 
-Live verification runs against the dev daemons on `:8901`, not against the
-installed `.app` on `:8888`, while the serving PR is still open.
+Live verification runs against a scratch instance, not against the installed
+`.app` on `:8888` and not against the dev daemons on `:8901`, while the serving
+PR is still open.
+
+## Two traps in this dashboard
+
+Both cost real time here, and neither fails loudly.
+
+**`tailwind.css` is prebuilt and purged.** A class that is not already used
+somewhere in the dashboard is not in the stylesheet, and applying it does
+nothing at all - no error, no warning, just a layout that quietly ignores you.
+`lg:grid-cols-4` laid the four cards out two-up until it was swapped for a
+breakpoint the build already knew about. Check a new class against
+`omlx/admin/static/css/tailwind.css` before trusting it.
+
+**An `x-for` inside this page's `<select>` binds once and dies.** It rendered
+against the empty model list it saw before the fetch returned and never re-ran,
+while the underlying array was correct the whole time - so the data looked
+right from the console and the picker stayed empty. The options are synced with
+`x-effect` instead, which re-runs on every reactive read it tracked.
