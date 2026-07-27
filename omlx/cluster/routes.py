@@ -612,6 +612,21 @@ async def set_cluster_config(
                 ),
             )
 
+    # A follower has no manager - it decides nothing - so the check above does
+    # not cover it, and applying here would kill this node's ranks out from
+    # under a leader that is mid-request. Stricter than the leader rule, and
+    # deliberately: this node cannot see whether the request it is serving a
+    # shard of is still in flight, so holding a rank at all is enough.
+    if _follower is not None and _follower.alive_ranks():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Mac is holding ranks for a cluster led by another Mac. "
+                "Changing the configuration here would stop them mid-request. "
+                "Tear the cluster down from the leader first."
+            ),
+        )
+
     if payload.backend is not None and payload.backend not in BACKENDS:
         raise HTTPException(
             status_code=400,
@@ -672,6 +687,10 @@ async def check_peers(payload: dict[str, Any]) -> dict[str, Any]:
 
     from omlx.cluster import bootstrap
     from omlx.cluster.manager import PeerClient
+
+    # A write in effect: it makes every matched peer scan its model
+    # directories, which takes tens of seconds each.
+    _require_real_auth()
 
     cluster = getattr(_settings(), "cluster", None)
     if cluster is None or not cluster.cluster_key:

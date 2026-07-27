@@ -913,5 +913,7 @@
   "cluster.checks_show": "Show checks",
   "cluster.checks_hide": "Hide checks",
   "cluster.config.backend_jaccl_ring": "RDMA ring over Thunderbolt (jaccl-ring)",
-  "cluster.card.fleet_memory_hint_one": "on this Mac alone"
+  "cluster.card.fleet_memory_hint_one": "on this Mac alone",
+  "cluster.state.holding_ranks": "Holding ranks",
+  "cluster.follower_hint": "This Mac holds ranks for a cluster led by another Mac. Configuration is locked until that cluster is torn down from its leader."
 }

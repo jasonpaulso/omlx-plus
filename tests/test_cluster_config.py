@@ -307,6 +307,47 @@ def test_a_serving_cluster_refuses_the_write(node, monkeypatch):
     assert response.status_code == 409
 
 
+def test_a_follower_holding_ranks_refuses_the_write(node, monkeypatch):
+    """A follower has no manager, so the leader-side check does not cover it.
+
+    Without this, changing any field on the second Mac stops its ranks out
+    from under a leader that is mid-request - and the page cannot even show a
+    teardown button, because `formed` is false on a follower.
+    """
+    client, _settings, _app = node
+
+    class _Follower:
+        ranks = ()
+
+        def alive_ranks(self):
+            return [1]
+
+    monkeypatch.setattr(routes, "_follower", _Follower())
+
+    response = client.post("/admin/api/cluster/config", json={"max_batch_size": 2})
+
+    assert response.status_code == 409
+    assert "another Mac" in response.json()["detail"]
+
+
+def test_an_idle_follower_still_accepts_the_write(node, monkeypatch):
+    """Ranks that have already exited are not a reason to refuse."""
+    client, settings, _app = node
+
+    class _Follower:
+        ranks = ()
+
+        def alive_ranks(self):
+            return []
+
+    monkeypatch.setattr(routes, "_follower", _Follower())
+
+    response = client.post("/admin/api/cluster/config", json={"max_batch_size": 2})
+
+    assert response.status_code == 200
+    assert settings.cluster.max_batch_size == 2
+
+
 def test_the_write_is_refused_when_admin_auth_is_switched_off(node):
     """`skip_api_key_verification` makes every caller an admin. Letting one
     write a cluster key would turn that into remote process spawn."""
@@ -315,9 +356,12 @@ def test_the_write_is_refused_when_admin_auth_is_switched_off(node):
 
     write = client.post("/admin/api/cluster/config", json={"max_batch_size": 2})
     keygen = client.post("/admin/api/cluster/key")
+    # A write in effect: it makes every peer scan its model directories.
+    check = client.post("/admin/api/cluster/peers/check", json={"model": "m"})
 
     assert write.status_code == 403
     assert keygen.status_code == 403
+    assert check.status_code == 403
     # Reading stays available; it discloses nothing this mode has not already.
     assert client.get("/admin/api/cluster/status").status_code == 200
 

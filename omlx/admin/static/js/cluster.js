@@ -281,11 +281,20 @@ function clusterPanel() {
             return backend;
         },
 
+        // Ranks this node holds for a cluster some other Mac leads. A follower
+        // has no manager, so `formed` is false here and without this the page
+        // would read as an idle, unconfigured node while it is in fact busy
+        // holding a shard of someone else's model.
+        get followerRanks() {
+            return this.status.follower_ranks || [];
+        },
+
         get stateLabel() {
             if (!this.loaded) return '';
             if (!this.status.enabled) return window.t('cluster.state.off');
             if (this.status.busy) return window.t('cluster.state.serving');
             if (this.status.formed) return window.t('cluster.state.formed');
+            if (this.followerRanks.length) return window.t('cluster.state.holding_ranks');
             if (this.joinablePeers.length) return window.t('cluster.state.ready');
             return window.t('cluster.state.searching');
         },
@@ -293,7 +302,7 @@ function clusterPanel() {
         get stateClass() {
             if (!this.status.enabled) return 'bg-neutral-100 text-neutral-500';
             if (this.status.busy) return 'bg-amber-50 text-amber-700';
-            if (this.status.formed) return 'bg-green-50 text-green-700';
+            if (this.status.formed || this.followerRanks.length) return 'bg-green-50 text-green-700';
             return 'bg-neutral-100 text-neutral-500';
         },
 
@@ -351,7 +360,7 @@ function clusterPanel() {
                     is_local: true,
                     key_match: null,
                     has_model: null,
-                    rank: ranks.get(local.node_id)?.rank ?? null,
+                    rank: ranks.get(local.node_id)?.rank ?? this.followerRanks[0] ?? null,
                 });
             }
             for (const peer of this.status.peers || []) {
@@ -381,6 +390,7 @@ function clusterPanel() {
 
         get saveHint() {
             if (this.saved) return window.t('cluster.config.saved');
+            if (this.followerRanks.length) return window.t('cluster.follower_hint');
             if (this.status.formed && this.status.busy) return window.t('cluster.config.busy');
             return window.t('cluster.config.restart_hint');
         },
