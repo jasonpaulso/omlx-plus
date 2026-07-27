@@ -113,6 +113,9 @@ def test_decode_txt_defaults_optional_fields():
     assert info.chip == "unknown"
     assert info.ram_gb == 0
     assert info.key_fingerprint == ""
+    # A peer built before hostnames were advertised is still discovered; the
+    # admin UI falls back to showing its node id.
+    assert info.hostname == ""
 
 
 # =============================================================================

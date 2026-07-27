@@ -154,6 +154,11 @@ class PeerInfo:
     chip: str
     ram_gb: int
     key_fingerprint: str
+    # What the operator calls this machine. The node id is a hardware UUID -
+    # right for identity, useless for telling two Macs apart in a list. Kept
+    # optional so a peer running an older build is still discovered, just
+    # nameless.
+    hostname: str = ""
 
 
 def encode_txt(info: PeerInfo) -> dict[str, str]:
@@ -165,6 +170,7 @@ def encode_txt(info: PeerInfo) -> dict[str, str]:
         "chip": info.chip,
         "ram_gb": str(info.ram_gb),
         "key_fingerprint": info.key_fingerprint,
+        "hostname": info.hostname,
     }
 
 
@@ -183,6 +189,7 @@ def decode_txt(txt: dict[str, str]) -> PeerInfo | None:
             chip=txt.get("chip", "unknown"),
             ram_gb=int(txt.get("ram_gb", "0")),
             key_fingerprint=txt.get("key_fingerprint", ""),
+            hostname=txt.get("hostname", ""),
         )
     except (KeyError, ValueError) as exc:
         logger.warning("discovery: malformed TXT record %r: %s", txt, exc)
@@ -442,6 +449,17 @@ def default_node_id() -> str:
     return socket.gethostname()
 
 
+def default_hostname() -> str:
+    """This machine's name, without the mDNS suffix.
+
+    Purely for display. `default_node_id` remains the identity, because two
+    Macs can share a hostname and neither the rank order nor the peer table
+    may depend on the operator having renamed them.
+    """
+    name = socket.gethostname()
+    return name[: -len(".local")] if name.endswith(".local") else name
+
+
 def default_chip() -> str:
     """Best-effort chip name, e.g. `"Apple M5 Max"`."""
     if shutil.which("sysctl") is None:
@@ -592,6 +610,7 @@ class ClusterDiscovery:
                 chip=self._chip,
                 ram_gb=self._ram_gb,
                 key_fingerprint=fingerprint(self._cluster_key),
+                hostname=default_hostname(),
             )
         )
 
