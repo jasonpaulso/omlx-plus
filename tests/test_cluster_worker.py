@@ -249,8 +249,10 @@ def build_worker(
     worker.abort = AbortChannel(abort_fd)
 
     def fake_generate_step(prompt, model, *, max_tokens, sampler, logits_processors):
-        for token_id in token_ids[:max_tokens]:
-            yield mx.array(token_id), None
+        # mlx-lm 0.31.3 yields a plain int; older versions yield an mx.array.
+        # Alternate between them so the worker keeps handling both.
+        for index, token_id in enumerate(token_ids[:max_tokens]):
+            yield (token_id if index % 2 else mx.array(token_id)), None
 
     # Patched on the module object, not by dotted path: `mlx_lm.generate` is
     # also the name of a re-exported *function*, so the string form resolves

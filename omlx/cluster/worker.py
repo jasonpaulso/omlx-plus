@@ -265,7 +265,10 @@ class Worker:
         )
 
         for token, _ in steps:
-            token_id = int(token.item())
+            # mlx-lm 0.31.3 yields a plain int here, older versions an
+            # `mx.array`. Accept both rather than pinning to whichever this
+            # machine happens to have installed.
+            token_id = int(token.item() if hasattr(token, "item") else token)
             text = ""
             local = STEP_CONTINUE
 
