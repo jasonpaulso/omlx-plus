@@ -11,7 +11,7 @@ contact with this package is `bootstrap.install()` at startup, which returns
 immediately when the setting is off; nothing else here is imported, no socket
 is opened and no process is spawned. Single-node behaviour is unchanged.
 
-Module map:
+Module map, in the order a reader should meet them:
 
 - `bootstrap`  - the only seam the server calls: install() / shutdown()
 - `preflight`  - per-node capability checks (RDMA, Thunderbolt, macOS version)
@@ -19,8 +19,12 @@ Module map:
 - `discovery`  - Bonjour peer advertisement and browsing
 - `hostfile`   - the on-wire launch contract (env vars + hostfile JSON)
 - `mlx_adapter`- every mlx.distributed call, isolated behind one interface
+- `protocol`   - the wire format between a daemon and its rank-0 worker
 - `worker`     - the rank process and its lockstep loop
 - `launcher`   - spawning and supervising rank processes from the daemon
+- `manager`    - the leader's side: forming a cluster, and owning it once formed
+- `routes`     - the peer control plane, plus the operator's read-only surface
+- `engine`     - the `BaseEngine` that makes a cluster look like a model
 """
 
 from __future__ import annotations
@@ -28,10 +32,14 @@ from __future__ import annotations
 __all__ = [
     "bootstrap",
     "discovery",
+    "engine",
     "hostfile",
     "launcher",
+    "manager",
     "mlx_adapter",
     "preflight",
+    "protocol",
+    "routes",
     "topology",
     "worker",
 ]
