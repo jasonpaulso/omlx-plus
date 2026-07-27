@@ -8,10 +8,13 @@ the group.
 the package is `bootstrap.install()` at startup, which returns immediately when
 the setting is off. Single-node behaviour is unchanged.
 
-**Scope:** `/v1/chat/completions` is served by a cluster, one request at a
-time. It does **not** include the rank-aware scheduler, so a cluster does not
-batch and does not use the prefix cache — both are correctness, not tuning; see
-"One request at a time". "What is NOT verified" gives the precise boundary.
+**Scope:** `/v1/chat/completions` is served by a cluster with **continuous
+batching** — concurrent requests join a shared batch that every rank steps in
+lockstep — and **rank death fails fast**: every daemon runs a deathwatch, so a
+dead rank fails in-flight requests in seconds and the next request re-forms
+the cluster. There is still no prefix cache on this path (a local cache hit is
+exactly the state ranks may not branch on); "What is NOT in this PR" gives the
+precise boundary.
 
 ## Why this shape
 
@@ -57,60 +60,71 @@ mlx 0.32.0 / mlx-lm 0.31.3.
 | Topology matches real cabling | domain-UUID cross-match verified bidirectionally on a real cable |
 | Idle followers survive | 7 s blocked `recv` on `stream=mx.cpu` completes |
 | **A cluster serves an OpenAI request** | `POST /v1/chat/completions` on the MacBook → "Red, Blue, Yellow", `finish_reason: stop`, weights sharded across both Macs |
-| Formation is quick enough to be automatic | 12 s cold (discovery → preflight → topology → both ranks → sharded load); 1.0 s for the next request |
+| Formation is quick enough to be automatic | 12 s cold (discovery → preflight → topology → both ranks → sharded load); ~2 s for the next request |
 | Streaming works token by token | SSE deltas arrive one token at a time from the remote shard |
-| Abort frees the cluster | client disconnects mid-2000-token run; the next request is served ~3 s later |
+| **Requests batch across the two machines** | 3 concurrent API requests, ~430 tokens total, wall time = the longest one alone (39.5 s), all outputs correct |
+| A request joins a running batch | submitted mid-decode of another request, admitted between steps, both stream interleaved |
+| Per-request abort leaves the batch serving | one of two concurrent requests aborted at 20 tokens with `finish_reason: abort`; the other ran to completion |
+| Client disconnect frees only its slot | dropped a streaming 2000-token request at 5 s; ranks idle within seconds, an immediate follow-up served in 3 s |
+| **A dead rank fails the request in seconds** | Studio's rank killed mid-generation: the in-flight request failed **2.1 s** later naming the dead rank; the next request re-formed and served in ~10 s |
+| Stop strings and seeded sampling hold in lockstep | `stop: ["gamma"]` truncated mid-stream; `temperature 0.8, seed 42` produced coherent output |
+| JACCL (RDMA over Thunderbolt) forms and serves | 3 live formations, warm requests 0.12-0.14 s vs ~1.0 s on ring; device selection requires an ACTIVE link |
 
-202 unit tests. Topology tests use real `system_profiler` captures from the two
+258 cluster unit tests, including a lockstep pair test: a real leader and
+follower loop linked only by queue-built collective semantics must make
+identical admissions, evictions and step counts — and compute the identical
+reply stream. Topology tests use real `system_profiler` captures from the two
 cabled machines, and the `dns-sd` parser tests a line captured verbatim at
-09:04. The suite is mutation-checked — making a follower decide for itself
-instead of taking rank 0's verdict fails five tests, and removing the abort on
-client disconnect fails a sixth.
+09:04.
 
-## What is NOT verified
+## How batching stays correct — and what it dodges
 
-**JACCL has not completed a run.** Both machines now report RDMA armed and a
-bidirectional Thunderbolt edge, so `auto` selects `jaccl` — and rank 0 dies
-instantly with `[jaccl] Couldn't allocate protection domain`, the exhausted
-pool that only a reboot clears. That failure is now handled rather than
-hidden: `auto` retries on TCP `ring` and reports the downgrade. Everything
-hardware-verified above ran on `ring`, which exercises the same launch
-contract, the same lockstep loop and the same sharding.
+Batching runs mlx-lm's `BatchGenerator` in lockstep on every rank
+(`omlx/cluster/batching.py`): identical generators, identical event streams,
+**no per-token collective at all**. Each step costs one small collective
+agreeing how many events rank 0 is holding (request arrivals, aborts — the
+only state peers cannot see), and a broadcast of them only when there are any.
+Everything downstream — who joins, who leaves, which token is drawn — follows
+identically on every rank, because admission order, batch caps, token-id stop
+machines and the synchronised RNG are all deterministic functions of the
+agreed inputs.
 
-**The bus-to-RDMA-device mapping is positional.** It matches reality on the one
-cabled machine (`bus_0 → en1 → rdma_en1`, confirmed against the only active
-interface) but a multi-cable machine is unverified. A missing device yields a
-null matrix entry and downgrades the backend rather than launching a run that
-would hang.
+Three upstream landmines were measured on the way (mlx 0.32.0 / mlx-lm
+0.31.3, pure mlx-lm reproductions with no oMLX code), and the design routes
+around each:
 
-**The rank-aware scheduler is not in this PR.** The worker runs its own
-lockstep decode loop with real sampling, stop sequences and aborts, but it is
-not oMLX's scheduler — so a cluster serves **one request at a time** and starts
-every request from a fresh KV cache. Both are correctness rather than tuning:
-under tensor parallelism every rank must run the same forward pass, so batching
-requires every rank to agree at every step which sequences advance, and a local
-prefix-cache hit is exactly the state ranks may not branch on. Concretely,
-still to build:
+- **The generator's prompt processing deadlocks a sharded world in every
+  shape it offers** — padded multi-prompt batches, serial prefill, prefill
+  overlapping decode, even mlx-lm's own server stream configuration: 0/5
+  each, while decode-only batching measured 5/5. So prompts are prefilled by
+  hand (one plain forward per chunk, fully evaluated) and sequences enter the
+  generator one token from decoding.
+- **Control collectives racing in-flight model collectives deadlock the
+  ring** — each stream has its own issuing thread, so the cross-rank order
+  diverges. The loop drains the generation stream before each per-step sync.
+  (Moving the sync onto the model's stream is not an option: ring `AllReduce`
+  has no GPU implementation.)
+- **Evicting a sequence outside the generation stream wedges the survivors** —
+  a natural finish filters inside `next()` under the generation stream, so
+  evictions are performed under that same stream.
 
-- rank-aware admission, batch composition, prefill segmentation and eviction,
-  all decided on rank 0 and broadcast;
-- the paged KV cache made lockstep-safe, and `(world_size, rank, parallelism)`
-  folded into the SSD cold-tier block signature so a 4-node cluster's blocks
-  are not reused by a 2-node one;
-- batching on top of that, which is the only thing standing between this and
-  a cluster that is also fast under load.
+## What is NOT in this PR
 
-The prerequisite for that work — an audit of every local-only divergence source
-in the 10.9k-line scheduler — is in `docs/cluster-scheduler-divergence-audit.md`.
-It found the surface far narrower than expected: **memory-gated admission is
-essentially the whole problem.** `_current_usage_bytes()` reads
-`mx.get_active_memory()` and `get_phys_footprint()`, both machine-local, and
-feeds six admission gates, so two ranks can decide differently about the same
-request and deadlock the collective. Wall-clock, RNG and iteration order are
-already benign for the reasons given there. The cache class is also now audited
-and turns out to be one function and one field: `remaining_tokens`, which
-decides the shape of a forward pass, so two ranks that disagree about it do not
-produce slightly different answers - they issue different collectives and hang.
+**The scheduler embed.** The cluster batches, but it is not oMLX's scheduler,
+so there is **no prefix cache** on this path (every request starts from a
+fresh cache) and no memory-aware admission (the batch is capped by
+`cluster.max_batch_size`, default 8, agreed by every rank via the load
+command). The audit that prices out the scheduler route — six machine-local
+memory gates and one cache-lookup field, each able to deadlock the collective
+— is `docs/cluster-scheduler-divergence-audit.md`; it remains the
+specification for the day the cluster wants prefix-cache reuse and
+memory-aware admission, including folding `(world_size, rank, parallelism)`
+into the SSD block signature.
+
+**The bus-to-RDMA-device mapping on multi-cable machines.** Device selection
+now requires an ACTIVE link, verified on the one cabled pair; a machine with
+several cables is unverified. A missing device yields a null matrix entry and
+downgrades the backend rather than launching a run that would hang.
 
 ## Findings that contradict the common understanding
 
@@ -181,19 +195,19 @@ rank independently draws the same token, one collective cheaper.
   `server.py` (install/shutdown), a `ClusterEngine` branch and a skipped memory
   ceiling in `engine_pool.py`, and an English fallback in the admin `t()`.
 - Reviewing order: `hostfile.py` (the contract) → `mlx_adapter.py` (the
-  constraints) → `worker.py` (the loop) → `launcher.py` → `topology.py` /
-  `preflight.py` / `discovery.py`.
+  constraints) → `batching.py` (the lockstep loop and its correctness
+  argument) → `worker.py` (the control plane around it) → `launcher.py`
+  (supervision and the deathwatch) → `manager.py` (formation and the reply
+  router) → `topology.py` / `preflight.py` / `discovery.py`.
 - `docs/cluster-serving.md` carries the operational detail.
 
 ## Follow-ups
 
-1. Rank-aware scheduler and paged-cache integration, including folding
-   `(world_size, rank, parallelism scheme)` into the SSD block signature so a
-   4-node cluster's cold blocks are not reused by a 2-node one.
-2. Batching, which the scheduler work unlocks — the abort protocol,
-   request routing, and the admin panel are in this PR.
-3. A liveness timeout on a formed cluster. JACCL has no fault tolerance by
-   design, so a rank that dies leaves rank 0 blocked in a collective and the
-   request hangs until the client gives up.
-4. JACCL validation once a second machine has RDMA armed, then shard
-   pre-staging over JACCL's send/recv file transfer.
+1. Scheduler embed for prefix-cache reuse and memory-aware admission
+   (specified in `docs/cluster-scheduler-divergence-audit.md`), including
+   folding `(world_size, rank, parallelism scheme)` into the SSD block
+   signature so a 4-node cluster's cold blocks are not reused by a 2-node one.
+2. Upstream the mlx-lm findings: sharded-world deadlocks in
+   `PromptProcessingBatch` (all shapes) and in cross-stream
+   eviction/collective ordering, each with a two-rank reproduction.
+3. Shard pre-staging over JACCL's send/recv file transfer.
