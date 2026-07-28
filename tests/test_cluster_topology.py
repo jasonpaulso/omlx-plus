@@ -21,6 +21,7 @@ from omlx.cluster.topology import (
     missing_cables,
     parse_buses,
     plan,
+    unattributed_device,
 )
 
 _MACBOOK_PROFILER_JSON = """
@@ -470,6 +471,59 @@ class TestIbvMatrix:
         matrix = ibv_matrix([a, b], order=["a", "b"])
         # Falls back to the positional map over all enumerated devices.
         assert matrix[0][1] == "rdma_en1"
+
+
+class TestHubMediatedCabling:
+    """Two Macs either side of a Thunderbolt hub, e.g. a Studio Display.
+
+    Measured 2026-07-27 with a MacBook on the display's upstream port and a
+    Studio on its downstream port: the Studio names the far Mac as its bus
+    peer, the MacBook names nobody. RDMA is live on both ends regardless, and
+    a hand-written symmetric matrix formed a jaccl world over that cabling.
+    """
+
+    def _reports(self):
+        downstream = NodeReport(
+            node_id="studio",
+            buses=[Bus(name="bus_2", domain_uuid="S2", peer_domain_uuid="M2")],
+            rdma_devices=["rdma_en4", "rdma_en5"],
+            active_rdma_devices=["rdma_en4"],
+            rdma_ready=True,
+        )
+        upstream = NodeReport(
+            node_id="macbook",
+            # Sees the hub, not the Mac behind it: no peer on any bus.
+            buses=[Bus(name="bus_2", domain_uuid="M2", peer_domain_uuid=None)],
+            rdma_devices=["rdma_en1", "rdma_en2", "rdma_en7"],
+            active_rdma_devices=["rdma_en2"],
+            rdma_ready=True,
+        )
+        return [downstream, upstream]
+
+    def test_matrix_is_symmetric_across_the_hub(self):
+        matrix = ibv_matrix(self._reports(), order=["studio", "macbook"])
+        assert matrix == [[None, "rdma_en4"], ["rdma_en2", None]]
+
+    def test_several_active_devices_stays_null(self):
+        """No bus to index by means position cannot break the tie."""
+        reports = self._reports()
+        reports[1].active_rdma_devices = ["rdma_en1", "rdma_en2"]
+        matrix = ibv_matrix(reports, order=["studio", "macbook"])
+        assert matrix[1][0] is None
+
+    def test_attributed_node_does_not_fall_back(self):
+        """A node that names its peers keeps per-bus selection."""
+        reports = self._reports()
+        assert unattributed_device(reports[0]) == "rdma_en4"
+        matrix = ibv_matrix(reports, order=["studio", "macbook"])
+        # studio's entry came from its bus, not from the fallback
+        assert matrix[0][1] == "rdma_en4"
+
+    def test_no_active_device_stays_null(self):
+        reports = self._reports()
+        reports[1].active_rdma_devices = []
+        matrix = ibv_matrix(reports, order=["studio", "macbook"])
+        assert matrix[1][0] is None
 
 
 class TestPlan:

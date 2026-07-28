@@ -6,6 +6,7 @@ import json
 import pytest
 
 from omlx.cluster.hostfile import (
+    BACKEND_VAR,
     build,
     jaccl_env,
     ring_addresses,
@@ -20,6 +21,8 @@ _DISTRIBUTED_VARS = [
     "MLX_JACCL_COORDINATOR",
     "MLX_IBV_DEVICES",
     "MLX_JACCL_RING",
+    "MLX_WORLD_SIZE",
+    "OMLX_CLUSTER_BACKEND",
     "JACCL_RANK",
     "JACCL_COORDINATOR",
     "JACCL_IBV_DEVICES",
@@ -146,6 +149,38 @@ class TestEnvAlwaysSetsFastSynch:
     def test_jaccl_env_with_ring(self):
         env = jaccl_env(0, "10.0.0.1:41200", "/tmp/ibv.json", ring=True)
         assert env["MLX_METAL_FAST_SYNCH"] == "1"
+
+
+class TestEnvNamesTheBackend:
+    """A rank must ask for the transport the planner chose, by name.
+
+    `mx.distributed.init()` defaults to `backend="any"` and to returning a
+    single-process group when nothing initialises - so an unnamed backend
+    lets a rank quietly succeed at being alone.
+    """
+
+    def test_ring_env_names_ring(self):
+        assert ring_env(0, "/tmp/hostfile.json")[BACKEND_VAR] == "ring"
+
+    def test_jaccl_env_names_jaccl(self):
+        env = jaccl_env(0, "10.0.0.1:41200", "/tmp/ibv.json")
+        assert env[BACKEND_VAR] == "jaccl"
+
+    def test_jaccl_ring_is_still_the_jaccl_backend(self):
+        """`MLX_JACCL_RING` picks the topology *within* mlx's jaccl backend."""
+        env = jaccl_env(0, "10.0.0.1:41200", "/tmp/ibv.json", ring=True)
+        assert env[BACKEND_VAR] == "jaccl"
+        assert env["MLX_JACCL_RING"] == "1"
+
+    def test_build_carries_it_through(self):
+        spec = build(
+            backend="jaccl",
+            rank=1,
+            world_size=2,
+            coordinator="10.0.0.1:41200",
+            ibv_devices="/tmp/ibv.json",
+        )
+        assert spec.env[BACKEND_VAR] == "jaccl"
 
 
 class TestScrubbedParentEnv:

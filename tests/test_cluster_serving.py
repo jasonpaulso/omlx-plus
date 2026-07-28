@@ -1129,6 +1129,37 @@ class TestBackendFallback:
         assert "protection domain" in status.reason
         assert "fell back to ring" in status.reason
 
+    def test_a_world_that_did_not_form_falls_back_like_any_other_failure(self):
+        """The failure this fallback existed for, and never once caught.
+
+        `mx.distributed.init()` returns a one-process group rather than
+        raising when no backend comes up, so jaccl failing looked exactly
+        like jaccl succeeding: rank 0 loaded the whole model and served it
+        alone while the leader logged the world it had planned (measured
+        2026-07-27, a 62GB model on one Mac of two). Formation now compares
+        the world rank 0 joined against the world it asked for, which is
+        what puts `auto` onto ring.
+        """
+        attempts: list = []
+        manager = ClusterManager(FakeSettings(), peers=list)
+        manager._settings.cluster.backend = "auto"
+
+        def fake_form(model_id, *, force_backend=None):
+            attempts.append(force_backend or "planned")
+            if force_backend is None:
+                manager._backend = "jaccl"
+                raise ClusterFormationError(
+                    "rank 0 joined a world of 1, not 2: "
+                    "the jaccl backend did not form across every node"
+                )
+            manager._backend = force_backend
+
+        manager._form = fake_form
+        status = manager.form("big-model")
+        assert attempts == ["planned", "ring"]
+        assert status.backend == "ring"
+        assert "world of 1, not 2" in status.reason
+
     def test_a_pinned_backend_is_never_silently_changed(self):
         attempts: list = []
         manager = self._manager("jaccl", attempts)
