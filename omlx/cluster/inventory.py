@@ -34,6 +34,15 @@ def supports_tensor_sharding(architecture: str) -> bool:
     the one module named by the config is imported, and the answer is cached -
     importing all of mlx-lm's families costs seconds and prints installation
     advice for the ones needing extra packages.
+
+    A config's `model_type` is not always a module name. mlx-lm keeps a
+    `MODEL_REMAPPING` table and consults it in `_get_classes()` before
+    importing, so asking for the module directly answers False for every
+    remapped family - `minimax_m2` (-> `minimax`), `kimi_k2` and
+    `joyai_llm_flash` (-> `deepseek_v3`), `mistral` and `iquestcoder`
+    (-> `llama`), `llava` (-> `mistral3`) all shard, and all of them were
+    being hidden from the cluster picker. Reported 2026-07-27 against a
+    MiniMax-M2.7 checkpoint that exo advertises as distributable.
     """
     if not architecture:
         return False
@@ -44,11 +53,17 @@ def supports_tensor_sharding(architecture: str) -> bool:
     try:
         import importlib
 
+        try:
+            from mlx_lm.utils import MODEL_REMAPPING
+        except ImportError:  # the table moved; the direct name is still right
+            MODEL_REMAPPING = {}
+        module_name = MODEL_REMAPPING.get(architecture, architecture)
+
         # mlx-lm prints to stdout on some optional-dependency misses.
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
             io.StringIO()
         ):
-            module = importlib.import_module(f"mlx_lm.models.{architecture}")
+            module = importlib.import_module(f"mlx_lm.models.{module_name}")
         model = getattr(module, "Model", None)
         answer = model is not None and hasattr(model, "shard")
     except BaseException:  # noqa: BLE001 - an unknown family is simply not shardable

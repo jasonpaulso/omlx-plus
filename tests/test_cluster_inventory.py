@@ -77,11 +77,33 @@ def test_architectures_mlx_lm_can_split_are_eligible(architecture):
     assert inventory.supports_tensor_sharding(architecture) is True
 
 
-@pytest.mark.parametrize("architecture", ["gemma4", "minimax_m2", "nanbeige", ""])
+@pytest.mark.parametrize("architecture", ["gemma4", "nanbeige", ""])
 def test_architectures_mlx_lm_cannot_split_are_refused(architecture):
     """The model the operator had selected was one of these: the weights can
     be everywhere and the cluster still never forms."""
     assert inventory.supports_tensor_sharding(architecture) is False
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["minimax_m2", "mistral", "kimi_k2", "joyai_llm_flash", "iquestcoder"],
+)
+def test_remapped_architectures_are_resolved_before_asking(architecture):
+    """A config's `model_type` is not always a module name.
+
+    mlx-lm consults `MODEL_REMAPPING` in `_get_classes()` before importing, so
+    importing `mlx_lm.models.<model_type>` directly answers False for every
+    remapped family that in fact shards. Reported 2026-07-27 against a
+    MiniMax-M2.7 checkpoint (`model_type: minimax_m2` -> `mlx_lm.models.minimax`,
+    which defines `shard`) that exo also advertises as tensor-splittable.
+    """
+    assert inventory.supports_tensor_sharding(architecture) is True
+
+
+def test_remapping_does_not_invent_support():
+    """Remapped families that land on a module without `shard` stay refused."""
+    for architecture in ("falcon_mamba", "phi-msft", "qwen2_5_vl", "llava"):
+        assert inventory.supports_tensor_sharding(architecture) is False
 
 
 def test_an_unshardable_model_says_so_rather_than_vanishing(tmp_path):
