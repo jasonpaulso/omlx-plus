@@ -568,9 +568,9 @@ except ImportError:
     pass
 
 # Include cluster control-plane routes. The router is always mounted; every
-# route answers 404 while cluster.role is "off", so the default install is
-# indistinguishable from one without the feature.
-from .cluster.routes import router as cluster_router
+# route answers 404 while cluster.role is "off" and no cluster state or
+# credential is reachable (the paths do remain visible in /openapi.json).
+from .cluster.routes import router as cluster_router  # noqa: E402
 
 app.include_router(cluster_router)
 

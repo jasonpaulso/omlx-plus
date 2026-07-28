@@ -2,8 +2,10 @@
 """``/v1/cluster/*`` control-plane API.
 
 The router is always mounted; the role check inside it decides whether
-anything is reachable. With ``cluster.role="off"`` every route answers 404,
-which is indistinguishable from a server without the feature.
+anything is reachable. With ``cluster.role="off"`` every route answers 404
+and no state or credential is exposed. (The paths still appear in
+``/openapi.json`` and wrong-method requests draw 405, so a prober can
+fingerprint that the feature exists — but not interact with it.)
 
 Composition matters for both E6 and E7. One parent router carries the
 enabled check, and each auth tier gets its own sub-router whose
