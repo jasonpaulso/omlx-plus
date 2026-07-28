@@ -2,7 +2,7 @@
 
 Reference cluster: local M4 Max 128GB (`Jasons-MacBook-Pro-2.local`) + Mac Studio M3 Ultra 96GB
 (`Jasons-Mac-Studio.local`, alias `192.168.5.28`), TB5 cable, `rdma_ctl` enabled both ends.
-Date: 2026-07-28. Scripts: `discovery/spike/`. This file is the tracked S0 deliverable per the
+Date: 2026-07-28. Scripts: `benchmarks/cluster_spike/` (tracked). This file is the tracked S0 deliverable per the
 program spec (`discovery/spec/cluster-v1-spec.md`, slice S0).
 
 ## Result summary vs S0 acceptance
@@ -26,7 +26,7 @@ straggler skew will be present and is expected to raise the number. Nothing here
   artifact is bf16. Recorded as bf16 per the actual measurement; not treated as a blocker.
 - Machine: local M4 Max, single-node, batch 1, decode-only (prefill excluded from timing).
 - Greedy sampling (`temp=0.0`), 320 decode-step steady-state window (16-step warmup discarded), first 256+ included.
-- Script: `discovery/spike/baseline_decode.py`
+- Script: `benchmarks/cluster_spike/baseline_decode.py`
 
 ```
 avg ms/token: 102.682
@@ -40,7 +40,7 @@ tok/s (avg): 9.74
 *Caveat (found in verification): the measurement script double-prefilled the prompt into the KV
 cache (~2× prompt-length KV, ~40 vs ~20 tokens, against 320+ decode steps), slightly inflating the
 baseline and thus slightly shrinking the tax ratios — i.e., biasing toward PASS by a negligible
-margin. The script (`discovery/spike/baseline_decode.py`) is fixed for future runs; the recorded
+margin. The script (`benchmarks/cluster_spike/baseline_decode.py`) is fixed for future runs; the recorded
 figure stands with this disclosure since the pass/fail outcome is insensitive to it.*
 
 ## Collective + broadcast measurements (Task C + D)
@@ -50,7 +50,7 @@ Smoke model for TP sharding: `mlx-community/Llama-3.2-1B-Instruct-4bit` (present
 `PromptProcessingBatch`/`BatchGenerator` (salvage pitfall #1: 0/5 configurations of that path
 survived TP collectives on the prior attempt).
 
-Script: `discovery/spike/collective_spike.py` (one process per rank, one `init()` per process
+Script: `benchmarks/cluster_spike/collective_spike.py` (one process per rank, one `init()` per process
 lifetime, all measurements for a backend in a single run — see "process lifecycle" note below).
 
 | Metric | Ring (idle-machine re-run) | JACCL |
@@ -138,14 +138,14 @@ use — see `hostfile.py`'s module docstring on the two file shapes).
 
 # rank 0 (local)
 MLX_RANK=0 MLX_HOSTFILE=hostfile.json MLX_METAL_FAST_SYNCH=1 OMLX_CLUSTER_BACKEND=ring \
-  python discovery/spike/collective_spike.py
+  python benchmarks/cluster_spike/collective_spike.py
 
 # rank 1 (remote), started ~3s after rank 0
 ssh Jasons-Mac-Studio.local '... MLX_RANK=1 MLX_HOSTFILE=hostfile.json MLX_METAL_FAST_SYNCH=1 \
-  OMLX_CLUSTER_BACKEND=ring python discovery/spike/collective_spike.py'
+  OMLX_CLUSTER_BACKEND=ring python benchmarks/cluster_spike/collective_spike.py'
 ```
 
-Full orchestration: `discovery/spike/run_ring.sh`. Formed cleanly on the first attempt.
+Full orchestration: `benchmarks/cluster_spike/run_ring.sh`. Formed cleanly on the first attempt.
 
 ### JACCL backend
 
@@ -159,15 +159,15 @@ off-diagonal entries name the device that reaches that peer. Device naming conve
 
 # rank 0 (local, coordinator)
 MLX_RANK=0 MLX_JACCL_COORDINATOR=10.0.2.1:41200 MLX_IBV_DEVICES=ibv_devices.json \
-  MLX_METAL_FAST_SYNCH=1 OMLX_CLUSTER_BACKEND=jaccl python discovery/spike/collective_spike.py
+  MLX_METAL_FAST_SYNCH=1 OMLX_CLUSTER_BACKEND=jaccl python benchmarks/cluster_spike/collective_spike.py
 
 # rank 1 (remote), started ~3s after rank 0
 ssh Jasons-Mac-Studio.local '... MLX_RANK=1 MLX_JACCL_COORDINATOR=10.0.2.1:41200 \
   MLX_IBV_DEVICES=ibv_devices.json MLX_METAL_FAST_SYNCH=1 OMLX_CLUSTER_BACKEND=jaccl \
-  python discovery/spike/collective_spike.py'
+  python benchmarks/cluster_spike/collective_spike.py'
 ```
 
-Full orchestration: `discovery/spike/run_jaccl.sh`. **Formed cleanly on the first attempt** — no
+Full orchestration: `benchmarks/cluster_spike/run_jaccl.sh`. **Formed cleanly on the first attempt** — no
 second attempt was needed, so the 2-clean-attempt budget was not exhausted. `bridge0` enslavement
 of the remote TB interface did not prevent RDMA formation.
 
@@ -280,7 +280,7 @@ MiniMax; it's an S6 acceptance anchor). Flagging for whoever picks up S5/S6.
 
 ## Rollback
 
-Full pre-change state dumped to `discovery/spike/rollback/` before any change:
+Full pre-change state dumped to `discovery/spike/rollback/` (session-local, deliberately untracked — contains machine-specific interface/process dumps) before any change:
 `local-ifconfig-before.txt`, `local-netstat-before.txt`, `local-hwports-before.txt`,
 `remote-ifconfig-before.txt`, `remote-netstat-before.txt`, `remote-hwports-before.txt`.
 
