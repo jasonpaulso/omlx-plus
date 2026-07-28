@@ -1,22 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """Which of this node's models could actually be served by a cluster.
 
-Two questions, and neither is answered by oMLX's own model type. A model is a
-candidate when mlx-lm can split its architecture across ranks, and when the
-weights on disk are all there.
+Three questions, and none is answered by oMLX's own model type. A model is a
+candidate when mlx-lm can split its architecture across ranks, when the
+weights on disk are all there, and when mlx-lm can be trusted with the
+checkpoint at all.
 
-Both were being guessed at. The picker filtered on `model_type == "llm"`,
-which hid every large MoE on the machine - they classify as `vlm` - while
-offering models whose architecture has no `shard` at all. And nothing checked
-completeness, so a directory holding 6 of 126 shards looked like a 4 GB model
-rather than a fragment of a 90 GB one.
+The first two were being guessed at. The picker filtered on
+`model_type == "llm"`, which hid every large MoE on the machine - they
+classify as `vlm` - while offering models whose architecture has no `shard` at
+all. And nothing checked completeness, so a directory holding 6 of 126 shards
+looked like a 4 GB model rather than a fragment of a 90 GB one.
+
+The third question is the one that has no error to go by. A cluster serves
+through mlx-lm; the rest of oMLX serves most of these checkpoints through
+mlx-vlm. Where the two implementations disagree, nothing raises: the model
+loads, the ranks form, and the answers come back fluent and wrong.
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
+import json
 import logging
+import struct
+import threading
+from pathlib import Path
 from typing import Any
 
 from omlx import model_integrity
@@ -24,6 +34,8 @@ from omlx import model_integrity
 logger = logging.getLogger(__name__)
 
 _shardable: dict[str, bool] = {}
+_mtp: dict[str, tuple[float, bool]] = {}
+_mtp_lock = threading.Lock()
 
 
 def supports_tensor_sharding(architecture: str) -> bool:
@@ -73,6 +85,81 @@ def supports_tensor_sharding(architecture: str) -> bool:
     return answer
 
 
+def carries_mtp_weights(model_path: str) -> bool:
+    """Whether the checkpoint carries multi-token-prediction weights.
+
+    mlx-lm ignores them - they are not part of its module tree, so they load
+    as unused - and then generates nonsense from the weights it did take.
+    Measured 2026-07-28 on one Mac, single process, no cluster involved:
+
+        Ornith-1.0-35B-oQ8e        qwen3_5_moe, 0 mtp weights   -> "Paris, a
+                                   city renowned for its rich history..."
+        Macaron-V1-Tall-oQ8e-mtp   qwen3_5_moe, 42 mtp weights  -> "-in坎t店铺
+                                   经营者format的..."
+        ThinkingCap-...-oQ8e-mtp   qwen3_5, 29 mtp weights      -> "'+.**"
+
+    Same mlx-lm module for the first two, same quantisation, same box: the MTP
+    heads are the only difference, and they separate correct from garbage on
+    both the dense and the MoE architecture. oMLX's own engine serves all
+    three correctly, which is why this cannot be left to surface as an error -
+    there is no error. The cluster returns fluent nonsense at full speed, and
+    on the first report of it the model looked "successfully loaded".
+
+    Why ignoring 29 unused tensors should corrupt the other 1847 is not
+    established. The rule here is the measurement, not an explanation of it.
+    """
+    directory = Path(model_path) if model_path else None
+    if directory is None or not directory.is_dir():
+        return False
+
+    try:
+        mtime = directory.stat().st_mtime
+    except OSError:
+        return False
+
+    with _mtp_lock:
+        cached = _mtp.get(model_path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+
+    answer = _has_mtp_uncached(directory)
+    with _mtp_lock:
+        _mtp[model_path] = (mtime, answer)
+    return answer
+
+
+def _is_mtp_key(name: str) -> bool:
+    return ".mtp." in name or name.startswith("mtp.")
+
+
+def _has_mtp_uncached(directory: Path) -> bool:
+    """Weight names only. Reading headers beats loading 30 GB to ask."""
+    index = directory / "model.safetensors.index.json"
+    if index.is_file():
+        try:
+            weight_map = json.loads(index.read_text()).get("weight_map", {})
+        except (OSError, ValueError):
+            return False
+        return any(_is_mtp_key(name) for name in weight_map)
+
+    # No index: a safetensors file states its own tensor names in a JSON
+    # header, so the names cost one seek rather than a load.
+    try:
+        files = sorted(directory.glob("*.safetensors"))
+    except OSError:
+        return False
+    for path in files:
+        try:
+            with path.open("rb") as handle:
+                (length,) = struct.unpack("<Q", handle.read(8))
+                header = json.loads(handle.read(length))
+        except (OSError, ValueError, struct.error):
+            continue
+        if any(_is_mtp_key(name) for name in header):
+            return True
+    return False
+
+
 def shard_census(model_path: str) -> tuple[int, int]:
     """`(present, expected)` safetensors shards for a model directory.
 
@@ -106,8 +193,10 @@ def describe(model: dict[str, Any]) -> dict[str, Any]:
     """Judge one model from the admin model list as a cluster candidate."""
     architecture = model.get("config_model_type") or ""
     shardable = supports_tensor_sharding(architecture)
-    present, expected = shard_census(model.get("model_path") or "")
+    model_path = model.get("model_path") or ""
+    present, expected = shard_census(model_path)
     complete = expected == 0 or present >= expected
+    mtp = carries_mtp_weights(model_path)
 
     if not complete:
         reason = f"only {present} of {expected} weight files are on disk"
@@ -116,6 +205,12 @@ def describe(model: dict[str, Any]) -> dict[str, Any]:
             f"mlx-lm cannot split a {architecture!r} model across ranks"
             if architecture
             else "this model has no architecture mlx-lm can split"
+        )
+    elif mtp:
+        reason = (
+            "this checkpoint carries multi-token-prediction weights, which "
+            "mlx-lm ignores and then generates nonsense from the rest - one "
+            "Mac serves it correctly, a cluster cannot"
         )
     else:
         reason = ""
@@ -130,7 +225,8 @@ def describe(model: dict[str, Any]) -> dict[str, Any]:
         "complete": complete,
         "shards_present": present,
         "shards_expected": expected,
-        "eligible": shardable and complete,
+        "mtp": mtp,
+        "eligible": shardable and complete and not mtp,
         "reason": reason,
     }
 

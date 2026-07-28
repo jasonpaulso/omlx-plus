@@ -843,16 +843,7 @@ async def cluster_candidates() -> dict[str, Any]:
 
     from omlx.cluster import inventory
 
-    models: list[dict[str, Any]] = []
-    try:
-        from omlx.server import _server_state
-
-        engine_pool = _server_state.engine_pool
-        if engine_pool is not None:
-            status = await asyncio.to_thread(engine_pool.get_status)
-            models = list(status.get("models", []))
-    except Exception:  # noqa: BLE001 - an empty list is a usable answer
-        logger.exception("cluster: could not list models for candidates")
+    models = await _local_models()
 
     # Off the event loop: judging a candidate stats its directory, and the
     # first call for an architecture imports an mlx-lm module.
@@ -867,6 +858,55 @@ async def generate_cluster_key() -> dict[str, str]:
 
     _require_real_auth()
     return {"cluster_key": secrets.token_urlsafe(32)}
+
+
+async def _local_models() -> list[dict[str, Any]]:
+    """This node's models as the pool reports them, or nothing it can judge."""
+    import asyncio
+
+    try:
+        from omlx.server import _server_state
+
+        engine_pool = _server_state.engine_pool
+        if engine_pool is None:
+            return []
+        status = await asyncio.to_thread(engine_pool.get_status)
+        return list(status.get("models", []))
+    except Exception:  # noqa: BLE001 - an empty list is a usable answer
+        logger.exception("cluster: could not list models")
+        return []
+
+
+async def _refuse_an_unservable_model(model_id: str) -> None:
+    """Reject a model this node knows a cluster cannot serve correctly.
+
+    The picker's eligibility was advisory: it explained itself beautifully in
+    the list and then accepted whatever string arrived here. That is the wrong
+    place to be lenient about the MTP case, because it fails without failing -
+    the cluster forms, serves, and answers nonsense.
+
+    Silent on models this node does not have. A leader may legitimately name a
+    model only its peers hold, and refusing on absence would make a pairing
+    problem look like a bad model.
+    """
+    import asyncio
+
+    from omlx.cluster import inventory
+
+    entry = next(
+        (m for m in await _local_models() if m.get("id") == model_id),
+        None,
+    )
+    if entry is None:
+        return
+
+    described = await asyncio.to_thread(inventory.describe, entry)
+    if described["eligible"]:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=f"{model_id} cannot be served by a cluster: {described['reason']}.",
+    )
 
 
 @admin_router.post("/config")
@@ -945,6 +985,9 @@ async def set_cluster_config(
             status_code=400,
             detail="Set a cluster key before enabling clustering.",
         )
+
+    if payload.model:
+        await _refuse_an_unservable_model(payload.model)
 
     previous_model = cluster.model
     for name, value in payload.model_dump(exclude_unset=True).items():

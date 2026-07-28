@@ -8,6 +8,9 @@ and offered ones that could never have formed.
 
 from __future__ import annotations
 
+import json
+import struct
+
 import pytest
 
 from omlx.cluster import inventory
@@ -116,6 +119,111 @@ def test_an_unshardable_model_says_so_rather_than_vanishing(tmp_path):
     assert described["eligible"] is False
     assert described["complete"] is True
     assert "gemma4" in described["reason"]
+
+
+def _write_index(directory, weight_names):
+    """A model directory whose index names `weight_names`, files and all."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "model-00001-of-00001.safetensors").write_bytes(b"x")
+    (directory / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {n: "model-00001-of-00001.safetensors" for n in weight_names}}
+        )
+    )
+    return str(directory)
+
+
+def _write_single_file(directory, tensor_names):
+    """One safetensors file with a real header, no index alongside it."""
+    directory.mkdir(parents=True, exist_ok=True)
+    header = json.dumps({n: {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]} for n in tensor_names}).encode()
+    with (directory / "model.safetensors").open("wb") as handle:
+        handle.write(struct.pack("<Q", len(header)))
+        handle.write(header)
+        handle.write(b"\x00\x00\x00\x00")
+    return str(directory)
+
+
+def test_a_checkpoint_with_mtp_heads_is_refused(tmp_path):
+    """Measured 2026-07-28, one Mac, single process, no cluster: Macaron-V1-
+    Tall-oQ8e-mtp (42 mtp weights) generated '-in坎t店铺经营者format的...' while
+    Ornith-1.0-35B-oQ8e - same mlx-lm module, same quantisation, no mtp -
+    answered 'Paris, a city renowned for its rich history'. mlx-lm ignores the
+    MTP tensors and mis-loads the rest, and nothing raises: the cluster forms,
+    serves at full speed, and returns fluent nonsense.
+    """
+    path = _write_index(
+        tmp_path / "mtp",
+        [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.mtp.fc.weight",
+            "language_model.mtp.layers.0.input_layernorm.weight",
+        ],
+    )
+
+    described = inventory.describe(_model(id="Macaron-V1-Tall-oQ8e-mtp", model_path=path))
+
+    assert described["mtp"] is True
+    assert described["eligible"] is False
+    assert described["complete"] is True
+    assert described["shardable"] is True
+    assert "multi-token-prediction" in described["reason"]
+
+
+def test_the_same_model_without_mtp_heads_is_eligible(tmp_path):
+    """The control arm. Blocking every checkpoint that merely looks like these
+    would take out the large VL MoEs a cluster exists for - Ornith is one, and
+    it is correct through mlx-lm."""
+    path = _write_index(
+        tmp_path / "plain",
+        [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "vision_tower.blocks.0.attn.qkv.weight",
+        ],
+    )
+
+    described = inventory.describe(_model(id="Ornith-1.0-35B-oQ8e", model_path=path))
+
+    assert described["mtp"] is False
+    assert described["eligible"] is True
+    assert described["reason"] == ""
+
+
+def test_mtp_is_found_in_a_single_file_model_too(tmp_path):
+    """No index means the tensor names live in the safetensors header. Reading
+    it costs a seek; not reading it would leave the gate open on exactly the
+    checkpoints it exists to catch."""
+    path = _write_single_file(tmp_path / "solo", ["model.layers.0.mlp.up_proj.weight", "mtp.fc.weight"])
+
+    assert inventory.carries_mtp_weights(path) is True
+
+
+def test_a_single_file_model_without_mtp_is_not_flagged(tmp_path):
+    path = _write_single_file(tmp_path / "solo-plain", ["model.layers.0.mlp.up_proj.weight"])
+
+    assert inventory.carries_mtp_weights(path) is False
+
+
+def test_a_missing_directory_is_not_called_mtp(tmp_path):
+    """No evidence is not evidence of a problem: a model this node does not
+    hold must not be refused as though it were broken."""
+    assert inventory.carries_mtp_weights(str(tmp_path / "nowhere")) is False
+    assert inventory.carries_mtp_weights("") is False
+
+
+def test_the_mtp_answer_is_recomputed_when_the_directory_changes(tmp_path):
+    """Cached on directory mtime, like the census - a download finishing must
+    not leave a stale answer behind."""
+    directory = tmp_path / "growing"
+    _write_index(directory, ["language_model.model.layers.0.self_attn.q_proj.weight"])
+    assert inventory.carries_mtp_weights(str(directory)) is False
+
+    _write_index(directory, ["language_model.mtp.fc.weight"])
+    import os
+
+    os.utime(directory, (0, 0))
+
+    assert inventory.carries_mtp_weights(str(directory)) is True
 
 
 def test_candidates_lead_with_the_big_models(tmp_path):

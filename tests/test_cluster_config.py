@@ -9,6 +9,7 @@ because it is what enables it. Every test that matters therefore starts from
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 import pytest
@@ -289,6 +290,81 @@ def test_a_partial_write_leaves_other_fields_alone(node):
     assert settings.cluster.model == "big-model"
     assert settings.cluster.backend == "jaccl"
     assert settings.cluster.max_batch_size == 4
+
+
+def _model_dir(tmp_path, name, weight_names):
+    directory = tmp_path / name
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "model-00001-of-00001.safetensors").write_bytes(b"x")
+    (directory / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {n: "model-00001-of-00001.safetensors" for n in weight_names}}
+        )
+    )
+    return str(directory)
+
+
+def _hold(monkeypatch, models):
+    async def _local_models():
+        return models
+
+    monkeypatch.setattr(routes, "_local_models", _local_models)
+
+
+def test_a_model_a_cluster_cannot_serve_is_refused(node, monkeypatch, tmp_path):
+    """The picker explained itself and then accepted whatever string arrived
+    here. For the MTP case that is the wrong place to be lenient: the cluster
+    forms, serves, and answers nonsense, so nothing ever surfaces as an error.
+    """
+    client, settings, _app = node
+    path = _model_dir(
+        tmp_path,
+        "mtp",
+        ["language_model.model.layers.0.self_attn.q_proj.weight", "language_model.mtp.fc.weight"],
+    )
+    _hold(
+        monkeypatch,
+        [{"id": "Macaron-V1-Tall-oQ8e-mtp", "model_path": path, "config_model_type": "qwen3_5_moe"}],
+    )
+
+    response = client.post(
+        "/admin/api/cluster/config", json={"model": "Macaron-V1-Tall-oQ8e-mtp"}
+    )
+
+    assert response.status_code == 400
+    assert "multi-token-prediction" in response.json()["detail"]
+    assert settings.cluster.model == ""
+    assert settings.saves == 0
+
+
+def test_a_servable_model_is_accepted(node, monkeypatch, tmp_path):
+    client, settings, _app = node
+    path = _model_dir(
+        tmp_path, "plain", ["language_model.model.layers.0.self_attn.q_proj.weight"]
+    )
+    _hold(
+        monkeypatch,
+        [{"id": "Ornith-1.0-35B-oQ8e", "model_path": path, "config_model_type": "qwen3_5_moe"}],
+    )
+
+    response = client.post(
+        "/admin/api/cluster/config", json={"model": "Ornith-1.0-35B-oQ8e"}
+    )
+
+    assert response.status_code == 200
+    assert settings.cluster.model == "Ornith-1.0-35B-oQ8e"
+
+
+def test_a_model_this_node_does_not_hold_is_not_refused(node, monkeypatch):
+    """A leader may name a model only its peers have. Refusing on absence
+    would dress a pairing problem up as a broken model."""
+    client, settings, _app = node
+    _hold(monkeypatch, [])
+
+    response = client.post("/admin/api/cluster/config", json={"model": "elsewhere"})
+
+    assert response.status_code == 200
+    assert settings.cluster.model == "elsewhere"
 
 
 def test_a_serving_cluster_refuses_the_write(node, monkeypatch):
