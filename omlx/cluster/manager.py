@@ -551,6 +551,18 @@ class ClusterManager:
         if not reply.get("ok"):
             raise ClusterFormationError(reply.get("error", "load failed"))
 
+        # Rank 0 has always reported the world it actually joined; nothing read
+        # it, and `status()` reports the world we *planned*. When a backend
+        # fails to come up, mlx hands back a one-process group, so rank 0 loads
+        # the whole model and serves alone while every log line says the fleet
+        # formed. Fail here instead, which puts `auto` onto the ring fallback.
+        joined = reply.get("world_size")
+        if joined != len(slots):
+            raise ClusterFormationError(
+                f"rank 0 joined a world of {joined}, not {len(slots)}: "
+                f"the {backend} backend did not form across every node"
+            )
+
         # From here on, replies interleave across requests; the router owns
         # the read side of the pipe. Nothing may call `command()` again on
         # this cluster.

@@ -56,6 +56,12 @@ DEFAULT_RING_BASE_PORT = 41100
 # TCP bootstrap for jaccl: GID/queue-pair exchange, after which RDMA takes over.
 DEFAULT_JACCL_COORDINATOR_PORT = 41200
 
+# Names the mlx backend a rank must join, so it can ask for that one by name
+# instead of `any`. `mx.distributed.init()` defaults to trying every backend
+# and, worse, to returning a single-process group when none of them come up -
+# which reads downstream as a formed cluster serving on one machine.
+BACKEND_VAR = "OMLX_CLUSTER_BACKEND"
+
 
 @dataclass(frozen=True)
 class RankLaunch:
@@ -111,6 +117,7 @@ def ring_env(rank: int, hostfile: str | Path) -> dict[str, str]:
         "MLX_RANK": str(rank),
         "MLX_HOSTFILE": str(hostfile),
         "MLX_METAL_FAST_SYNCH": METAL_FAST_SYNCH,
+        BACKEND_VAR: "ring",
     }
 
 
@@ -132,6 +139,9 @@ def jaccl_env(
         "MLX_JACCL_COORDINATOR": coordinator,
         "MLX_IBV_DEVICES": str(ibv_devices),
         "MLX_METAL_FAST_SYNCH": METAL_FAST_SYNCH,
+        # `jaccl-ring` is still mlx's `jaccl` backend; MLX_JACCL_RING picks the
+        # topology within it.
+        BACKEND_VAR: "jaccl",
     }
     if ring:
         # Ring cabling rather than a full mesh.
@@ -192,5 +202,9 @@ def scrubbed_parent_env() -> dict[str, str]:
         "JACCL_COORDINATOR",
         "JACCL_IBV_DEVICES",
         "JACCL_RING",
+        # mlx's own launcher exports this; inheriting a previous run's value
+        # would size a world the caller never asked for.
+        "MLX_WORLD_SIZE",
+        BACKEND_VAR,
     }
     return {k: v for k, v in os.environ.items() if k not in drop}

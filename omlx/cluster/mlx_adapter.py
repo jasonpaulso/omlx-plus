@@ -39,12 +39,15 @@ force that work to happen before any real traffic.
 from __future__ import annotations
 
 import logging
+import os
 import pickle
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
 import mlx.core as mx
+
+from omlx.cluster import hostfile
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +108,14 @@ class DistributedSession:
     """
 
     def __init__(self) -> None:
-        self._group = mx.distributed.init()
+        # `strict=True` because the default returns a *singleton group* when no
+        # backend comes up, and every layer above reads that as success: rank 0
+        # loads the whole model, the leader reports the world it planned, and
+        # the peer's rank sits idle holding nothing. Naming the backend matters
+        # for the same reason - `any` will happily settle for something other
+        # than the transport the topology planner chose and logged.
+        backend = os.environ.get(hostfile.BACKEND_VAR) or "any"
+        self._group = mx.distributed.init(strict=True, backend=backend)
         self.world = WorldInfo(rank=self._group.rank(), size=self._group.size())
         self.barrier()
         logger.info(

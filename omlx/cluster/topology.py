@@ -261,6 +261,27 @@ def find_ring(node_ids: list[str], edges: set[frozenset[str]]) -> list[str] | No
     return list(path) if extend() else None
 
 
+def unattributed_device(report: NodeReport) -> str | None:
+    """The RDMA device of a node that cannot name its peer on any bus.
+
+    A Thunderbolt hub between two Macs - a Studio Display with an upstream and
+    a downstream port, say - is enumerated asymmetrically: the Mac downstream
+    reports the far Mac as its bus peer, the Mac upstream reports no peer at
+    all. Its buses therefore attribute no device to any link, and the matrix
+    entry falls through to null even though RDMA is live on both ends
+    (measured 2026-07-27: a hand-written symmetric matrix formed a jaccl world
+    over exactly that cabling and completed a collective).
+
+    Only a single active device is trusted here. With several, position is the
+    only discriminator and there is no bus to index by, so guessing would be
+    worse than the honest null. A wrong guess is bounded anyway: the launch
+    fails, and `auto` falls back to ring.
+    """
+    devices = set(report.rdma_devices)
+    active = sorted(d for d in report.active_rdma_devices if d in devices)
+    return active[0] if len(active) == 1 else None
+
+
 def ibv_matrix(
     reports: list[NodeReport], order: list[str]
 ) -> list[list[str | None]]:
@@ -328,6 +349,8 @@ def ibv_matrix(
                     continue
                 device = pick(report, bus, cable_index)
                 break
+            if device is None and not cabled:
+                device = unattributed_device(report)
             row.append(device)
         matrix.append(row)
     return matrix
