@@ -477,6 +477,27 @@ async def lifespan(app: FastAPI):
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # Start the cluster control plane when a role is configured. start()
+    # refuses a cluster role on a server with no API key, which fails
+    # startup loudly rather than exposing an unauthenticated control plane.
+    from .settings import GlobalSettings
+
+    cluster_manager = None
+    global_settings = _server_state.global_settings
+    if (
+        isinstance(global_settings, GlobalSettings)
+        and global_settings.cluster.role != "off"
+    ):
+        from .cluster.manager import ClusterManager, set_cluster_manager
+
+        cluster_manager = ClusterManager(global_settings)
+        set_cluster_manager(cluster_manager)
+        try:
+            await cluster_manager.start()
+        except Exception:
+            set_cluster_manager(None)
+            raise
+
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
@@ -487,6 +508,12 @@ async def lifespan(app: FastAPI):
         with suppress(asyncio.CancelledError):
             await preload_task
     get_server_metrics().save_alltime()
+    if cluster_manager is not None:
+        from .cluster.manager import set_cluster_manager
+
+        await cluster_manager.stop()
+        set_cluster_manager(None)
+        logger.info("Cluster manager stopped")
     if ttl_task is not None:
         ttl_task.cancel()
         try:
@@ -539,6 +566,13 @@ try:
     del _
 except ImportError:
     pass
+
+# Include cluster control-plane routes. The router is always mounted; every
+# route answers 404 while cluster.role is "off", so the default install is
+# indistinguishable from one without the feature.
+from .cluster.routes import router as cluster_router
+
+app.include_router(cluster_router)
 
 # Include admin routes
 from .admin.auth import _RedirectToLogin

@@ -3062,6 +3062,38 @@ async def get_server_info(is_admin: bool = Depends(require_admin)):
     }
 
 
+async def _require_cluster_operator(request: Request) -> bool:
+    """Delegate to the cluster operator dependency.
+
+    Imported lazily: ``omlx.admin`` imports this module from its package
+    ``__init__``, so a module-level import of ``omlx.cluster.auth`` (which
+    imports ``omlx.admin.auth``) would break whenever the cluster package
+    is imported first.
+    """
+    from ..cluster.auth import require_cluster_operator
+
+    return await require_cluster_operator(request)
+
+
+@router.get("/api/cluster")
+async def get_cluster(is_operator: bool = Depends(_require_cluster_operator)):
+    """Return the cluster state snapshot for the dashboard panel.
+
+    Guarded by the cluster operator dependency rather than
+    ``require_admin``/``_require_admin_or_bearer``: those honor
+    ``skip_api_key_verification``, which would open a second, softer read
+    path to cluster state. The snapshot never contains credential
+    material (CL-12).
+    """
+    from ..cluster.manager import get_cluster_manager
+
+    manager = get_cluster_manager()
+    if manager is None:
+        # The operator dependency already 404s when no role is active.
+        raise HTTPException(status_code=404, detail="Not Found")
+    return manager.snapshot()
+
+
 def _schedule_self_terminate(delay: float = 0.5) -> None:
     """Schedule ``os.kill(getpid(), SIGTERM)`` on the running loop.
 

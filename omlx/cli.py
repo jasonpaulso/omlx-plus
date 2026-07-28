@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import faulthandler
 import math
 import sys
@@ -752,6 +753,165 @@ def diagnose_command(args) -> int:
     return 1
 
 
+def _local_server(args):
+    """Resolve the local server base URL and main-key headers.
+
+    Cluster verbs are thin authenticated clients of the local server: the
+    long-lived server process owns the cluster credential, not the CLI.
+    """
+    from .settings import GlobalSettings
+
+    settings = GlobalSettings.load()
+    host = getattr(args, "host", None) or settings.server.host
+    port = getattr(args, "port", None) or settings.server.port
+    first_bind = [h.strip() for h in host.split(",") if h.strip()][0] if host else ""
+    connect_host = (
+        first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    )
+
+    api_key = getattr(args, "api_key", None) or settings.auth.api_key
+    if not api_key:
+        print("No API key configured. Cluster commands require one.")
+        sys.exit(1)
+    headers = {"Authorization": f"Bearer {api_key}"}
+    return settings, f"http://{connect_host}:{port}", headers
+
+
+def _cluster_request(method: str, url: str, headers: dict, json_body=None):
+    """Call the local server and exit with a readable message on failure."""
+    import requests
+
+    try:
+        response = requests.request(
+            method, url, headers=headers, json=json_body, timeout=30
+        )
+    except Exception as exc:
+        print(f"Could not reach the oMLX server at {url}: {exc}")
+        print("Start the server first: omlx start")
+        sys.exit(1)
+    if response.status_code == 404:
+        print(
+            "Cluster endpoint not available. Check that this node runs with the "
+            "expected cluster.role (head or worker)."
+        )
+        sys.exit(1)
+    if response.status_code >= 400:
+        detail = response.text
+        with contextlib.suppress(ValueError):
+            detail = response.json().get("detail", detail)
+        print(f"Request failed ({response.status_code}): {detail}")
+        sys.exit(1)
+    try:
+        return response.json()
+    except ValueError:
+        print(f"Unexpected non-JSON response from {url}")
+        sys.exit(1)
+
+
+def _resolve_join_token(args) -> str:
+    """Read the bootstrap token from a file or the environment.
+
+    ``--token-file`` and ``OMLX_CLUSTER_TOKEN`` are the documented inputs;
+    ``--token`` works but puts the secret on the command line where any
+    local process can read it (CL-08).
+    """
+    import os
+    from pathlib import Path
+
+    if args.token_file:
+        try:
+            token = Path(args.token_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            print(f"Could not read token file {args.token_file}: {exc}")
+            sys.exit(1)
+        if token:
+            return token
+        print(f"Token file {args.token_file} is empty")
+        sys.exit(1)
+    env_token = os.environ.get("OMLX_CLUSTER_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    if args.token:
+        return str(args.token)
+    print(
+        "No bootstrap token provided. Set OMLX_CLUSTER_TOKEN, pass "
+        "--token-file, or (less safely) --token."
+    )
+    sys.exit(1)
+
+
+def join_command(args):
+    """Join this node's server to a cluster head."""
+    token = _resolve_join_token(args)
+    _settings, base_url, headers = _local_server(args)
+    result = _cluster_request(
+        "POST",
+        f"{base_url}/v1/cluster/local/join",
+        headers,
+        {"head_url": args.head_url, "token": token},
+    )
+    print(f"Joined {result.get('head_url')} as member {result.get('member_id')}")
+    print(f"Heartbeat interval: {result.get('heartbeat_interval_s')}s")
+
+
+def cluster_command(args):
+    """Run a cluster control-plane verb against the local server."""
+    settings, base_url, headers = _local_server(args)
+    action = args.action
+
+    if action == "token":
+        if args.revoke:
+            result = _cluster_request("DELETE", f"{base_url}/v1/cluster/token", headers)
+            print(
+                "Bootstrap token revoked."
+                if result.get("revoked")
+                else "No bootstrap token was configured."
+            )
+            return
+        result = _cluster_request("POST", f"{base_url}/v1/cluster/token", headers)
+        print("Bootstrap join token (shown once):")
+        print(f"  {result.get('token')}")
+        print(f"  expires in {result.get('ttl_s')}s")
+        print(
+            "Pass it to the worker as OMLX_CLUSTER_TOKEN or via "
+            "`omlx join <head-url> --token-file <path>`."
+        )
+        return
+
+    if action == "leave":
+        result = _cluster_request("POST", f"{base_url}/v1/cluster/local/leave", headers)
+        print(f"Left {result.get('head_url')} (member {result.get('member_id')})")
+        if not result.get("head_notified"):
+            print("Warning: the head could not be reached; remove the member there.")
+        return
+
+    # status
+    if settings.cluster.role == "worker":
+        result = _cluster_request("GET", f"{base_url}/v1/cluster/local/status", headers)
+        if not result.get("joined"):
+            print("Not joined to any cluster.")
+            return
+        print(f"Head: {result.get('head_url')}")
+        print(f"Member id: {result.get('member_id')}")
+        heartbeat = result.get("heartbeat") or {}
+        print(
+            f"Heartbeat: seq={heartbeat.get('seq')} epoch={heartbeat.get('epoch')} "
+            f"running={heartbeat.get('running')}"
+        )
+        if heartbeat.get("last_error"):
+            print(f"Last error: {heartbeat['last_error']}")
+        return
+
+    result = _cluster_request("GET", f"{base_url}/v1/cluster/state", headers)
+    members = result.get("members", [])
+    print(f"Role: {result.get('role')}  members: {len(members)}")
+    for member in members:
+        print(
+            f"  {member.get('id')}  {member.get('address')}:{member.get('port')}  "
+            f"{member.get('status')}  {member.get('name') or ''}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="omlx: Production-ready LLM server for Apple Silicon",
@@ -978,6 +1138,21 @@ Example directory structure:
         help="API key for authentication (optional)",
     )
 
+    # Cluster options
+    serve_parser.add_argument(
+        "--cluster-role",
+        type=str,
+        choices=["off", "head", "worker"],
+        default=None,
+        help="Cluster control-plane role (default: off). head and worker both "
+        "require an API key to be configured",
+    )
+    serve_parser.add_argument(
+        "--cluster-allow-loopback",
+        action="store_true",
+        help="Admit cluster members whose address is loopback (single-host testing)",
+    )
+
     # Launch command
     launch_parser = subparsers.add_parser(
         "launch",
@@ -1049,6 +1224,69 @@ Example directory structure:
         help="Claude Code Haiku tier model (Claude integration only)",
     )
 
+    # Cluster commands
+    join_parser = subparsers.add_parser(
+        "join",
+        help="Join this node's server to a cluster head",
+        description=(
+            "Ask the local oMLX server to join a cluster head. The server "
+            "performs the handshake and owns the resulting credential; the "
+            "bootstrap token is read from OMLX_CLUSTER_TOKEN or --token-file."
+        ),
+    )
+    join_parser.add_argument("head_url", type=str, help="Head server URL")
+    join_parser.add_argument(
+        "--token-file",
+        type=str,
+        default=None,
+        help="File holding the bootstrap join token (preferred over --token)",
+    )
+    join_parser.add_argument(
+        "--token",
+        type=str,
+        default=None,
+        help="Bootstrap join token. Visible to other local processes via the "
+        "process list — prefer OMLX_CLUSTER_TOKEN or --token-file",
+    )
+
+    cluster_parser = subparsers.add_parser(
+        "cluster",
+        help="Inspect and manage the cluster control plane",
+        description="Mint join tokens, leave a cluster, or show cluster status.",
+    )
+    cluster_parser.add_argument(
+        "action",
+        type=str,
+        choices=["token", "leave", "status"],
+        help="token: mint (or --revoke) a bootstrap join token (head); "
+        "leave: leave the cluster (worker); status: show cluster state",
+    )
+    cluster_parser.add_argument(
+        "--revoke",
+        action="store_true",
+        help="With 'token': invalidate the current bootstrap join token",
+    )
+
+    for cluster_client_parser in (join_parser, cluster_parser):
+        cluster_client_parser.add_argument(
+            "--host",
+            type=str,
+            default=None,
+            help="oMLX server host (default: from settings or 127.0.0.1)",
+        )
+        cluster_client_parser.add_argument(
+            "--port",
+            type=int,
+            default=None,
+            help="oMLX server port (default: from settings or 8000)",
+        )
+        cluster_client_parser.add_argument(
+            "--api-key",
+            type=str,
+            default=None,
+            help="API key for oMLX server authentication",
+        )
+
     # Diagnose command
     diagnose_parser = subparsers.add_parser(
         "diagnose",
@@ -1084,6 +1322,10 @@ Example directory structure:
             serve_command(args)
         elif args.command in {"start", "stop", "restart"}:
             sys.exit(lifecycle_command(args))
+        elif args.command == "join":
+            join_command(args)
+        elif args.command == "cluster":
+            cluster_command(args)
         elif args.command == "diagnose":
             sys.exit(diagnose_command(args))
         else:

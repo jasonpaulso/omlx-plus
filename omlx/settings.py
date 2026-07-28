@@ -507,6 +507,58 @@ class AuthSettings:
 
 
 @dataclass
+class ClusterSettings:
+    """Distributed-serving control-plane settings.
+
+    ``role`` is the feature flag: ``off`` (the default) leaves the cluster
+    package inert — no routes are reachable and no background task runs.
+    A non-off role requires ``auth.api_key`` to be configured; the server
+    refuses to start otherwise.
+    """
+
+    role: str = "off"
+    heartbeat_interval_s: float = 5.0
+    member_timeout_s: float = 20.0
+    bootstrap_token_ttl_s: float = 900.0
+    # Single-host test mode: admit members whose socket address is loopback
+    # (CL-10 otherwise rejects loopback, unspecified and multicast).
+    allow_loopback: bool = False
+    node_name: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ClusterSettings:
+        """Create from dictionary."""
+        return cls(
+            role=normalize_cluster_role(data.get("role")),
+            heartbeat_interval_s=float(data.get("heartbeat_interval_s", 5.0)),
+            member_timeout_s=float(data.get("member_timeout_s", 20.0)),
+            bootstrap_token_ttl_s=float(data.get("bootstrap_token_ttl_s", 900.0)),
+            allow_loopback=bool(data.get("allow_loopback", False)),
+            node_name=str(data.get("node_name") or ""),
+        )
+
+
+VALID_CLUSTER_ROLES = {"off", "head", "worker"}
+
+
+def normalize_cluster_role(value: Any) -> str:
+    """Coerce a cluster role to a known value, defaulting to ``off``.
+
+    An unknown role must never leave the node in a half-enabled state, so
+    anything unrecognized falls back to the feature being off.
+    """
+    role = str(value or "off").strip().lower()
+    if role not in VALID_CLUSTER_ROLES:
+        logger.warning(f"Invalid cluster role: {value!r}, using 'off'")
+        return "off"
+    return role
+
+
+@dataclass
 class MCPSettings:
     """MCP (Model Context Protocol) configuration settings."""
 
@@ -804,6 +856,7 @@ class GlobalSettings:
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     cache: CacheSettings = field(default_factory=CacheSettings)
     auth: AuthSettings = field(default_factory=AuthSettings)
+    cluster: ClusterSettings = field(default_factory=ClusterSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
     modelscope: ModelScopeSettings = field(default_factory=ModelScopeSettings)
@@ -891,6 +944,8 @@ class GlobalSettings:
                 self.cache = CacheSettings.from_dict(data["cache"])
             if "auth" in data:
                 self.auth = AuthSettings.from_dict(data["auth"])
+            if "cluster" in data:
+                self.cluster = ClusterSettings.from_dict(data["cluster"])
             if "mcp" in data:
                 self.mcp = MCPSettings.from_dict(data["mcp"])
             if "huggingface" in data:
@@ -980,6 +1035,29 @@ class GlobalSettings:
         # Auth settings
         if api_key := os.getenv("OMLX_API_KEY"):
             self.auth.api_key = api_key
+
+        # Cluster settings
+        if cluster_role := os.getenv("OMLX_CLUSTER_ROLE"):
+            self.cluster.role = normalize_cluster_role(cluster_role)
+        for env_name, attr in (
+            ("OMLX_CLUSTER_HEARTBEAT_INTERVAL_S", "heartbeat_interval_s"),
+            ("OMLX_CLUSTER_MEMBER_TIMEOUT_S", "member_timeout_s"),
+            ("OMLX_CLUSTER_BOOTSTRAP_TOKEN_TTL_S", "bootstrap_token_ttl_s"),
+        ):
+            if raw := os.getenv(env_name):
+                try:
+                    setattr(self.cluster, attr, float(raw))
+                except ValueError:
+                    logger.warning(f"Invalid {env_name} value: {raw}")
+        if allow_loopback := os.getenv("OMLX_CLUSTER_ALLOW_LOOPBACK"):
+            self.cluster.allow_loopback = allow_loopback.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if node_name := os.getenv("OMLX_CLUSTER_NODE_NAME"):
+            self.cluster.node_name = node_name
 
         # MCP settings
         if mcp_config := os.getenv("OMLX_MCP_CONFIG"):
@@ -1102,6 +1180,12 @@ class GlobalSettings:
         if hasattr(args, "api_key") and args.api_key is not None:
             self.auth.api_key = args.api_key
 
+        # Cluster settings
+        if hasattr(args, "cluster_role") and args.cluster_role is not None:
+            self.cluster.role = normalize_cluster_role(args.cluster_role)
+        if hasattr(args, "cluster_allow_loopback") and args.cluster_allow_loopback:
+            self.cluster.allow_loopback = True
+
         # MCP settings
         if hasattr(args, "mcp_config") and args.mcp_config is not None:
             self.mcp.config_path = args.mcp_config
@@ -1178,6 +1262,7 @@ class GlobalSettings:
             "scheduler": self.scheduler.to_dict(),
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),
+            "cluster": self.cluster.to_dict(),
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
@@ -1463,6 +1548,7 @@ class GlobalSettings:
             "scheduler": self.scheduler.to_dict(),
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),
+            "cluster": self.cluster.to_dict(),
             "mcp": self.mcp.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),

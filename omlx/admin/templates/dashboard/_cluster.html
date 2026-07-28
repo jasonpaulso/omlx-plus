@@ -1,0 +1,108 @@
+<!-- Read-only cluster panel. Hidden entirely unless /admin/api/cluster
+     answers with an active role; write operations arrive in S4/S5. -->
+<div x-show="mainTab === 'status'" x-cloak x-data="clusterPanel()" x-init="init()">
+    <div x-show="cluster" x-cloak class="animate-fade-in-up mt-10">
+        <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4 mb-6">
+            <div>
+                <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">Cluster</h2>
+                <h3 class="text-2xl font-bold tracking-tight text-neutral-900">
+                    Members
+                    <span class="text-base font-medium text-neutral-400"
+                          x-text="cluster ? `(${cluster.active_count}/${cluster.member_count} active)` : ''"></span>
+                </h3>
+            </div>
+            <div class="flex items-center gap-2">
+                <span class="px-2.5 py-1 text-xs font-medium rounded-lg bg-neutral-100 text-neutral-600"
+                      x-text="cluster ? `role: ${cluster.role}` : ''"></span>
+                <span class="px-2.5 py-1 text-xs font-medium rounded-lg bg-neutral-100 text-neutral-600"
+                      x-show="cluster && cluster.bootstrap_token && cluster.bootstrap_token.configured">
+                    join token active
+                </span>
+            </div>
+        </div>
+
+        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+            <template x-if="cluster && cluster.members.length === 0">
+                <p class="px-5 py-6 text-sm text-neutral-400">No members have joined yet.</p>
+            </template>
+            <template x-if="cluster && cluster.members.length > 0">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead class="bg-neutral-50 text-xs uppercase tracking-widest text-neutral-400">
+                            <tr>
+                                <th class="text-left font-bold px-5 py-3">Member</th>
+                                <th class="text-left font-bold px-5 py-3">Endpoint</th>
+                                <th class="text-left font-bold px-5 py-3">Status</th>
+                                <th class="text-left font-bold px-5 py-3">Last heartbeat</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="m in cluster.members" :key="m.id">
+                                <tr class="border-t border-neutral-100">
+                                    <td class="px-5 py-3">
+                                        <span class="font-medium text-neutral-900" x-text="m.name || m.id"></span>
+                                        <span class="block text-xs font-mono text-neutral-400" x-text="m.id"></span>
+                                    </td>
+                                    <td class="px-5 py-3 font-mono text-xs text-neutral-600"
+                                        x-text="`${m.address}:${m.port}`"></td>
+                                    <td class="px-5 py-3">
+                                        <span class="px-2 py-0.5 text-xs font-medium rounded-md"
+                                              :class="m.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'"
+                                              x-text="m.status"></span>
+                                    </td>
+                                    <td class="px-5 py-3 text-xs text-neutral-500"
+                                        x-text="formatHeartbeat(m.last_heartbeat_at)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </template>
+        </div>
+    </div>
+</div>
+
+<script>
+    function clusterPanel() {
+        return {
+            cluster: null,
+            timer: null,
+            async init() {
+                // Poll only once the endpoint has answered. With no cluster
+                // role the endpoint 404s, and a standing interval would write
+                // a rejected-request warning to the server log every 5s on a
+                // default install.
+                if (await this.refresh()) {
+                    this.timer = setInterval(() => this.refresh(), 5000);
+                }
+            },
+            stop() {
+                if (this.timer) {
+                    clearInterval(this.timer);
+                    this.timer = null;
+                }
+            },
+            async refresh() {
+                try {
+                    const resp = await fetch('/admin/api/cluster');
+                    if (!resp.ok) {
+                        this.cluster = null;
+                        this.stop();
+                        return false;
+                    }
+                    this.cluster = await resp.json();
+                    return true;
+                } catch (e) {
+                    this.cluster = null;
+                    this.stop();
+                    return false;
+                }
+            },
+            formatHeartbeat(ts) {
+                if (!ts) return 'never';
+                const age = Math.max(0, Math.round(Date.now() / 1000 - ts));
+                return age < 1 ? 'just now' : `${age}s ago`;
+            },
+        };
+    }
+</script>

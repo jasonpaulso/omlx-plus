@@ -16,6 +16,7 @@ from omlx.settings import (
     AuthSettings,
     CacheSettings,
     ClaudeCodeSettings,
+    ClusterSettings,
     GlobalSettings,
     HuggingFaceSettings,
     IntegrationSettings,
@@ -2280,3 +2281,92 @@ class TestCORSMiddleware:
             assert resp.status_code == 200
             assert "access-control-allow-origin" in resp.headers
             assert resp.headers["access-control-allow-origin"] == "*"
+
+
+class TestClusterSettings:
+    """Tests for the cluster control-plane settings section."""
+
+    def test_defaults_are_off(self):
+        cluster = ClusterSettings()
+        assert cluster.role == "off"
+        assert cluster.allow_loopback is False
+        assert cluster.heartbeat_interval_s == 5.0
+        assert cluster.member_timeout_s == 20.0
+        assert cluster.bootstrap_token_ttl_s == 900.0
+
+    def test_round_trip_preserves_every_field(self):
+        """The lifespan re-saves settings.json, so a dropped field would
+        silently lose a node's cluster config on the next start."""
+        original = ClusterSettings(
+            role="worker",
+            heartbeat_interval_s=1.5,
+            member_timeout_s=6.0,
+            bootstrap_token_ttl_s=60.0,
+            allow_loopback=True,
+            node_name="studio",
+        )
+        assert ClusterSettings.from_dict(original.to_dict()) == original
+
+    def test_unknown_role_falls_back_to_off(self):
+        assert ClusterSettings.from_dict({"role": "leader"}).role == "off"
+        assert ClusterSettings.from_dict({"role": None}).role == "off"
+
+    def test_role_is_case_insensitive(self):
+        assert ClusterSettings.from_dict({"role": "HEAD"}).role == "head"
+
+    def test_global_settings_persists_the_cluster_section(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings.cluster.role = "head"
+            settings.cluster.allow_loopback = True
+            settings.cluster.member_timeout_s = 7.0
+            settings.save()
+
+            reloaded = GlobalSettings.load(base_path=tmpdir)
+
+            assert reloaded.cluster.role == "head"
+            assert reloaded.cluster.allow_loopback is True
+            assert reloaded.cluster.member_timeout_s == 7.0
+
+    def test_env_overrides(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = {
+                "OMLX_CLUSTER_ROLE": "worker",
+                "OMLX_CLUSTER_HEARTBEAT_INTERVAL_S": "0.5",
+                "OMLX_CLUSTER_MEMBER_TIMEOUT_S": "2",
+                "OMLX_CLUSTER_BOOTSTRAP_TOKEN_TTL_S": "30",
+                "OMLX_CLUSTER_ALLOW_LOOPBACK": "true",
+                "OMLX_CLUSTER_NODE_NAME": "node-a",
+            }
+            with patch.dict(os.environ, env):
+                settings = GlobalSettings.load(base_path=tmpdir)
+            assert settings.cluster.role == "worker"
+            assert settings.cluster.heartbeat_interval_s == 0.5
+            assert settings.cluster.member_timeout_s == 2.0
+            assert settings.cluster.bootstrap_token_ttl_s == 30.0
+            assert settings.cluster.allow_loopback is True
+            assert settings.cluster.node_name == "node-a"
+
+    def test_invalid_numeric_env_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"OMLX_CLUSTER_MEMBER_TIMEOUT_S": "soon"}):
+                settings = GlobalSettings.load(base_path=tmpdir)
+            assert settings.cluster.member_timeout_s == 20.0
+
+    def test_cli_overrides(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings._apply_cli_overrides(
+                Namespace(cluster_role="head", cluster_allow_loopback=True)
+            )
+            assert settings.cluster.role == "head"
+            assert settings.cluster.allow_loopback is True
+
+    def test_cli_default_leaves_role_untouched(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings.cluster.role = "worker"
+            settings._apply_cli_overrides(
+                Namespace(cluster_role=None, cluster_allow_loopback=False)
+            )
+            assert settings.cluster.role == "worker"

@@ -1040,3 +1040,66 @@ class TestCLIDocstrings:
         assert (
             "multi-model" in result.stdout.lower() or "server" in result.stdout.lower()
         )
+
+
+class TestClusterTokenResolution:
+    """Tests for how `omlx join` sources the bootstrap token (CL-08)."""
+
+    def test_token_file_wins_over_env_and_argv(self, tmp_path):
+        from omlx.cli import _resolve_join_token
+
+        token_file = tmp_path / "token"
+        token_file.write_text("from-file\n", encoding="utf-8")
+        args = SimpleNamespace(token_file=str(token_file), token="from-argv")
+        with patch.dict("os.environ", {"OMLX_CLUSTER_TOKEN": "from-env"}):
+            assert _resolve_join_token(args) == "from-file"
+
+    def test_env_wins_over_argv(self):
+        from omlx.cli import _resolve_join_token
+
+        args = SimpleNamespace(token_file=None, token="from-argv")
+        with patch.dict("os.environ", {"OMLX_CLUSTER_TOKEN": "from-env"}):
+            assert _resolve_join_token(args) == "from-env"
+
+    def test_argv_token_still_works(self):
+        from omlx.cli import _resolve_join_token
+
+        args = SimpleNamespace(token_file=None, token="from-argv")
+        with patch.dict("os.environ", {"OMLX_CLUSTER_TOKEN": ""}):
+            assert _resolve_join_token(args) == "from-argv"
+
+    def test_no_token_anywhere_exits(self):
+        from omlx.cli import _resolve_join_token
+
+        args = SimpleNamespace(token_file=None, token=None)
+        with (
+            patch.dict("os.environ", {"OMLX_CLUSTER_TOKEN": ""}),
+            pytest.raises(SystemExit),
+        ):
+            _resolve_join_token(args)
+
+    def test_unreadable_token_file_exits(self, tmp_path):
+        from omlx.cli import _resolve_join_token
+
+        args = SimpleNamespace(token_file=str(tmp_path / "missing"), token=None)
+        with pytest.raises(SystemExit):
+            _resolve_join_token(args)
+
+    def test_empty_token_file_exits(self, tmp_path):
+        from omlx.cli import _resolve_join_token
+
+        token_file = tmp_path / "token"
+        token_file.write_text("  \n", encoding="utf-8")
+        args = SimpleNamespace(token_file=str(token_file), token=None)
+        with pytest.raises(SystemExit):
+            _resolve_join_token(args)
+
+    def test_cluster_and_join_commands_are_registered(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert "join" in result.stdout
+        assert "cluster" in result.stdout
