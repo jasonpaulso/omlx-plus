@@ -399,10 +399,16 @@ class TestPreflightQueueGate:
     async def test_admits_below_rank_capacity(self, make_engine):
         from omlx.cluster.scheduler_config import rank_inflight_capacity
 
-        engine = make_engine(NORMAL)
-        self._fill(engine, rank_inflight_capacity() - 1)
-        await engine.preflight_chat([{"role": "user", "content": "hi"}])
-        await engine.preflight_completion("hi")
+        # One preflight per engine: a second one against the same 39 in-flight
+        # requests is the 41st request overall, and preflight now reserves the
+        # slot it checked for, so that one is correctly refused.
+        chat_engine = make_engine(NORMAL)
+        self._fill(chat_engine, rank_inflight_capacity() - 1)
+        await chat_engine.preflight_chat([{"role": "user", "content": "hi"}])
+
+        completion_engine = make_engine(NORMAL)
+        self._fill(completion_engine, rank_inflight_capacity() - 1)
+        await completion_engine.preflight_completion("hi")
 
     async def test_rejects_at_rank_capacity(self, make_engine):
         from omlx.cluster.scheduler_config import rank_inflight_capacity
@@ -450,6 +456,109 @@ class TestPreflightQueueGate:
         # The plan's burst recipe: cap + max_num_seqs + 1 submissions is what
         # it takes to force a rejection, so the 41st of 41 is the one refused.
         assert rank_inflight_capacity() + 1 == 41
+
+    async def test_cold_burst_is_refused_before_any_generator_runs(self, make_engine):
+        """The shape the live rig measured, and the reason the first fix did
+        nothing there.
+
+        On a cold burst every request preflights before starlette iterates any
+        response body, so ``_pending`` -- filled inside ``stream_generate`` --
+        is still empty when the gate reads it. Gating on ``_pending`` alone
+        therefore admits all 41 and the cap is only hit later, in-stream,
+        under HTTP 200. Note what this test does *not* do: it does not
+        pre-fill anything. That is the whole point.
+        """
+        from omlx.cluster.scheduler_config import rank_inflight_capacity
+
+        engine = make_engine(NORMAL)
+        capacity = rank_inflight_capacity()
+
+        admitted = 0
+        rejected = 0
+        for _ in range(capacity + 1):
+            try:
+                await engine.preflight_chat([{"role": "user", "content": "hi"}])
+            except SchedulerQueueFullError:
+                rejected += 1
+            else:
+                admitted += 1
+
+        assert engine._pending == {}, "no generator ran: this is the cold shape"
+        assert admitted == capacity
+        assert rejected == 1
+
+    async def test_admission_hands_the_reservation_back(self, make_engine):
+        """A reservation covers preflight->submit only. Once the request is in
+        ``_pending`` it is counted there, and counting it twice would shrink
+        the formation's usable capacity by one per request.
+        """
+        engine = make_engine(NORMAL)
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        assert engine._reserved_slots() == 1
+
+        outputs = [
+            o async for o in engine.stream_generate("hi", max_tokens=8, request_id="r")
+        ]
+
+        assert outputs[-1].finished is True
+        assert engine._reserved_slots() == 0
+        assert engine._pending == {}
+
+    async def test_reservation_is_released_when_the_request_never_admits(
+        self, make_engine
+    ):
+        """``stream_generate`` can fail or return before reaching ``_pending``
+        (empty prompt, a non-goal, a dead pipe). The slot has to come back on
+        those paths too, or a stream of malformed requests would wall off the
+        formation for a full TTL.
+        """
+        engine = make_engine(NORMAL)
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+
+        engine._tokenizer = type("Empty", (), {"encode": lambda self, text: []})()
+        outputs = [o async for o in engine.stream_generate("", request_id="empty")]
+
+        # Exactly the empty-prompt early return, not an ordinary completion:
+        # one empty terminal output and nothing submitted.
+        assert len(outputs) == 1
+        assert outputs[0].text == "" and outputs[0].finished is True
+        assert engine._pending == {}
+        assert engine._reserved_slots() == 0
+
+    async def test_abandoned_reservations_expire(self, make_engine, monkeypatch):
+        """The one path no explicit release can cover: a request that passes
+        preflight and never reaches ``stream_generate`` at all -- a client
+        that disconnects after the route committed. The TTL sweep is what
+        keeps those from accumulating into a permanent capacity loss.
+        """
+        import omlx.cluster.engine as engine_module
+        from omlx.cluster.scheduler_config import rank_inflight_capacity
+
+        monkeypatch.setattr(engine_module, "_RESERVATION_TTL_S", 0.05)
+        engine = make_engine(NORMAL)
+        for _ in range(rank_inflight_capacity()):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        with pytest.raises(SchedulerQueueFullError):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+
+        await asyncio.sleep(0.06)
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        assert engine._reserved_slots() == 1
+
+    async def test_reservations_and_inflight_share_one_ceiling(self, make_engine):
+        """Occupancy is what rank 0 holds plus what is on its way there. Half
+        of each must still add up to the same ceiling, or the gate would
+        double-count during churn and reject early.
+        """
+        from omlx.cluster.scheduler_config import rank_inflight_capacity
+
+        capacity = rank_inflight_capacity()
+        engine = make_engine(NORMAL)
+        self._fill(engine, capacity // 2)
+        for _ in range(capacity - capacity // 2):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        with pytest.raises(SchedulerQueueFullError):
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
 
     async def test_backstop_frame_is_logged_head_side(self, make_engine, caplog):
         """The preflight->submit race stays open, so rank 0 can still refuse

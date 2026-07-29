@@ -331,6 +331,99 @@ async def test_active_request_count_reflects_live_formation(tmp_path):
         assert engine.get_stats()["num_active_requests"] == 0
 
 
+async def test_cold_burst_is_refused_at_preflight_not_in_stream(tmp_path):
+    """S3 acceptance row 4, in the ordering the live rig actually produces.
+
+    The sibling test below submits straight into ``stream_generate``, which is
+    the *backstop* path: it proves rank 0 still refuses, but by then a real
+    route has committed to a ``StreamingResponse`` and the client can only be
+    told in-stream, under HTTP 200. Row 4 asks for a 503, which only preflight
+    can deliver.
+
+    The ordering matters more than the count. Over HTTP, all 41 requests clear
+    preflight before starlette iterates any response body, so the two phases
+    here are separated on purpose — driving preflight and submission together
+    from one task would let each request's ``_pending`` entry land before the
+    next one preflights, which is the warm shape, not row 4's. The deployed
+    ``_pending``-only gate passes that version of this test and still measured
+    ``{200: 41}`` on the rig.
+
+    Mirrors ``benchmarks/cluster_spike/s3_row4.py``: >=1 rejection AND >=1
+    request still streaming. Rejecting the whole burst would satisfy the first
+    clause alone while being worse than the defect.
+    """
+    num_submissions = 41
+    max_tokens_burst = 4096
+
+    async with two_node(tmp_path) as (head, worker):
+        await asyncio.wait_for(head.formation.load(MODEL), LOAD_TIMEOUT_S)
+        engine = head.formation.active_engine(MODEL)
+        assert engine is not None
+
+        # Phase 1 — every request preflights, cold: nothing has submitted yet.
+        verdicts = await asyncio.gather(
+            *(
+                engine.preflight_chat([{"role": "user", "content": "Tell me a story"}])
+                for _ in range(num_submissions)
+            ),
+            return_exceptions=True,
+        )
+        rejected = [v for v in verdicts if isinstance(v, SchedulerQueueFullError)]
+        unexpected = [
+            v
+            for v in verdicts
+            if isinstance(v, BaseException)
+            and not isinstance(v, SchedulerQueueFullError)
+        ]
+        assert not unexpected, f"preflight raised something else: {unexpected}"
+        assert rejected, (
+            "expected at least one preflight rejection on a cold "
+            f"{num_submissions}-request burst; got none"
+        )
+        assert len(rejected) < num_submissions, (
+            "the whole burst was rejected — a gate that refuses everything "
+            "passes 'a 503 happened' while being worse than the defect"
+        )
+
+        # Phase 2 — the admitted ones must still be servable. Preflight that
+        # holds a slot forever would show up here as nothing streaming.
+        admitted = [
+            i for i, v in enumerate(verdicts) if not isinstance(v, BaseException)
+        ]
+        streams: dict[int, Any] = {}
+        streaming: list[int] = []
+
+        async def submit(i: int) -> None:
+            stream = engine.stream_generate(
+                "Tell me a very long, detailed story",
+                max_tokens=max_tokens_burst,
+                temperature=0.0,
+                request_id=f"cold-{i}",
+            )
+            try:
+                await stream.__anext__()
+            except SchedulerQueueFullError:
+                # rank 0's backstop: allowed, the preflight->submit race is
+                # open by design and the burst can outrun a stepping loop.
+                return
+            streams[i] = stream
+            streaming.append(i)
+
+        tasks = [asyncio.create_task(submit(i)) for i in admitted]
+        try:
+            # Not gather(): only max_num_seqs of these ever emit a first token
+            # within the test, the rest park in rank 0's waiting queue behind
+            # 4096-token generations. Wait for the outcome under test.
+            await _wait_for(lambda: bool(streaming), GEN_TIMEOUT_S)
+            assert streaming, "expected admitted requests to stream"
+        finally:
+            for task in tasks:
+                task.cancel()
+            for stream in streams.values():
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(stream.aclose(), GEN_TIMEOUT_S)
+
+
 async def test_queue_full_rejects_while_earlier_requests_keep_streaming(tmp_path):
     """The pinned S3 recipe (s3-plan.md D7/Tests): max_num_seqs = 8 (the D6(b)
     rank-side default) makes the waiting-queue cap max(8*4, 32) = 32

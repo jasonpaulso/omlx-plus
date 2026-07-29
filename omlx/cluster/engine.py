@@ -24,7 +24,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -37,6 +39,15 @@ from .launcher import LocalCluster
 from .protocol import GenerationSpec
 
 logger = logging.getLogger(__name__)
+
+# How long a preflight reservation stays counted if its request never reaches
+# ``stream_generate``. Every path that *does* reach it releases explicitly (see
+# ``_preflight_queue``), so this only covers a request abandoned between the two
+# — a client that disconnects after preflight but before starlette iterates the
+# body, or a route raising in between. Long enough that no real
+# preflight->submit gap (chat templating + encode) can expire early; short
+# enough that a leak cannot hold slots for a meaningful part of a burst.
+_RESERVATION_TTL_S = 30.0
 
 # Idle timeout for a single reply frame from rank 0 (salvage generate-idle
 # value): a rank that dies mid-collective leaves rank 0 blocked, and this is
@@ -135,6 +146,9 @@ class ClusterEngine(BatchedEngine):
         # pipe out to a per-request queue by request_id; the writer side
         # serialises on LocalCluster's own stdin lock (write() takes it).
         self._pending: dict[str, asyncio.Queue[Any]] = {}
+        # Slots claimed by requests that passed preflight but have not reached
+        # ``stream_generate`` yet; monotonic expiry deadlines, oldest first.
+        self._reserved: deque[float] = deque()
         self._reader_task: asyncio.Task[None] | None = None
         self._reader_error: BaseException | None = None
         # Last request's D9 coordination-tax summary, from rank 0's done frame.
@@ -221,6 +235,27 @@ class ClusterEngine(BatchedEngine):
     def has_active_requests(self) -> bool:
         return bool(self._pending)
 
+    def _reserved_slots(self) -> int:
+        """Live preflight reservations, expiring stale ones first."""
+        now = time.monotonic()
+        while self._reserved and self._reserved[0] <= now:
+            self._reserved.popleft()
+        return len(self._reserved)
+
+    def _release_reservation(self) -> None:
+        """Give back one slot claimed by ``_preflight_queue``.
+
+        Counting, not identity: reservations are interchangeable, so the
+        oldest is dropped rather than a specific request's. A
+        ``stream_generate`` that never preflighted (an internal caller, or a
+        test driving the engine directly) therefore releases nothing when the
+        deque is empty, and at worst returns a slot one request early —
+        which relaxes the gate toward the pre-reservation behaviour instead
+        of holding slots that no request owns.
+        """
+        if self._reserved:
+            self._reserved.popleft()
+
     def _preflight_queue(self) -> None:
         """Reject a request rank 0 has no room for, before the route commits
         to a ``StreamingResponse``.
@@ -232,23 +267,41 @@ class ClusterEngine(BatchedEngine):
         requests written and not yet terminal -- is what rank 0 is holding,
         modulo the frames still in flight between the two.
 
-        Approximate on purpose. ``_pending`` counts running and waiting
-        together, and it lags rank 0 by one frame, so this rejects a little
-        early under churn and can let a few extra through when several
-        requests preflight before any of them submits. ``add_request`` on
-        rank 0 stays the authority; the frame it sends back on a miss is the
+        **``_pending`` alone is not enough, and the live rig proved it.** It is
+        filled inside ``stream_generate``, which starlette only iterates
+        *after* the route has committed to the ``StreamingResponse``. Under a
+        cold burst — S3 acceptance row 4's recipe — every request preflights
+        before any generator body runs, so the counter is still empty when the
+        gate reads it and the gate never engages. The original design
+        consciously accepted "over-admitting by a few"; on a cold burst it
+        does not over-admit by a few, it does nothing at all.
+
+        So preflight *reserves* the slot it just checked for, and
+        ``stream_generate`` hands the reservation back when it takes its place
+        in ``_pending`` (or when it fails before getting there). Occupancy is
+        the sum of the two: requests rank 0 holds plus requests on their way
+        to it.
+
+        Still approximate, deliberately: ``_pending`` lags rank 0 by one frame,
+        so this can reject a little early under churn. ``add_request`` on rank
+        0 stays the authority; the frame it sends back on a miss is the
         backstop (``_error_from_frame``), and it is logged there.
         """
         from .scheduler_config import rank_inflight_capacity, rank_max_num_seqs
 
         capacity = rank_inflight_capacity()
-        if len(self._pending) < capacity:
+        occupancy = len(self._pending) + self._reserved_slots()
+        if occupancy < capacity:
+            # Claim the slot in the same synchronous frame that checked for
+            # it. Nothing awaits in between, so no second preflight can see
+            # this one's check without also seeing its claim.
+            self._reserved.append(time.monotonic() + _RESERVATION_TTL_S)
             return
         max_num_seqs = rank_max_num_seqs()
         # Report it the way rank 0 would: everything past the running batch
         # is queue depth, so the numbers a client sees match single-node's.
         raise SchedulerQueueFullError(
-            current_depth=max(0, len(self._pending) - max_num_seqs),
+            current_depth=max(0, occupancy - max_num_seqs),
             max_depth=capacity - max_num_seqs,
         )
 
@@ -319,35 +372,43 @@ class ClusterEngine(BatchedEngine):
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[GenerationOutput]:
-        if not self._loaded:
-            await self.start()
-        _reject_if_specprefill(kwargs)
-        await self._ensure_reader()
+        # Everything up to the ``_pending`` insert is the window a preflight
+        # reservation covers: once this request is in ``_pending`` it is
+        # counted there instead, and if it never gets there the slot must go
+        # back rather than wait out ``_RESERVATION_TTL_S``. Both exits run the
+        # release, hence the try/finally rather than a call per path.
+        try:
+            if not self._loaded:
+                await self.start()
+            _reject_if_specprefill(kwargs)
+            await self._ensure_reader()
 
-        request_id = str(kwargs.get("request_id") or uuid.uuid4())
-        spec = self._build_spec(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            stop=stop,
-            request_id=request_id,
-            kwargs=kwargs,
-        )
-        if not spec.prompt_ids:
-            yield GenerationOutput(text="", finished=True, finish_reason="stop")
-            return
+            request_id = str(kwargs.get("request_id") or uuid.uuid4())
+            spec = self._build_spec(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                stop=stop,
+                request_id=request_id,
+                kwargs=kwargs,
+            )
+            if not spec.prompt_ids:
+                yield GenerationOutput(text="", finished=True, finish_reason="stop")
+                return
 
-        prompt_tokens = len(spec.prompt_ids)
-        queue: asyncio.Queue[Any] = asyncio.Queue()
-        # Own queue submitted+consumed here (D5): no per-request lock, so
-        # concurrent stream_generate calls interleave naturally, each reading
-        # only the frames the demux routed to its own request_id.
-        self._pending[request_id] = queue
+            prompt_tokens = len(spec.prompt_ids)
+            queue: asyncio.Queue[Any] = asyncio.Queue()
+            # Own queue submitted+consumed here (D5): no per-request lock, so
+            # concurrent stream_generate calls interleave naturally, each
+            # reading only the frames the demux routed to its own request_id.
+            self._pending[request_id] = queue
+        finally:
+            self._release_reservation()
 
         loop = asyncio.get_running_loop()
         payload = {"op": "generate", "spec": spec.to_dict()}

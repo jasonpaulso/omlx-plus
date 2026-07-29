@@ -14,11 +14,16 @@ one real defect and its main carry-forward. E4's stop condition did not fire on
 either backend.
 
 Row 4 update (2026-07-29): the defect turned out to be shared with single-node,
-not cluster-specific. A fix landed at the preflight seam and **was re-measured
-on the rig: row 4 still FAILS on ring.** The gate counts requests that have not
-entered the engine yet, so it never engages on a cold burst. The rejection *is*
-now logged head-side. See "Row 4 re-measure, ring" below — the row stays open,
-and closing it needs a design change, not a patch.
+not cluster-specific. A first fix landed at the preflight seam and **was
+re-measured on the rig: it did not close row 4** — the gate counted requests
+that had not entered the engine yet, so it never engaged on a cold burst. The
+rejection *is* now logged head-side. See "Row 4 re-measure, ring" below.
+
+Row 4 second fix (2026-07-29, later): preflight now **reserves** the slot it
+checked for, on the cluster path only, so occupancy counts requests on their way
+to rank 0 as well as those it already holds. **Rig-unverified — the rig has not
+been touched since the re-measure above.** Local evidence is in "Reservation
+fix" below; the rig re-run is what would flip this row to PASS.
 
 ---
 
@@ -483,6 +488,68 @@ design change rather than a patch. Left for a decision.
 route/engine layer and cannot vary with the collective backend; ring is
 decisive and a jaccl session would cost a fresh-daemon cycle to reproduce a
 foreordained result. If the reservation lands, re-run both.
+
+### Reservation fix — local evidence, rig re-run still owed
+
+The design change the section above asked for, scoped to the cluster path.
+
+**It needs no preflight→submit identity.** That was the blocker on paper, and it
+dissolves once reservations are counted rather than matched: slots are
+interchangeable, so preflight appends one and `stream_generate` drops one when
+it takes its place in `_pending`. Occupancy is `len(_pending) + reservations`
+against the same `rank_inflight_capacity()` ceiling (40 = 8 running + 32
+waiting), so nothing is double-counted at the handover — the release happens in
+the same synchronous frame as the insert.
+
+| Path | Behaviour |
+| --- | --- |
+| Cold burst of 41 | 40 reserve, the 41st is refused **at preflight** → 503 |
+| Admitted request | releases its slot as it enters `_pending` |
+| Fails before `_pending` (empty prompt, non-goal, dead pipe) | releases in `finally` |
+| Never reaches `stream_generate` (client vanished after preflight) | expires after `_RESERVATION_TTL_S` (30 s) |
+| `stream_generate` with no preceding preflight (internal caller, direct test) | releases nothing when there is nothing to release |
+
+The failure mode is chosen deliberately: an extra release relaxes the gate
+toward the previous behaviour, whereas a missed release would hold a slot no
+request owns. Reservations never outlive the TTL, so no leak is permanent.
+
+**Not applied to single-node.** `Scheduler.preflight_queue_or_raise` compares
+against the *waiting* cap only, while the cluster gate compares against a total
+(running + waiting). Adding reservations there requires switching it to the
+total form — a behaviour change to the default configuration, with its own
+tests to move. Row 4 is a cluster-path measurement; single-node's identical
+cold-burst hole is a separate slice, and it is still open.
+
+Local gates at this commit:
+
+| Gate | Result |
+| --- | --- |
+| `pytest -m cluster` | **22 passed** (3:40) — 21 baseline + the new cold-burst test |
+| New tests vs stashed source | **6 of 6 fail without the fix** — see the caveat below |
+| Default unit gate | **7534 passed, 2 failed** — the known GLM numerical pair, zero delta |
+| black / ruff / mypy | zero delta (mypy 665 errors / 81 files both sides) |
+| `s3_row4.py --selftest` | the predicted `{200: 40, 503: 1}` shape scores **PASS**; all 5 shapes behave as specified |
+
+**Don't over-credit the 6.** Three of the five unit tests touch `_reserved_slots`
+or `_RESERVATION_TTL_S`, which do not exist pre-fix, so they fail on
+`AttributeError` rather than on behaviour. The weight is carried by
+`test_cold_burst_is_refused_before_any_generator_runs` and
+`test_reservations_and_inflight_share_one_ceiling` — public surface only, failing
+because no rejection happens — and by the two-rank test.
+
+The two-rank test (`test_cold_burst_is_refused_at_preflight_not_in_stream`)
+deliberately separates preflight from submission into two phases. That is the
+whole point, and it was checked rather than assumed: a single-phase variant
+(preflight and submit interleaved per task) was run against the **pre-fix**
+engine and reported `{streaming: 8, pending: 32, preflight_503: 1}` — it passes
+without the fix, because each request's `_pending` entry lands before the next
+one preflights. That is the warm shape the previous fix's pre-filled unit tests
+also measured, and it is why the rig disagreed with them. The two-phase test
+asserts the same two clauses as the row-4 gate.
+
+**Still rig-unverified.** The rig was not touched in this session. Closing row 4
+means re-running `flood` on ring and jaccl at this commit, under the pinned
+protocol above (no-retry included).
 
 Rig left clean: model unloaded, member scrubbed, both daemons stopped,
 8910/8911 free, `backend=ring` and roles intact on both nodes, daily-driver
