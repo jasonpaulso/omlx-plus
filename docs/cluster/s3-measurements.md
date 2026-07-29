@@ -401,6 +401,35 @@ backends and only a rig re-run can close it. Re-measure with the same `flood`
 recipe (41 concurrent, `max_tokens` large enough that nothing completes) and
 assert an actual HTTP 503 — do not mark it PASS from the test suite.
 
+### Row 4 re-measure protocol — pinned before the run
+
+Written before any daemon was started, so the rules cannot be chosen to fit a
+number. Same shape as the D7 protocol.
+
+**Gate.** `benchmarks/cluster_spike/s3_row4.py`, run over the `flood` dump.
+PASS ⇔ **at least one HTTP 503 AND at least one request streaming ≥1 token**.
+Both clauses are load-bearing: a preflight gate that rejected the whole burst
+would satisfy "a 503 happened" while being strictly worse than the defect it
+replaces, so that shape must fail. In-stream `queue_full` errors are counted
+and reported but are **not** a failure — the preflight→submit race is open by
+design, so the backstop staying reachable is expected. Proven falsifiable
+before rig time with `s3_row4.py --selftest`: five synthetic shapes, including
+the pre-fix one (40 streaming + 1 in-stream error, no 503) which must FAIL and
+the over-aggressive one (all 503) which must also FAIL.
+
+**No-retry.** A flood that produces no 503 is a **result**, not an infra
+error. The first completed run per backend is the number. A re-run is
+permitted only when the *formation* failed — model load error, rank death,
+`negotiated_backend != requested` — and any re-run is logged with its reason.
+Row 4 is a status-code assertion, not a timing measurement, so machine-noise
+arguments do not apply to it.
+
+**Preconditions, checked by hand each session.** Both checkouts at the same
+SHA compared as strings (E10 does not check the omlx checkout — a stale worker
+joins cleanly and runs mismatched TP code); ghost members scrubbed before
+forming; `negotiated_backend == requested` asserted per backend; jaccl gets
+freshly started daemons (PD-leak is one session per process).
+
 ## Repeats and anomalies
 
 Every repeat below is logged per the no-retry rule. **No repeat was triggered by
