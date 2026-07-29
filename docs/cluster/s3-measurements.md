@@ -219,6 +219,12 @@ batch), so per-token tax is expected to fall as batch size grows.
 
 ### ring — 2026-07-29, commit `cec04f05`, formation `world_size 2`
 
+**The ring column spans two formations, not one.** Rows 1, 2, 3, 5 and 6 come
+from the first ring session below. Row 4 comes from a second, freshly formed
+ring session run after jaccl, once the capture defect was fixed. Rows 5 and 6
+were deliberately not re-run in that second session — the numbers below stand,
+and re-running them for tidiness is exactly what the no-retry rule forbids.
+
 Formation: `active_model MiniMax-M2.7-3bit`, `loaded: true`, `world_size: 2`,
 `negotiated_backend: "ring"` — **row 1 PASS**. Rank 1 loaded its shard on the
 Studio (`50 340 050 944` shard param bytes). `prompt_tokens: 761` on every
@@ -308,7 +314,8 @@ faster (23.90 vs 19.40 tok/s), but its batching gain is ~nil (1.010× vs ring's
 9.4–13.5, and TTFT under load was markedly worse (4.0–12.4 s vs 1.3–5.8 s). So
 on this rig jaccl buys single-stream latency and gives back concurrency
 throughput. One observation, one run — not a trend, and worth a dedicated
-comparison before anyone designs around it.
+comparison before anyone designs around it. The TTFT gap is the part most likely
+to matter downstream: it is user-visible latency, not a throughput ratio.
 
 **Row 6 — E4 coordination tax.** Both windows **PASS**; stop condition did not
 fire.
