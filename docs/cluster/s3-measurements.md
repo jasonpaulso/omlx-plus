@@ -14,8 +14,11 @@ one real defect and its main carry-forward. E4's stop condition did not fire on
 either backend.
 
 Row 4 update (2026-07-29): the defect turned out to be shared with single-node,
-not cluster-specific, and a fix has landed at the preflight seam — but the row
-stays **open** until it is re-measured on the rig. See "Follow-up" under Row 4.
+not cluster-specific. A fix landed at the preflight seam and **was re-measured
+on the rig: row 4 still FAILS on ring.** The gate counts requests that have not
+entered the engine yet, so it never engages on a cold burst. The rejection *is*
+now logged head-side. See "Row 4 re-measure, ring" below — the row stays open,
+and closing it needs a design change, not a patch.
 
 ---
 
@@ -429,6 +432,61 @@ SHA compared as strings (E10 does not check the omlx checkout — a stale worker
 joins cleanly and runs mismatched TP code); ghost members scrubbed before
 forming; `negotiated_backend == requested` asserted per backend; jaccl gets
 freshly started daemons (PD-leak is one session per process).
+
+### Row 4 re-measure, ring, 2026-07-29 — still FAIL
+
+Run at `b3d39ad6`, both checkouts verified identical by `git rev-parse`, both
+venvs confirmed importing the new symbols. Formation: MiniMax-M2.7-3bit across
+the pair, `negotiated_backend: ring` == requested, smoke generation served
+(24 tokens, 6.55 s) before the burst. 41 concurrent, `max_tokens=4096`.
+
+```
+status codes         : {200: 41}
+HTTP 503 rejections  : 0
+streamed >=1 token   : 40
+in-stream queue_full : 1
+ROW 4 GATE : FAIL
+```
+
+Identical to the pre-fix shape. **The fix does not close row 4, and the reason
+is structural in the fix itself, not in the rig.**
+
+`ClusterEngine._preflight_queue` gates on `len(self._pending)`, but `_pending`
+is populated at `cluster/engine.py:350` — inside `stream_generate`, which the
+route only iterates *after* it has committed to the `StreamingResponse`. On a
+cold simultaneous burst all 41 requests run preflight before any generator
+starts, so the counter the gate reads is still empty and the gate never fires.
+Confirmed from the head log: zero preflight 503s, exactly one backstop warning.
+
+The same reasoning applies to the single-node path: `Scheduler.waiting` is
+filled by `add_request`, which is likewise inside the generator. So
+`preflight_queue_or_raise` only fires when the queue is **already** at cap when
+a later request preflights — sustained backpressure, which is the production
+shape — and never on a cold burst, which is precisely row 4's recipe. The unit
+tests pass because they pre-fill the queue before calling preflight; that is a
+real behaviour, just not the one this row measures.
+
+What the fix *did* close: the rejection is now logged head-side, which was the
+second half of row 4's complaint ("not logged on the head at all"). The
+warning fired exactly once, naming the request id and `32/32`.
+
+Closing this row needs the head to reserve the slot at preflight time rather
+than count generators that have not started — the reservation approach
+consciously rejected when the fix was designed, on the reasoning that
+over-admitting by a few was immaterial. That reasoning was wrong for a cold
+burst: the gate does not over-admit by a few, it does not engage at all.
+Reservation needs a preflight→submit identity, and the route passes
+`request_id` from an `x-request-id` header that is usually absent, so it is a
+design change rather than a patch. Left for a decision.
+
+**jaccl not run — a decision, not an omission.** The defect is in the head's
+route/engine layer and cannot vary with the collective backend; ring is
+decisive and a jaccl session would cost a fresh-daemon cycle to reproduce a
+foreordained result. If the reservation lands, re-run both.
+
+Rig left clean: model unloaded, member scrubbed, both daemons stopped,
+8910/8911 free, `backend=ring` and roles intact on both nodes, daily-driver
+`:8899` (PID 87617) and Studio `:8888`/`:8889` untouched throughout.
 
 ## Repeats and anomalies
 

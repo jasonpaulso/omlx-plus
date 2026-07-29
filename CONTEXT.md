@@ -1,11 +1,17 @@
-# Session Context — 2026-07-29 (evening) — row 4 fixed; it was never a cluster defect
+# Session Context — 2026-07-29 (evening) — row 4 re-measured on the rig: STILL FAILS
 
-**Status:** the S3 P3 row-4 carry-forward (#10) is fixed and committed at `87fb0e2e` on
-`feat/cluster-v1`; a second, unrelated route-guard defect found along the way is fixed at
-`6a64e7c0`. **Row 4 itself is still open** — it was measured on the live 2-Mac rig on both
-backends, and only a rig re-run closes it. S3 (#7) stays open behind it.
+**Status:** the defect was diagnosed correctly (it was never cluster-specific), a fix landed
+at `87fb0e2e`, and a second unrelated route-guard defect was fixed at `6a64e7c0`. Then the rig
+run showed **the fix does not close row 4**: the gate counts requests that have not entered
+the engine yet, so it never engages on a cold burst. S3 (#7) stays open. Closing row 4 needs a
+design change (slot reservation at preflight), not a patch — details in "Rig re-measure" and
+"Next" below.
 
-Branch tip `6a64e7c0`. Rig untouched all session.
+Half of row 4 *is* closed: the rejection is now logged head-side.
+
+Branch tip: see `git log`. **Rig left clean** — daemons down, 8910/8911 free, `backend=ring`
+and roles intact on both nodes, member scrubbed, model unloaded; daily-driver `:8899`
+(PID 87617) and Studio `:8888`/`:8889` untouched throughout.
 
 ## The finding that changed the shape of the fix
 
@@ -48,11 +54,13 @@ Deliberate choices worth not re-litigating:
   after the tokenize `try/except` would make it dead on tokenizer errors. There is a test
   pinning each.
 - `ClusterEngine` gates on `len(self._pending)` rather than asking rank 0. It is rank 0's only
-  submitter, so that count *is* what rank 0 holds, modulo frames in flight. Approximate by
-  construction — the preflight→submit race stays open, `add_request` stays the authority, and
-  the in-stream backstop is now logged.
-- **No reservation protocol.** The cap is backpressure, not a correctness invariant, and the
-  acceptance assertion is index-free. Over-admitting by a few under a burst is immaterial.
+  submitter, so that count *is* what rank 0 holds, modulo frames in flight. **Disproven by the
+  rig run below** — `_pending` is filled inside the response generator, so at preflight time
+  on a cold burst it is empty and the gate never engages.
+- ~~**No reservation protocol.** The cap is backpressure, not a correctness invariant, and the
+  acceptance assertion is index-free. Over-admitting by a few under a burst is immaterial.~~
+  **Wrong, and it is the reason row 4 still fails.** On a cold burst the gate does not
+  over-admit by a few — it does not fire at all. Reservation is the fix.
 - DFlash needs no change: primary mode bypasses the scheduler, fallback mode delegates to the
   fallback engine's preflight.
 
@@ -77,18 +85,54 @@ requested it" is more specific than the CLAUDE.md orchestration policy, so no `v
 dispatched — but that means the evidence above is self-reported, as it was in the two prior
 sessions where the dispatched verifier went idle. Worth solving as its own thread.
 
+## Rig re-measure — ran it, and row 4 still FAILS
+
+Ring, at `b3d39ad6`, both checkouts SHA-matched and both venvs confirmed importing the new
+symbols. `negotiated_backend: ring` == requested, smoke generation served before the burst.
+
+```
+status codes {200: 41} | HTTP 503: 0 | streamed: 40 | in-stream queue_full: 1  -> FAIL
+```
+
+Identical to pre-fix. **The reason is in the fix, not the rig.**
+`ClusterEngine._preflight_queue` gates on `len(self._pending)`, but `_pending` is filled at
+`cluster/engine.py:350` — inside `stream_generate`, which runs only *after* the route commits
+to the `StreamingResponse`. On a cold burst all 41 preflight before any generator starts, so
+the counter is empty and the gate never fires. Head log confirms: zero preflight 503s, exactly
+one backstop warning.
+
+Single-node has the same shape — `Scheduler.waiting` is filled by `add_request`, also inside
+the generator. So `preflight_queue_or_raise` engages only when the queue is **already** at cap
+when a later request preflights (sustained backpressure, the production shape), never on a
+cold burst — which is exactly row 4's recipe. The unit tests pass because they pre-fill the
+queue first: a real behaviour, just not the measured one.
+
+**What did close:** the rejection is now logged head-side, the second half of row 4's
+complaint. Fired once, with request id and `32/32`.
+
+jaccl deliberately not run: the defect is head-side and cannot vary with the collective
+backend, so ring is decisive.
+
 ## Next
 
-1. **Rig re-measure of row 4** — the named next action, deliberately not run unsupervised.
-   Same `flood` recipe (41 concurrent at `max_num_seqs=8`, `max_tokens` large enough that
-   nothing completes), both backends, asserting a real HTTP 503. Watch the traps in
-   [[gotcha-omlx-cluster-rig-operation]]: use `.venv/bin/omlx` (the PATH `omlx` is a uv tool
-   that silently wipes cluster settings), scrub ghost members before forming, and **sync the
-   Studio checkout to `87fb0e2e` by hand** — E10 does not check it, so a stale worker joins
-   cleanly and runs mismatched TP code.
-2. **#7 — S3 completion**, once row 4 closes.
-2. Optional: dedicated ring-vs-jaccl comparison, driven by the TTFT gap (4.0–12.4s vs
+1. **Decide how to close row 4.** It needs the head to *reserve* a slot at preflight instead
+   of counting generators that haven't started. Reservation was consciously rejected during
+   design ("over-admitting by a few is immaterial") — wrong for a cold burst, where the gate
+   doesn't over-admit, it doesn't engage. Needs a preflight→submit identity; the route's
+   `request_id` comes from an `x-request-id` header that is usually absent. Design change,
+   your call.
+2. **#7 — S3 completion**, still blocked behind it.
+3. Optional: dedicated ring-vs-jaccl comparison, driven by the TTFT gap (4.0–12.4s vs
    1.3–5.8s), not the throughput ratio.
+
+**Rig operation, hard-won:** start the worker **attached** —
+`ssh -o ServerAliveInterval=15 ... 'cd ... && ulimit -n 65536 && exec .venv/bin/omlx serve ...'`
+from a background call. A `nohup`-orphaned worker fails every control-plane call with
+"All connection attempts failed" while curl/httpx/ClusterClient from the same host all
+succeed; cause still unknown (fd limits, uvloop, TCC, fork, Metal init, firewalls and
+interface all ruled out; a Tailscale network extension is the untested lead). Also: the
+api_key is **not** shared between nodes, there is no `omlx cluster join` verb (the worker
+calls its own `/v1/cluster/local/join`), and head LAN is `192.168.4.68`.
 
 ## Also fixed (`6a64e7c0`) — and a correction to how I first reported it
 
