@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from .hostfile import require_link_scope
+from .hostfile import ibv_matrix_from_devices, require_link_scope
 from .launcher import DEFAULT_JOIN_TIMEOUT_S, LocalCluster, sweep_orphaned_ranks
 from .manager import ClusterError
 from .protocol import (
@@ -61,6 +61,10 @@ class FormationJob:
     created_at: float
     status: str = "running"
     error: str = ""
+    # The backend formation ACTUALLY formed on — never the requested setting.
+    # Under `auto` this is what survived (jaccl, or ring after a fallback), so a
+    # reader sees the real transport without re-running (D9). Empty until formed.
+    negotiated_backend: str = ""
     steps: list[dict[str, Any]] = field(default_factory=list)
     _step_counter: int = 0
 
@@ -80,6 +84,7 @@ class FormationJob:
             "model": self.model,
             "status": self.status,
             "error": self.error,
+            "negotiated_backend": self.negotiated_backend,
             "steps": list(self.steps),
             "created_at": self.created_at,
         }
@@ -208,32 +213,19 @@ class FormationManager:
                     "no auto-download — nothing was spawned",
                 )
             worker_addr = str(presence.get("data_plane_address") or "")
+            worker_rdma = str(presence.get("rdma_device") or "")
             ips = self._build_ips(worker_addr)
             # Step 2: sweep orphaned ranks on both nodes.
             sweep_orphaned_ranks()
             await self._command(member, self._sweep_cmd(job), job, "sweep")
-            # Step 3: spawn rank 0 (head child) and wait until it is listening.
-            backend = self._resolve_backend()
-            self._local = await self._run_blocking(
-                self._spawn_leader_fn,
-                model_path=local_path,
-                ips=ips,
-                backend=backend,
-                base_port=int(self._settings.data_plane_base_port),
+            # Steps 3-5: form on the negotiated backend, falling back per D7.
+            negotiated = await self._form_with_fallback(
+                job, member, model_id, local_path, ips, worker_rdma
             )
-            job.mark("spawn_leader", "listening")
-            # Step 4: command the worker to spawn its rank.
-            await self._command(
-                member,
-                self._spawn_cmd(job, model_id, ips, backend),
-                job,
-                "spawn_rank",
-            )
-            # Step 5: rank 0 reports ready — the barrier implies the worker's
-            # rank also loaded its shard.
-            await self._run_blocking(self._local.wait_ready, timeout=LOAD_TIMEOUT_S)
-            job.mark("ranks_ready", "ready")
-            # Step 6: register the engine so get_engine yields it.
+            job.negotiated_backend = negotiated
+            # Step 6: register the engine so get_engine yields it. A successful
+            # _form_with_fallback leaves self._local set to the formed cluster.
+            assert self._local is not None
             engine = self._engine_factory(
                 model_id=model_id, cluster=self._local, resolved_path=local_path
             )
@@ -242,7 +234,12 @@ class FormationManager:
             self._active_model = model_id
             job.status = "ready"
             job.mark("register_engine", "ready")
-            return {"model": model_id, "status": "ready", "job_id": job.id}
+            return {
+                "model": model_id,
+                "status": "ready",
+                "job_id": job.id,
+                "negotiated_backend": negotiated,
+            }
         except BaseException as exc:  # noqa: BLE001 - recorded, formation aborted
             job.status = "failed"
             job.error = str(exc)
@@ -351,6 +348,7 @@ class FormationManager:
         model_id: str,
         ips: list[str],
         backend: str,
+        ibv_devices: list[list[str | None]] | None = None,
     ) -> dict[str, Any]:
         return command_to_wire(
             SpawnRankCommand(
@@ -363,6 +361,7 @@ class FormationManager:
                 model_id=model_id,
                 peers=list(ips),
                 base_port=int(self._settings.data_plane_base_port),
+                ibv_devices=ibv_devices,
             )
         )
 
@@ -437,15 +436,138 @@ class FormationManager:
             )
         return ips
 
-    def _resolve_backend(self) -> str:
+    def _backend_candidates(self) -> list[str]:
+        """The backends to attempt, in order (D7).
+
+        ``ring``/``jaccl`` pin one transport — an explicit request that fails to
+        form fails the job with the real error, never a silent substitution.
+        ``auto`` tries jaccl first and falls back to ring, so a reader is a
+        resolver that tries jaccl then ring.
+        """
         backend = self._settings.backend
-        if backend in ("ring", "auto"):
-            return "ring"
-        raise ClusterError(
-            400,
-            f"backend {backend!r} is not supported by the P2 launcher "
-            "(ring only; jaccl lands in P3)",
+        if backend == "ring":
+            return ["ring"]
+        if backend == "jaccl":
+            return ["jaccl"]
+        if backend == "auto":
+            return ["jaccl", "ring"]
+        raise ClusterError(400, f"unknown cluster.backend {backend!r}")
+
+    async def _form_with_fallback(
+        self,
+        job: FormationJob,
+        member: Member,
+        model_id: str,
+        local_path: str,
+        ips: list[str],
+        worker_rdma: str,
+    ) -> str:
+        """Attempt each candidate backend; return the one that formed.
+
+        Each attempt spawns FRESH rank processes on both nodes; a failed attempt
+        is torn down completely — head local then worker — before the next
+        candidate spawns (salvage pitfall 6: one distributed session per process,
+        a fresh process per formation attempt, and the worker's CL2-09 slot must
+        be free before it will spawn again). The last candidate's failure
+        propagates the real error: an explicit ``jaccl`` never silently becomes
+        ring, and an ``auto`` that also fails on ring reports that failure.
+        """
+        candidates = self._backend_candidates()
+        for index, backend in enumerate(candidates):
+            is_last = index == len(candidates) - 1
+            try:
+                await self._form_once(
+                    job, member, model_id, local_path, ips, worker_rdma, backend
+                )
+                return backend
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 - recorded; the real error re-raises
+                job.mark(f"form_{backend}", "failed", str(exc))
+                # Fresh process per attempt: tear the failed attempt down on both
+                # nodes before the next candidate. NOT a torn-down-job mark — this
+                # is an intra-job retry, not an operator unload, so it must not
+                # arm the CL2-06 suppression alarm.
+                await self._abort_formation()
+                await self._teardown_worker(member, job)
+                if is_last:
+                    raise
+                logger.warning(
+                    "cluster: %s formation failed (%s); falling back to ring (auto)",
+                    backend,
+                    exc,
+                )
+        # Unreachable: _backend_candidates never returns an empty list.
+        raise ClusterError(500, "no backend candidate formed")
+
+    async def _form_once(
+        self,
+        job: FormationJob,
+        member: Member,
+        model_id: str,
+        local_path: str,
+        ips: list[str],
+        worker_rdma: str,
+        backend: str,
+    ) -> None:
+        """One formation attempt on ``backend`` (steps 3-5). Raises on failure."""
+        ibv = self._ibv_matrix(backend, worker_rdma)
+        # Step 3: spawn rank 0 (head child) and wait until it is listening.
+        self._local = await self._run_blocking(
+            self._spawn_leader_fn,
+            model_path=local_path,
+            ips=ips,
+            backend=backend,
+            base_port=int(self._settings.data_plane_base_port),
+            ibv_devices=ibv,
         )
+        job.mark(f"spawn_leader_{backend}", "listening")
+        # Step 4: command the worker to spawn its rank.
+        await self._command(
+            member,
+            self._spawn_cmd(job, model_id, ips, backend, ibv),
+            job,
+            "spawn_rank",
+        )
+        # Step 5: rank 0 reports ready — the barrier implies the worker's rank
+        # also loaded its shard.
+        await self._run_blocking(self._local.wait_ready, timeout=LOAD_TIMEOUT_S)
+        job.mark(f"ranks_ready_{backend}", "ready")
+
+    def _ibv_matrix(
+        self, backend: str, worker_rdma: str
+    ) -> list[list[str | None]] | None:
+        """The full jaccl device matrix from both nodes' typed settings (None for
+        ring). Rank 0 is the head, rank 1 the worker.
+        """
+        if backend != "jaccl":
+            return None
+        head_rdma = self._settings.rdma_device
+        if not head_rdma:
+            raise ClusterError(
+                400,
+                "jaccl requested but the head has no cluster.rdma_device configured",
+            )
+        if not worker_rdma:
+            raise ClusterError(
+                424, "jaccl requested but the worker reported no rdma_device"
+            )
+        return ibv_matrix_from_devices([head_rdma, worker_rdma])
+
+    async def _teardown_worker(self, member: Member, job: FormationJob) -> None:
+        """Command the worker to tear its rank down (best-effort, between
+        fallback attempts and on failure).
+
+        Catches broadly on purpose: this runs inside a fallback's exception
+        handler, so a teardown error must NEVER replace the real formation error
+        that is about to be re-raised (the acceptance pins a true jaccl failure).
+        """
+        try:
+            await self._command(member, self._teardown_cmd(job), job, "teardown")
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 - best-effort; never mask the real error
+            job.mark("teardown_command", "error", str(exc))
 
     async def _abort_formation(self) -> None:
         local, self._local = self._local, None
@@ -464,6 +586,7 @@ class FormationManager:
         ips: list[str],
         backend: str,
         base_port: int,
+        ibv_devices: list[list[str | None]] | None = None,
     ) -> LocalCluster:
         cs = self._settings
         cluster = LocalCluster(
@@ -478,6 +601,7 @@ class FormationManager:
         cluster.start(
             [0],
             ips=ips,
+            ibv_devices=ibv_devices,
             data_plane_subnet=cs.data_plane_subnet,
             allow_routable_data_plane=cs.allow_routable_data_plane,
             allow_loopback=cs.allow_loopback,

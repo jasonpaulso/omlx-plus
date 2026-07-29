@@ -257,6 +257,12 @@ class SpawnRankCommand(_CommandBase):
     dirs (CL2-02); ``peers`` are per-rank data-plane addresses the worker
     re-validates against its own settings and never accepts for its own rank
     (CL2-03). No environment crosses the wire (CL2-01).
+
+    ``ibv_devices`` is the jaccl ``MLX_IBV_DEVICES`` matrix (null for ring):
+    device names for peers this node cannot itself observe. The worker keeps the
+    head's peer rows but OVERWRITES its own rank's row from its OWN
+    ``cluster.rdma_device`` — a head-supplied device name for its own rank is
+    never trusted (CL2-03), the exact discipline ``peers`` gets for addresses.
     """
 
     kind: Literal[CommandKind.SPAWN_RANK] = CommandKind.SPAWN_RANK
@@ -267,6 +273,7 @@ class SpawnRankCommand(_CommandBase):
     peers: list[str]
     base_port: int = Field(ge=1, le=65535)
     seed: int = 0
+    ibv_devices: list[list[str | None]] | None = None
 
 
 class SweepCommand(_CommandBase):

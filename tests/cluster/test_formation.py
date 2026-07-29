@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import types
 
 import pytest
 
@@ -22,12 +23,13 @@ from omlx.cluster.versions import collect_versions
 from .conftest import make_settings, running_manager
 
 
-def _head_settings(tmp_path):
+def _head_settings(tmp_path, **overrides):
     return make_settings(
         tmp_path / "head",
         role="head",
         data_plane_subnet="10.0.2.0/24",
         data_plane_address="10.0.2.1",
+        **overrides,
     )
 
 
@@ -45,6 +47,10 @@ class FakeEngine:
 
     async def stop(self):
         return None
+
+    def get_stats(self):
+        # snapshot() surfaces the live engine's stats once a model is active.
+        return {"engine_type": "cluster-distributed", "loaded": True}
 
 
 def _formation(manager, spawns):
@@ -99,6 +105,7 @@ async def _drive_worker(fm, member, stop_event, *, present=True):
                             status="present" if present else "absent",
                             present=present,
                             data_plane_address="10.0.2.2",
+                            rdma_device="rdma_en4",
                         )
                     ],
                 )
@@ -161,6 +168,223 @@ async def test_load_forms_then_refuses_a_second(tmp_path):
             unload = await fm.unload("target")
             assert unload["status"] == "unloaded"
             assert fm.active_engine("target") is None
+        finally:
+            stop.set()
+            await driver
+
+
+# -- D7 backend resolution + auto fallback ------------------------------------
+
+
+def _candidates_for(backend: str) -> list[str]:
+    fm = FormationManager.__new__(FormationManager)
+    fm._manager = types.SimpleNamespace(settings=types.SimpleNamespace(backend=backend))
+    return fm._backend_candidates()
+
+
+def test_backend_candidates_per_setting():
+    assert _candidates_for("ring") == ["ring"]
+    assert _candidates_for("jaccl") == ["jaccl"]
+    # auto is a resolver that tries jaccl first, then ring.
+    assert _candidates_for("auto") == ["jaccl", "ring"]
+
+
+def _formation_with_spawn(manager, spawns, *, fail_on=None):
+    """A formation whose fake leader spawn fails for one named backend."""
+
+    def spawn(*, backend, **kwargs):
+        spawns.append({"backend": backend, **kwargs})
+        if backend == fail_on:
+            raise RuntimeError(f"{backend} PD exhausted")
+        return FakeLeader()
+
+    return FormationManager(
+        manager,
+        spawn_leader_fn=spawn,
+        engine_factory=lambda **kwargs: FakeEngine(),
+        model_resolver=lambda model_id: "/head/models/target",
+    )
+
+
+async def test_auto_falls_back_to_ring_when_jaccl_fails(tmp_path):
+    settings = _head_settings(tmp_path, backend="auto", rdma_device="rdma_en2")
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        fm = _formation_with_spawn(manager, spawns, fail_on="jaccl")
+        manager._formation = fm
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(fm, member, stop, present=True))
+        try:
+            result = await fm.load("target")
+            # Reported backend reflects what ACTUALLY formed, not the request.
+            assert result["negotiated_backend"] == "ring"
+            assert fm.snapshot()["jobs"][-1]["negotiated_backend"] == "ring"
+            # jaccl was attempted first (with a real matrix), then ring.
+            assert [s["backend"] for s in spawns] == ["jaccl", "ring"]
+            assert spawns[0]["ibv_devices"] == [
+                [None, "rdma_en2"],
+                ["rdma_en4", None],
+            ]
+            assert spawns[1]["ibv_devices"] is None
+            # An intra-job fallback teardown must NOT arm the CL2-06 alarm.
+            assert fm.alarms() == []
+        finally:
+            stop.set()
+            await driver
+
+
+class _FailReadyLeader:
+    """A leader that spawns fine but whose barrier fails on the first attempt —
+    the sequence where the jaccl rank is live on the worker and the ring retry
+    is refused (CL2-09) unless the fallback teardown lands first."""
+
+    def __init__(self, fail: bool) -> None:
+        self._fail = fail
+
+    def wait_ready(self, timeout: float = 0.0):
+        if self._fail:
+            raise RuntimeError("jaccl barrier timed out")
+        return {"event": "ready"}
+
+    def stop(self):
+        return None
+
+
+async def _recording_driver(fm, member, seen, stop_event):
+    """Like _drive_worker but records the ordered sequence of command kinds,
+    deduped so a command seen across polls counts once."""
+    last = None
+    while not stop_event.is_set():
+        cmds = fm.commands_for(member.id)
+        if cmds:
+            command = cmds[0]
+            key = (command["job_id"], command["step"])
+            if key != last:
+                last = key
+                seen.append(command["kind"])
+            kind = command["kind"]
+            if kind == "presence":
+                fm.record_job_updates(
+                    member,
+                    [
+                        _ju(
+                            command,
+                            status="present",
+                            present=True,
+                            data_plane_address="10.0.2.2",
+                            rdma_device="rdma_en4",
+                        )
+                    ],
+                )
+            elif kind == "sweep":
+                fm.record_job_updates(member, [_ju(command, status="swept")])
+            elif kind == "spawn_rank":
+                fm.record_job_updates(member, [_ju(command, status="spawned")])
+            elif kind == "teardown":
+                fm.record_job_updates(member, [_ju(command, status="torn_down")])
+        await asyncio.sleep(0.003)
+
+
+async def test_auto_tears_worker_down_between_attempts(tmp_path):
+    # The jaccl rank spawns on the worker, then the head's barrier fails: the
+    # ring retry must be preceded by a worker teardown so CL2-09 does not refuse
+    # the second spawn (fresh process per attempt, salvage pitfall 6).
+    settings = _head_settings(tmp_path, backend="auto", rdma_device="rdma_en2")
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+
+        def spawn(*, backend, **kwargs):
+            spawns.append({"backend": backend, **kwargs})
+            return _FailReadyLeader(fail=(backend == "jaccl"))
+
+        fm = FormationManager(
+            manager,
+            spawn_leader_fn=spawn,
+            engine_factory=lambda **kwargs: FakeEngine(),
+            model_resolver=lambda model_id: "/head/models/target",
+        )
+        manager._formation = fm
+        seen: list[str] = []
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_recording_driver(fm, member, seen, stop))
+        try:
+            result = await fm.load("target")
+            assert result["negotiated_backend"] == "ring"
+            assert [s["backend"] for s in spawns] == ["jaccl", "ring"]
+            # A teardown landed between the worker's two spawn_rank commands.
+            first = seen.index("spawn_rank")
+            second = seen.index("spawn_rank", first + 1)
+            assert "teardown" in seen[first + 1 : second]
+            # The intra-job teardown must not arm the CL2-06 suppression alarm.
+            assert fm.alarms() == []
+        finally:
+            stop.set()
+            await driver
+
+
+async def test_explicit_jaccl_failure_does_not_fall_back(tmp_path):
+    settings = _head_settings(tmp_path, backend="jaccl", rdma_device="rdma_en2")
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        fm = _formation_with_spawn(manager, spawns, fail_on="jaccl")
+        manager._formation = fm
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(fm, member, stop, present=True))
+        try:
+            with pytest.raises(RuntimeError) as excinfo:
+                await fm.load("target")
+            # The real jaccl error, never a silent ring substitution.
+            assert "jaccl" in str(excinfo.value)
+            assert [s["backend"] for s in spawns] == ["jaccl"]
+            job = fm._jobs[-1]
+            assert job.status == "failed"
+            assert job.negotiated_backend == ""
+        finally:
+            stop.set()
+            await driver
+
+
+async def test_explicit_jaccl_success_reports_jaccl_and_builds_matrix(tmp_path):
+    settings = _head_settings(tmp_path, backend="jaccl", rdma_device="rdma_en2")
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        fm = _formation_with_spawn(manager, spawns, fail_on=None)
+        manager._formation = fm
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(fm, member, stop, present=True))
+        try:
+            result = await fm.load("target")
+            assert result["negotiated_backend"] == "jaccl"
+            # The head builds the full S0-recipe matrix from typed state.
+            assert spawns[0]["backend"] == "jaccl"
+            assert spawns[0]["ibv_devices"] == [
+                [None, "rdma_en2"],
+                ["rdma_en4", None],
+            ]
+        finally:
+            stop.set()
+            await driver
+
+
+async def test_jaccl_without_head_rdma_device_fails(tmp_path):
+    # backend pinned jaccl but the head has no rdma_device: an explicit request
+    # that cannot form fails rather than silently forming ring.
+    settings = _head_settings(tmp_path, backend="jaccl")  # no rdma_device
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        fm = _formation_with_spawn(manager, spawns, fail_on=None)
+        manager._formation = fm
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(fm, member, stop, present=True))
+        try:
+            with pytest.raises(ClusterError):
+                await fm.load("target")
+            assert spawns == []  # nothing formed on any backend
         finally:
             stop.set()
             await driver

@@ -94,6 +94,65 @@ async def test_peer_outside_own_subnet_is_refused(tmp_path):
     assert not spawns
 
 
+# -- jaccl: CL2-03 own row from own device; CL2-12 own device required --------
+
+
+async def test_jaccl_spawn_overwrites_own_row_with_own_device(tmp_path):
+    # The head supplies a matrix whose row for the worker's own rank names a
+    # different device; the worker ignores it and uses its own rdma_device, and
+    # keeps the head's peer rows (devices it cannot itself observe). CL2-03 for
+    # the ibv matrix, exactly as `peers` is confined for addresses.
+    spawns: list = []
+    executor = _executor(tmp_path, spawns, rdma_device="rdma_en4")
+    head_matrix = [[None, "rdma_en2"], ["rdma_head_lies", None]]
+    update = await executor._apply(_spawn_cmd(backend="jaccl", ibv_devices=head_matrix))
+    assert update["status"] == "spawned"
+    prepared = spawns[0]
+    assert prepared.backend == "jaccl"
+    # Own row (rank 1) recomputed from own device; head's row 0 kept as sent.
+    assert prepared.ibv_devices == [[None, "rdma_en2"], ["rdma_en4", None]]
+
+
+async def test_jaccl_without_own_rdma_device_refuses(tmp_path):
+    spawns: list = []
+    executor = _executor(tmp_path, spawns, rdma_device="")
+    head_matrix = [[None, "rdma_en2"], ["rdma_en4", None]]
+    update = await executor._apply(_spawn_cmd(backend="jaccl", ibv_devices=head_matrix))
+    assert update["status"] == "error"
+    assert "CL2-12" in update["detail"]
+    assert not spawns
+
+
+async def test_jaccl_without_a_matrix_refuses(tmp_path):
+    spawns: list = []
+    executor = _executor(tmp_path, spawns, rdma_device="rdma_en4")
+    update = await executor._apply(_spawn_cmd(backend="jaccl"))  # no ibv_devices
+    assert update["status"] == "error"
+    assert not spawns
+
+
+def test_worker_resolves_both_backends(tmp_path):
+    from omlx.cluster.protocol import Backend
+
+    executor = _executor(tmp_path, [], rdma_device="rdma_en4")
+    assert executor._resolve_backend(Backend.RING) == "ring"
+    assert executor._resolve_backend(Backend.JACCL) == "jaccl"
+
+
+async def test_presence_reports_own_rdma_device(tmp_path):
+    executor = _executor(tmp_path, [], rdma_device="rdma_en4")
+    update = await executor._apply(
+        {
+            "kind": "presence",
+            "schema_version": PROTOCOL_VERSION,
+            "job_id": "j",
+            "step": 1,
+            "model_id": "target-model",
+        }
+    )
+    assert update["rdma_device"] == "rdma_en4"
+
+
 # -- CL2-12: no own data-plane config refuses to form -------------------------
 
 

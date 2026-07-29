@@ -420,6 +420,12 @@ class LocalCluster:
     _workdir: Path | None = None
     _deathwatch: DeathWatch | None = None
     _stdin_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Per-backend launch context, written once in ``_start`` and read by each
+    # ``_spawn_one``: ring sets ``_hostfile_path``; jaccl sets ``_ibv_path``
+    # (the MLX_IBV_DEVICES matrix file) and ``_coordinator`` ("<rank0_ip>:port").
+    _hostfile_path: Path | None = None
+    _ibv_path: Path | None = None
+    _coordinator: str | None = None
 
     def any_alive(self) -> bool:
         return any(r.alive for r in self.ranks)
@@ -429,17 +435,21 @@ class LocalCluster:
         ranks: list[int],
         *,
         ips: list[str],
+        ibv_devices: list[list[str | None]] | None = None,
         data_plane_subnet: str | None = None,
         allow_routable_data_plane: bool = False,
         allow_loopback: bool = False,
     ) -> None:
-        """Spawn the given ranks on this machine (ring backend).
+        """Spawn the given ranks on this machine.
 
         ``ips`` is the whole cluster's data-plane address list in rank order —
-        every node needs it, because the ring hostfile describes all ranks.
-        When ``data_plane_subnet`` is given, every address is put through the
-        D7 predicate before it can enter the hostfile (CL2-03); with the subnet
-        unset the caller has already validated them.
+        every node needs it, because the ring hostfile and the jaccl coordinator
+        both describe all ranks. For the jaccl backend ``ibv_devices`` is the
+        ``MLX_IBV_DEVICES`` matrix (``matrix[i][j]`` names node ``i``'s device to
+        node ``j``); it is ignored for the ring backend. When
+        ``data_plane_subnet`` is given, every address is put through the D7
+        predicate before it can enter the launch context (CL2-03); with the
+        subnet unset the caller has already validated them.
         """
         if self.enforce_spawn_bound:
             _register_formation(self)
@@ -447,6 +457,7 @@ class LocalCluster:
             self._start(
                 ranks,
                 ips=ips,
+                ibv_devices=ibv_devices,
                 data_plane_subnet=data_plane_subnet,
                 allow_routable_data_plane=allow_routable_data_plane,
                 allow_loopback=allow_loopback,
@@ -462,6 +473,7 @@ class LocalCluster:
         ranks: list[int],
         *,
         ips: list[str],
+        ibv_devices: list[list[str | None]] | None,
         data_plane_subnet: str | None,
         allow_routable_data_plane: bool,
         allow_loopback: bool,
@@ -477,23 +489,31 @@ class LocalCluster:
                     allow_loopback=allow_loopback,
                 )
 
-        if self.backend != "ring":
+        if self.backend not in ("ring", "jaccl"):
             raise ValueError(
-                f"P1 launcher supports only the ring backend, not {self.backend!r}"
+                f"unsupported backend {self.backend!r}; expected ring or jaccl"
             )
-        # The ring world size is the hostfile length; a mismatch would form a
-        # smaller world than the caller believes (the singleton-group trap
-        # strict=True exists to prevent).
+        # World size is the hostfile / coordinator peer-list length; a mismatch
+        # would form a smaller world than the caller believes (the singleton-
+        # group trap strict=True exists to prevent).
         if len(ips) != self.world_size:
             raise ValueError(
                 f"world_size {self.world_size} != {len(ips)} data-plane addresses"
             )
 
         self._workdir = Path(tempfile.mkdtemp(prefix="omlx-cluster-"))
-        addresses = hostfile.ring_addresses(ips, self.base_port)
-        hostfile_path = hostfile.write_ring_hostfile(
-            self._workdir / "hosts.json", addresses
-        )
+        if self.backend == "ring":
+            addresses = hostfile.ring_addresses(ips, self.base_port)
+            self._hostfile_path = hostfile.write_ring_hostfile(
+                self._workdir / "hosts.json", addresses
+            )
+        else:  # jaccl: a TCP coordinator bootstraps the RDMA queue-pair exchange
+            if ibv_devices is None:
+                raise ValueError("the jaccl backend requires an ibv device matrix")
+            self._ibv_path = hostfile.write_ibv_devices(
+                self._workdir / "ibv.json", ibv_devices
+            )
+            self._coordinator = f"{ips[0]}:{hostfile.DEFAULT_JACCL_COORDINATOR_PORT}"
 
         # Rank 0 must bind its listening socket before any peer connects: a peer
         # that starts first burns its connect window and dies with error 65,
@@ -501,7 +521,7 @@ class LocalCluster:
         # spawn rank 0 first, wait until it is listening, then spawn the rest.
         ordered = sorted(ranks)
         for index, rank in enumerate(ordered):
-            self._spawn_one(rank, hostfile_path)
+            self._spawn_one(rank)
             more_ranks_pending = rank == 0 and index + 1 < len(ordered)
             if more_ranks_pending and not self.wait_until_ready(
                 timeout=DEFAULT_JOIN_TIMEOUT_S
@@ -511,12 +531,14 @@ class LocalCluster:
                     "spawn peers against a dead listener"
                 )
 
-    def _spawn_one(self, rank: int, hostfile_path: Path) -> None:
+    def _spawn_one(self, rank: int) -> None:
         env = hostfile.local_worker_env(
             dict(os.environ),
             rank=rank,
-            backend="ring",
-            hostfile=hostfile_path,
+            backend=self.backend,
+            hostfile=self._hostfile_path,
+            coordinator=self._coordinator,
+            ibv_devices=self._ibv_path,
         )
         argv = [
             self.python,
@@ -571,7 +593,13 @@ class LocalCluster:
         ranks may already be past init — so a short grace lets the caller
         proceed. The only real failure is a rank that died.
         """
-        port = self.base_port
+        # Rank 0 listens on the ring base port; under jaccl it listens on the
+        # coordinator port (the TCP bootstrap for the RDMA queue-pair exchange).
+        port = (
+            self.base_port
+            if self.backend == "ring"
+            else hostfile.DEFAULT_JACCL_COORDINATOR_PORT
+        )
         grace_deadline = time.monotonic() + min(timeout, 5.0)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

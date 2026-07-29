@@ -9,7 +9,9 @@ import json
 import pytest
 
 from omlx.cluster.hostfile import (
+    DEFAULT_JACCL_COORDINATOR_PORT,
     LinkScopeError,
+    ibv_matrix_from_devices,
     link_scope_verdict,
     local_worker_env,
     require_link_scope,
@@ -150,3 +152,47 @@ def test_local_worker_env_ring_requires_hostfile():
 def test_local_worker_env_rejects_unknown_backend():
     with pytest.raises(ValueError):
         local_worker_env({}, rank=0, backend="nccl")
+
+
+# -- jaccl: ibv matrix from typed state, and the jaccl env -------------------
+
+
+def test_ibv_matrix_from_devices_matches_s0_recipe():
+    # Two nodes with the S0 rig's devices produce the recorded matrix exactly:
+    # off-diagonal is the row-node's own device, diagonal is null.
+    assert ibv_matrix_from_devices(["rdma_en2", "rdma_en4"]) == [
+        [None, "rdma_en2"],
+        ["rdma_en4", None],
+    ]
+
+
+def test_ibv_matrix_from_devices_three_nodes():
+    assert ibv_matrix_from_devices(["a", "b", "c"]) == [
+        [None, "a", "a"],
+        ["b", None, "b"],
+        ["c", "c", None],
+    ]
+
+
+def test_local_worker_env_jaccl_sets_coordinator_and_matrix():
+    base = {"PATH": "/usr/bin", "HF_HOME": "/hf", "PYTHONPATH": "/evil"}
+    env = local_worker_env(
+        base,
+        rank=0,
+        backend="jaccl",
+        coordinator=f"10.0.2.1:{DEFAULT_JACCL_COORDINATOR_PORT}",
+        ibv_devices="/tmp/ibv.json",
+    )
+    assert env["MLX_RANK"] == "0"
+    assert env["MLX_JACCL_COORDINATOR"] == "10.0.2.1:41200"
+    assert env["MLX_IBV_DEVICES"] == "/tmp/ibv.json"
+    assert env["OMLX_CLUSTER_BACKEND"] == "jaccl"
+    # The ring hostfile variable is absent on the jaccl path, and the RCE key
+    # never survives the allowlist.
+    assert "MLX_HOSTFILE" not in env
+    assert "PYTHONPATH" not in env
+
+
+def test_local_worker_env_jaccl_requires_coordinator_and_matrix():
+    with pytest.raises(ValueError):
+        local_worker_env({}, rank=0, backend="jaccl")

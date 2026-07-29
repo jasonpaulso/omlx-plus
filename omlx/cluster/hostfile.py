@@ -142,6 +142,21 @@ def write_ibv_devices(path: str | Path, matrix: list[list[str | None]]) -> Path:
     return path
 
 
+def ibv_matrix_from_devices(devices: list[str | None]) -> list[list[str | None]]:
+    """Build the ``MLX_IBV_DEVICES`` matrix from each node's own RDMA device.
+
+    ``devices[i]`` is node ``i``'s ``cluster.rdma_device`` setting. The result
+    is the per-node matrix jaccl reads: ``matrix[i][j]`` is the device node
+    ``i`` uses to reach node ``j`` — node ``i``'s own device off the diagonal,
+    null on it. RDMA over Thunderbolt cannot route, so a node reaches every peer
+    through its single device and a whole row is that one device. Two nodes with
+    devices ``["rdma_en2", "rdma_en4"]`` yield the S0 recipe's
+    ``[[null, "rdma_en2"], ["rdma_en4", null]]``.
+    """
+    size = len(devices)
+    return [[None if i == j else devices[i] for j in range(size)] for i in range(size)]
+
+
 def ring_env(rank: int, hostfile: str | Path) -> dict[str, str]:
     """Environment for one rank of a TCP ring run."""
     return {

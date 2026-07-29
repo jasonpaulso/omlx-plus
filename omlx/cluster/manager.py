@@ -116,6 +116,8 @@ class _PreparedSpawn:
     against this node's own model dirs (CL2-02), ``ips`` has the worker's own
     address in its own rank slot and every entry re-validated against this
     node's own subnet (CL2-03), ``base_port`` is this node's own setting.
+    ``ibv_devices`` (jaccl only, else None) has this rank's own row computed
+    from this node's OWN ``rdma_device`` — never a head-supplied one (CL2-03).
     """
 
     rank: int
@@ -125,6 +127,7 @@ class _PreparedSpawn:
     ips: list[str]
     base_port: int
     seed: int
+    ibv_devices: list[list[str | None]] | None = None
 
 
 class WorkerCommandExecutor:
@@ -301,6 +304,10 @@ class WorkerCommandExecutor:
             present=present,
             resolved_size=(resolved[1] if resolved is not None else 0),
             data_plane_address=self._reportable_address(),
+            # The worker's own RDMA device, so the head can build a complete
+            # jaccl matrix (mirrors data_plane_address). The worker still
+            # recomputes its own matrix row from this same setting (CL2-03).
+            rdma_device=self.settings.rdma_device,
         )
 
     async def _do_spawn(self, command: SpawnRankCommand) -> dict[str, Any]:
@@ -376,23 +383,55 @@ class WorkerCommandExecutor:
                 allow_loopback=cs.allow_loopback,
             )
             ips.append(address)
+        backend = self._resolve_backend(command.backend)
+        ibv_devices = self._own_ibv_matrix(command) if backend == "jaccl" else None
         return _PreparedSpawn(
             rank=command.rank,
             world_size=command.world_size,
-            backend=self._resolve_backend(command.backend),
+            backend=backend,
             model_path=model_path,
             ips=ips,
             base_port=int(cs.data_plane_base_port),
             seed=command.seed,
+            ibv_devices=ibv_devices,
         )
+
+    def _own_ibv_matrix(self, command: SpawnRankCommand) -> list[list[str | None]]:
+        """The jaccl matrix this rank launches with, own row from own device.
+
+        The head supplies a full matrix (device names for peers this node cannot
+        observe). The worker keeps those peer rows but computes its OWN rank's
+        row from its OWN ``cluster.rdma_device`` — a head-supplied device name
+        for its own rank is never trusted (CL2-03), and a node with no configured
+        device refuses to form (the CL2-12 discipline, extended to jaccl).
+        """
+        own_device = self.settings.rdma_device
+        if not own_device:
+            raise ClusterFormationError(
+                "jaccl formation requested but this node has no "
+                "cluster.rdma_device configured; refusing to form (CL2-12)"
+            )
+        size = command.world_size
+        supplied = command.ibv_devices
+        if (
+            supplied is None
+            or len(supplied) != size
+            or any(len(row) != size for row in supplied)
+        ):
+            raise ClusterFormationError(
+                f"jaccl spawn command carried no {size}x{size} ibv device matrix"
+            )
+        matrix = [list(row) for row in supplied]
+        rank = command.rank
+        matrix[rank] = [None if j == rank else own_device for j in range(size)]
+        return matrix
 
     def _resolve_backend(self, backend: Backend) -> str:
         if backend == Backend.RING:
             return "ring"
-        raise ClusterFormationError(
-            f"backend {backend.value!r} is not supported by the P2 launcher "
-            "(ring only; jaccl lands in P3)"
-        )
+        if backend == Backend.JACCL:
+            return "jaccl"
+        raise ClusterFormationError(f"unsupported backend {backend.value!r}")
 
     def _default_spawn(self, prepared: _PreparedSpawn) -> Any:
         from .launcher import LocalCluster
@@ -408,6 +447,7 @@ class WorkerCommandExecutor:
         cluster.start(
             [prepared.rank],
             ips=prepared.ips,
+            ibv_devices=prepared.ibv_devices,
             data_plane_subnet=cs.data_plane_subnet,
             allow_routable_data_plane=cs.allow_routable_data_plane,
             allow_loopback=cs.allow_loopback,

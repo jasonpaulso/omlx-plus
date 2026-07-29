@@ -17,6 +17,7 @@ from omlx.cluster.protocol import (
     SpawnRankCommand,
     StepMessage,
     StopTextBuffer,
+    command_to_wire,
     parse_command,
 )
 
@@ -105,6 +106,25 @@ def test_parse_spawn_rank_command():
     assert command.backend is Backend.RING
     assert command.rank == 1
     assert command.model_id.endswith("Llama-3.2-1B-Instruct-4bit")
+
+
+def test_spawn_rank_ring_omits_ibv_devices():
+    command = parse_command(_spawn_payload())
+    assert command.ibv_devices is None
+    # The wire dict round-trips (ring carries an explicit null matrix).
+    wire = command_to_wire(command)
+    assert wire["ibv_devices"] is None
+    assert parse_command(wire).ibv_devices is None
+
+
+def test_spawn_rank_jaccl_carries_ibv_matrix():
+    matrix = [[None, "rdma_en2"], ["rdma_en4", None]]
+    command = parse_command(_spawn_payload(backend="jaccl", ibv_devices=matrix))
+    assert command.backend is Backend.JACCL
+    assert command.ibv_devices == matrix
+    # Survives a wire round-trip unchanged.
+    assert command_to_wire(command)["ibv_devices"] == matrix
+    assert parse_command(command_to_wire(command)).ibv_devices == matrix
 
 
 def test_parse_sweep_and_teardown_and_presence():
