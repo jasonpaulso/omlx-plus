@@ -7,23 +7,25 @@ Companion docs: `bringup.md` (rig setup), `s2-measurements.md` (S2 acceptance �
 context only; **no S2 number is the S3 gate**, see "Why S2's throughput figure is
 not the baseline" below).
 
-Status: **rows 1, 2, 3, 5, 6 PASS on both backends. Row 4 fails as written on
-both: the queue-full cap does fire at exactly 32, but it reaches the client as
-an in-stream SSE error under HTTP 200, never as a 503.** That is the slice's
-one real defect and its main carry-forward. E4's stop condition did not fire on
-either backend.
+Status: **all six acceptance rows PASS on both backends.** E4's stop condition
+did not fire on either.
 
-Row 4 update (2026-07-29): the defect turned out to be shared with single-node,
-not cluster-specific. A first fix landed at the preflight seam and **was
-re-measured on the rig: it did not close row 4** — the gate counted requests
-that had not entered the engine yet, so it never engaged on a cold burst. The
-rejection *is* now logged head-side. See "Row 4 re-measure, ring" below.
+Row 4 took three sessions and two fixes to get there, and the history is kept
+below rather than rewritten, because both wrong turns are instructive:
 
-Row 4 second fix (2026-07-29, later): preflight now **reserves** the slot it
-checked for, on the cluster path only, so occupancy counts requests on their way
-to rank 0 as well as those it already holds. **Rig-unverified — the rig has not
-been touched since the re-measure above.** Local evidence is in "Reservation
-fix" below; the rig re-run is what would flip this row to PASS.
+1. **Measured FAIL on both backends.** The queue-full cap fired at exactly 32,
+   but reached the client as an in-stream SSE error under HTTP 200, never a 503,
+   and was never logged head-side.
+2. **First fix (`87fb0e2e`) — did not close it.** The defect turned out to be
+   shared with single-node, not cluster-specific; the fix went in at the
+   preflight seam but gated on a counter that is only filled *after* the route
+   commits, so it never engaged on a cold burst. Re-measured on the rig: still
+   `{200: 41}`. It did close the second half of the complaint — the rejection is
+   now logged head-side.
+3. **Second fix (`df100432`) — closes it.** Preflight now *reserves* the slot it
+   checked for, so occupancy counts requests on their way to rank 0 as well as
+   those it already holds. **Measured on the rig, both backends: `{200: 40,
+   503: 1}`, gate PASS.** See "Reservation fix" below.
 
 ---
 
@@ -403,11 +405,11 @@ scheduler. Both derive their cap from one `waiting_queue_capacity` definition.
 No `server.py` change was needed. The head-side log line the second bullet
 above asks for now exists on the backstop path.
 
-**Row 4 remains rig-unverified.** The fix is covered by unit and two-rank
-integration tests, but this row was measured on the live 2-Mac pair on both
-backends and only a rig re-run can close it. Re-measure with the same `flood`
-recipe (41 concurrent, `max_tokens` large enough that nothing completes) and
-assert an actual HTTP 503 — do not mark it PASS from the test suite.
+**Row 4 remained rig-unverified at this point**, and the insistence on a rig
+re-run rather than a green test suite is what caught that this fix did not work.
+*(Superseded: the row was later closed at `df100432` — see "Row 4 — CLOSED"
+below. This paragraph is kept because it is the reason the wrong fix did not
+ship as a PASS.)*
 
 ### Row 4 re-measure protocol — pinned before the run
 
@@ -489,7 +491,45 @@ route/engine layer and cannot vary with the collective backend; ring is
 decisive and a jaccl session would cost a fresh-daemon cycle to reproduce a
 foreordained result. If the reservation lands, re-run both.
 
-### Reservation fix — local evidence, rig re-run still owed
+### Row 4 — CLOSED, both backends, 2026-07-29 at `df100432`
+
+Same recipe as every prior attempt: MiniMax-M2.7-3bit across the pair, 41
+concurrent, `max_tokens=4096`, `--hold-s 90`, the `s3_prompt.txt` prompt. Model
+and burst held identical to the `b3d39ad6` FAIL, so the fix is the only variable.
+
+```
+backend: ring   (flood, n=41)          backend: jaccl  (flood, n=41)
+  status codes         : {200: 40, 503: 1}    {200: 40, 503: 1}
+  HTTP 503 rejections  : 1                    1
+  streamed >=1 token   : 40                   40
+  in-stream queue_full : 0                    0
+  ROW 4 GATE : PASS                           PASS
+```
+
+The 503 carries the same message a single-node client gets
+(`Scheduler waiting queue full (32/32). Try again shortly.`) and is logged
+head-side as `POST /v1/chat/completions → 503`. **Zero backstop warnings on
+either run** — the rejection came from preflight, before the response committed,
+which is exactly what row 4 asks for. Not one of the 40 admitted requests was
+refused in-stream.
+
+Preconditions checked by hand before each formation: both checkouts at
+`df100432` compared as strings **and both venvs confirmed importing
+`_RESERVATION_TTL_S` / `ClusterEngine._reserved_slots`** (a stale worker would
+not crash — rank 0 never runs the gate — it would just reproduce `{200: 41}` and
+look like the fix failing); no ghost members; `negotiated_backend == requested`
+on both; smoke generation served before each burst (24 tokens, 4.43 s ring /
+4.15 s jaccl). jaccl got freshly started daemons per the PD-leak rule. **No
+re-runs on either backend** — one flood each, first completed run is the number.
+
+The Studio was synced by `git bundle`, not a push: `origin` carries no
+`feat/cluster-v1` branch and this program has never published one.
+
+Rig left clean: model unloaded, member scrubbed, both daemons stopped, 8910/8911
+free, `backend=ring` restored and roles intact on both nodes, daily-driver
+`:8899` (PID 87617) and Studio `:8888`/`:8889` (PIDs 947/926) untouched.
+
+### Reservation fix — the change itself
 
 The design change the section above asked for, scoped to the cluster path.
 
@@ -547,9 +587,8 @@ one preflights. That is the warm shape the previous fix's pre-filled unit tests
 also measured, and it is why the rig disagreed with them. The two-phase test
 asserts the same two clauses as the row-4 gate.
 
-**Still rig-unverified.** The rig was not touched in this session. Closing row 4
-means re-running `flood` on ring and jaccl at this commit, under the pinned
-protocol above (no-retry included).
+Rig result for this change is the section above: PASS on both backends, one
+flood each.
 
 Rig left clean: model unloaded, member scrubbed, both daemons stopped,
 8910/8911 free, `backend=ring` and roles intact on both nodes, daily-driver
