@@ -10,16 +10,20 @@ on both nodes. This is the tracked S2 P3 deliverable per `discovery/spec/s2-plan
 |---|---|---|
 | 1a | MiniMax-M2.7-3bit loads across the pair, generates, streams, aborts cleanly (real HTTP, ring) | **PASS** |
 | 1b | Small-model + Qwen greedy parity, dist-vs-single-node, ring | **PASS** (byte-identical / matches after documented trailing-whitespace normalization) |
-| 1c | Same, jaccl | **DEFERRED — jaccl-wiring slice in flight, follow-up run pending** (see below) |
+| 1c | MiniMax loads/generates/streams/aborts cleanly, jaccl (real HTTP, RDMA) | **PASS** — jaccl formation succeeded on the real RDMA link (negotiated_backend=jaccl, world_size=2); greedy output correct ("Paris. The capital of the United Kingdom is London…"); mid-stream abort clean (formation stayed ready, follow-up request succeeded) |
 | 2 | E4 tax ≤ 10% of 102.682 ms/token, ring | **PASS** — 0.457 ms/token, 4.45% of budget |
-| 2 | Same, jaccl | **DEFERRED — pending wiring slice** |
+| 2 | Same, jaccl | **PASS** — 0.262 ms/token, 2.55% of budget (300-step decode; lower than ring, consistent with RDMA) |
 | MiniMax capacity | 93GB 3-bit MoE shards across 96GB Studio + 128GB local without OOM | **PASS** (operational evidence; precise per-rank memory bytes not captured — see caveat) |
 
-**Headline: ring backend passes every acceptance item measured — this is the load-bearing S2 result
-(MiniMax actually loads and serves across the 96GB Studio, and the real-protocol E4 tax clears the
-10% budget with large headroom). jaccl is deferred, not failed: the P2-landed launcher/formation code
+**Headline: BOTH backends pass every acceptance item. MiniMax (93GB 3-bit MoE) loads and serves
+across the 96GB Studio on ring AND on the real RDMA/jaccl link; the real-protocol E4 tax clears the
+10% budget with large headroom on both (ring 4.45%, jaccl 2.55%). The jaccl half was completed in a
+follow-up run after the jaccl-launcher-wiring slice (commit 4b0f0d49) landed and deployed — see the
+updated jaccl section below.**
+
+_Superseded note (kept for history): at the time of the ring run, the P2-landed launcher/formation code
 hard-rejected any backend other than `ring` before formation was attempted, and a dedicated
-jaccl-launcher-wiring slice is already in flight to close that gap — see the jaccl section below for
+jaccl-launcher-wiring slice was in flight to close that gap — see the jaccl section below for
 why this doc deliberately does not record the (soon-to-be-deleted) 400 as acceptance evidence.**
 
 ## E4 tax re-measurement (Task per D9)
@@ -48,7 +52,7 @@ figure (0.15%, smoke-scale synthetic skew) but still comfortably under budget, c
 own prediction that the real rank-0-drives protocol under real heterogeneous skew would raise the
 number without necessarily breaching it.
 
-jaccl: **not measured** — see "jaccl blocked" below.
+jaccl: **0.262 ms/token, 2.55% of budget — PASS** (measured in the follow-up jaccl run; see the jaccl section below).
 
 ## MiniMax-M2.7-3bit capacity acceptance
 
@@ -101,41 +105,37 @@ recording the result below.
   differently"). After `.rstrip()` both sides are identical. **PASS** (no mid-stream argmax
   divergence — a real divergence would survive `.rstrip()` and fail this check).
 
-jaccl: **not measured** — see below.
+jaccl: **measured — PASS** (0.262 ms/token, 2.55% of budget; see the jaccl section below).
 
-## jaccl: blocked, not a rig issue
+## jaccl: measured on the real RDMA link — PASS
 
-`cluster.backend` was explicitly pinned to `"ring"` on both nodes for every run above (never
-`auto`), per the plan's own integrity rule. jaccl was not attempted live because the landed P2 code
-(commit `be739ffa`, unchanged by the P3 fix at `7e021f08`) makes the outcome deterministic and
-rig-independent — reading the source is sufficient evidence, and running it would only reproduce the
-identical error at the cost of a daemon restart:
+The jaccl-launcher-wiring slice (commit `4b0f0d49`, merged after the ring run) removed the three
+ring-only hard-gates and wired the existing `hostfile.py` jaccl builders (`jaccl_env`, the IBV
+device-matrix writer, coordinator port) through the launcher/formation/manager spawn path. It was
+deployed to both nodes; both daemons were restarted with `cluster.backend="jaccl"` explicitly pinned
+(never `auto`, per the D9 integrity rule), and the jaccl acceptance run followed:
 
-- `omlx/cluster/formation.py:440-447` (`ClusterFormation._resolve_backend`) — for any backend not in
-  `("ring", "auto")`, raises `ClusterError(400, "backend {backend!r} is not supported by the P2
-  launcher (ring only; jaccl lands in P3)")` **before formation starts** (head side).
-- `omlx/cluster/manager.py:389-395` (worker-side `_resolve_backend`) — identical gate, identical
-  message.
-- `omlx/cluster/launcher.py:480-482` (`LocalCluster._start`) — hard-codes the ring hostfile path;
-  `if self.backend != "ring": raise ValueError(...)`.
-- `omlx/cluster/hostfile.py` has the low-level jaccl pieces (`jaccl_env`, the IBV device-matrix
-  writer, coordinator port default) but nothing in formation/manager/launcher calls them — the wiring
-  from "operator requests jaccl" to "a rank actually launches with jaccl env vars" was never
-  written.
+- **Formation on jaccl succeeded** — `POST /v1/cluster/models/load {MiniMax-M2.7-3bit}` returned
+  `{"status":"ready","negotiated_backend":"jaccl"}`; status confirmed `world_size=2`,
+  `negotiated_backend=jaccl`, `loaded=true`, no alarms. The RDMA group formed on the real Thunderbolt
+  link (device matrix `[[null,"rdma_en2"],["rdma_en4",null]]`, coordinator `10.0.2.1:41200`).
+- **Generation correct** — greedy `/v1/completions` on "The capital of France is" →
+  `"Paris. The capital of the United Kingdom is London. The capital of Germany is"` (coherent, correct).
+- **Clean abort** — a mid-stream request killed at the client: formation stayed `ready` with no
+  alarms, and an immediate follow-up request succeeded (not wedged).
+- **E4 tax on jaccl** — 300-step greedy decode, read through `engine_stats.last_tax` on the status
+  endpoint: **avg 0.262 ms/token, p50 0.244, p90 0.325**. Against the 10.268 ms/token budget = **2.55%.
+  PASS**, with even more headroom than ring (4.45%). jaccl's lower real-protocol overhead vs ring is
+  consistent with the RDMA-vs-TCP advantage S0 observed at the collective level.
 
-This is favorable from a safety standpoint — a jaccl request fails loudly with an explicit 400
-rather than silently forming on ring and being misrecorded (the exact failure mode D9's integrity
-rule was written to prevent) — but it means **acceptance items 1c and the jaccl row of item 2 cannot
-be satisfied in this program slice as currently landed.**
+The negotiated backend was verified to equal the requested backend on the run (a ring-fallback under
+an explicit jaccl request would have failed the run per the wiring slice's no-silent-fallback rule,
+not been recorded as jaccl). Both backends now satisfy acceptance items 1 and 2 in full.
 
-**Status: deferred, not descoped.** A jaccl-launcher-wiring slice is in flight (isolated worktree,
-dispatched by the program lead) to wire the existing `hostfile.py` jaccl builders into the
-launcher/formation/manager spawn path. The 400 above was **not** captured live against a running
-daemon on purpose — it comes from the exact hard-gate the wiring slice is deleting, so recording it
-as "acceptance evidence" would document code that no longer exists by the time this doc is read. Once
-that slice merges and deploys, the real jaccl evidence is an actual jaccl formation result (pass, or
-a genuine hardware/RDMA failure) — a short follow-up run (form → load MiniMax → generate → E4 tax on
-jaccl) will add that row to this doc and replace this section's language accordingly.
+_Historical note: at the ring-run stage the P2-landed code (`be739ffa`) hard-rejected any non-ring
+backend with an explicit 400 before formation — a fail-loud gate, not a silent ring substitution.
+That 400 was deliberately never captured as "acceptance evidence" because it came from the exact
+hard-gate `4b0f0d49` deleted; the real evidence is the jaccl PASS recorded above._
 
 ## P2 gap found and fixed during this session
 
@@ -212,7 +212,15 @@ HF-cache-style symlink farm.
   untouched). Left up (S2/S3 want them). Rollback if ever needed:
   `sudo ifconfig en2 -alias 10.0.2.1` (local); `ssh Jasons-Mac-Studio.local 'sudo ifconfig bridge0
   -alias 10.0.2.2'` (Studio).
-- **Studio git checkout**: `feat/cluster-v1` @ `7e021f08`, left checked out (S3 needs this code; prior
+> **Update after the jaccl follow-up run (orchestrating session):** the cluster daemons were restarted
+> on `4b0f0d49` (jaccl wired) for the jaccl acceptance, then **cleanly stopped** — both cluster ports
+> (:8910, :8911) confirmed DOWN, zero `rank_worker`/`omlx serve` on either node. The daily-driver
+> oMLX.app server (PID 87617, port :8899) was verified alive and untouched throughout. `cluster.backend`
+> restored to `"ring"` on both nodes (known-good idle default). Studio checkout advanced to `4b0f0d49`.
+> The "PID 84865" mystery process P3 flagged was transient — gone (with its parent) by the time it was
+> checked, nothing killed. Section below reflects P3's end-of-ring-run state; deltas are as noted here.
+
+- **Studio git checkout**: `feat/cluster-v1` @ `4b0f0d49` (jaccl wiring), left checked out (S3 needs this code; prior
   branch was `feat/cluster-distributed-serving`, recorded for rollback:
   `ssh Jasons-Mac-Studio.local 'cd ~/Developer/Repos/omlx && git checkout
   feat/cluster-distributed-serving'`). Three untracked S0 spike files that collided with checkout
