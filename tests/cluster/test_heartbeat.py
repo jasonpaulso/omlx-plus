@@ -114,6 +114,50 @@ class TestLoop:
         assert not beat.running
 
 
+class TestNodeState:
+    """S4 D1: advisory node_state attached to each heartbeat."""
+
+    async def test_node_state_is_attached_when_provider_is_set(self):
+        beat, created = sender()
+        beat._node_state_provider = lambda: {
+            "total_memory": 1000,
+            "memory_ceiling": 100,
+            "models_present": {"m": 50},
+        }
+        await beat.send_once()
+        payload = created[0].calls[0][3]
+        assert payload["node_state"] == {
+            "total_memory": 1000,
+            "memory_ceiling": 100,
+            "models_present": {"m": 50},
+        }
+
+    async def test_node_state_is_omitted_when_provider_returns_none(self):
+        beat, created = sender()
+        beat._node_state_provider = lambda: None
+        await beat.send_once()
+        payload = created[0].calls[0][3]
+        assert "node_state" not in payload
+
+    async def test_node_state_is_omitted_when_no_provider_is_set(self):
+        beat, created = sender()
+        await beat.send_once()
+        payload = created[0].calls[0][3]
+        assert "node_state" not in payload
+
+    async def test_a_raising_provider_never_fails_the_beat(self):
+        beat, created = sender()
+
+        def boom():
+            raise RuntimeError("scan failed")
+
+        beat._node_state_provider = boom
+        reply = await beat.send_once()
+        assert reply is not None
+        payload = created[0].calls[0][3]
+        assert "node_state" not in payload
+
+
 class TestStatus:
     async def test_status_reports_epoch_and_sequence_without_the_secret(self):
         beat, _ = sender()

@@ -1103,3 +1103,14 @@ class TestClusterTokenResolution:
         )
         assert "join" in result.stdout
         assert "cluster" in result.stdout
+
+    def test_cluster_placement_verb_is_registered(self):
+        """S4 D3: `omlx cluster placement <model> [--prefer ...]`."""
+        result = subprocess.run(
+            [sys.executable, "-m", "omlx.cli", "cluster", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert "placement" in result.stdout
+        assert "--prefer" in result.stdout

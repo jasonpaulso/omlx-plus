@@ -94,6 +94,62 @@ class MemberLiveness:
 
 
 @dataclass(frozen=True)
+class MemberNodeState:
+    """A worker's self-reported capacity/inventory (S4 D1).
+
+    Rides the heartbeat as an optional field, never persisted, and lives on
+    the liveness side of the identity-vs-liveness split alongside
+    :class:`MemberLiveness`: it is advisory only, used exclusively for
+    placement scoring, and never consulted for auth or liveness decisions.
+
+    ``memory_ceiling`` is the worker's own ``get_final_ceiling()`` verbatim
+    (0 when its memory guard is disabled) — placement's capacity-unknown
+    rule treats that 0 as "unknown", so no fallback is applied here the way
+    the head's own capacity gets one.
+    """
+
+    total_memory: int
+    memory_ceiling: int
+    models_present: dict[str, int]
+    received_at: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_memory": self.total_memory,
+            "memory_ceiling": self.memory_ceiling,
+            "models_present": dict(self.models_present),
+            "received_at": self.received_at,
+        }
+
+    @classmethod
+    def parse(cls, data: Any, *, received_at: float) -> MemberNodeState | None:
+        """Lenient parse: any shape mismatch drops the field, never raises.
+
+        Advisory data must never fail the heartbeat's liveness path (D2b),
+        so every failure mode here — wrong top-level type, missing/
+        non-numeric fields, a non-dict ``models_present`` — returns None
+        rather than propagating.
+        """
+        if not isinstance(data, dict):
+            return None
+        try:
+            total_memory = int(data["total_memory"])
+            memory_ceiling = int(data["memory_ceiling"])
+            raw_present = data.get("models_present") or {}
+            if not isinstance(raw_present, dict):
+                return None
+            models_present = {str(k): int(v) for k, v in raw_present.items()}
+        except (KeyError, TypeError, ValueError):
+            return None
+        return cls(
+            total_memory=total_memory,
+            memory_ceiling=memory_ceiling,
+            models_present=models_present,
+            received_at=received_at,
+        )
+
+
+@dataclass(frozen=True)
 class FileManifestEntry:
     """One head-pinned file in a transfer manifest (CL-13 seam, used in S5)."""
 

@@ -30,7 +30,9 @@ if TYPE_CHECKING:
     from .formation import FormationManager
 
 from ..admin.auth import fingerprint_key
+from ..model_discovery import discover_models
 from ..settings import ClusterSettings, GlobalSettings
+from ..utils.psutil_compat import get_total_memory
 from .client import ClusterClient, ClusterClientError, validate_head_url
 from .credentials import (
     cluster_state_path,
@@ -59,6 +61,7 @@ from .state import (
     ClusterState,
     Member,
     MemberLiveness,
+    MemberNodeState,
     WorkerIdentity,
     parse_member_address,
 )
@@ -89,6 +92,28 @@ def set_cluster_manager(manager: ClusterManager | None) -> None:
     """Install (or clear) the process-wide cluster manager."""
     global _cluster_manager
     _cluster_manager = manager
+
+
+# S4 D4/D2b: nothing in `omlx/cluster/` reaches into `_server_state` — the
+# placement preview endpoint (D3) and the worker's own node_state (D1) both
+# need the local EnginePool, so `server.init_server()` injects a getter here,
+# mirroring the admin `configure(pool_getter=...)` precedent
+# (admin/routes.py:1106,1133-1135).
+_get_engine_pool: Callable[[], Any] | None = None
+
+
+def get_engine_pool() -> Any | None:
+    """Return this process's EnginePool, or None before init_server() runs."""
+    getter = _get_engine_pool
+    if getter is None:
+        return None
+    return getter()
+
+
+def set_engine_pool_getter(getter: Callable[[], Any] | None) -> None:
+    """Install (or clear) the injected EnginePool accessor."""
+    global _get_engine_pool
+    _get_engine_pool = getter
 
 
 class ClusterError(Exception):
@@ -534,6 +559,14 @@ class ClusterManager:
         self._client_factory = client_factory or (lambda url: ClusterClient(url))
         self._state = ClusterState()
         self._liveness: dict[str, MemberLiveness] = {}
+        # S4 D1: advisory, liveness-side. Never persisted, never consulted
+        # for auth or liveness — placement scoring only.
+        self._node_state: dict[str, MemberNodeState] = {}
+        # S4 D1: this worker's own inventory scan, cached at most 60s so the
+        # heartbeat (every few seconds) does not re-scan the model dirs on
+        # every beat.
+        self._node_state_cache: dict[str, int] | None = None
+        self._node_state_cache_at: float = 0.0
         self._queue = ClusterCommandQueue()
         self._scrub_task: asyncio.Task[None] | None = None
         self._heartbeat: HeartbeatSender | None = None
@@ -566,6 +599,10 @@ class ClusterManager:
 
     def liveness(self, member_id: str) -> MemberLiveness | None:
         return self._liveness.get(member_id)
+
+    def node_state(self, member_id: str) -> MemberNodeState | None:
+        """The member's most recently reported node_state (S4 D1), or None."""
+        return self._node_state.get(member_id)
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -738,6 +775,7 @@ class ClusterManager:
                 )
             )
             self._liveness.pop(member_id, None)
+            self._node_state.pop(member_id, None)
             logger.info("Cluster member removed: id=%s", member_id)
             return {"member_id": member_id, "removed": True}
 
@@ -750,6 +788,7 @@ class ClusterManager:
         seq: int,
         epoch: str,
         job_updates: list[dict[str, Any]] | None = None,
+        node_state: Any = None,
     ) -> dict[str, Any]:
         """Record liveness for a heartbeat. Touches no persisted state.
 
@@ -764,6 +803,11 @@ class ClusterManager:
         reply carries ``commands`` plus a signature over the commands and the
         echoed epoch+seq (CL2-05/CL2-06); S1 heartbeats (no updates, no
         pending commands) get exactly the S1 reply.
+
+        The optional ``node_state`` (S4 D1) is parsed leniently: a malformed
+        or absent value simply means this member has no capacity data for
+        placement — it never fails the heartbeat, and liveness is recorded
+        either way.
         """
         if not epoch:
             raise ClusterError(400, "Heartbeat epoch must not be empty")
@@ -781,6 +825,15 @@ class ClusterManager:
         )
         if revived:
             logger.info("Cluster member revived: id=%s", member.id)
+
+        if node_state is not None:
+            parsed = MemberNodeState.parse(node_state, received_at=now)
+            if parsed is not None:
+                self._node_state[member.id] = parsed
+            else:
+                logger.debug(
+                    "cluster: dropping malformed node_state from member %s", member.id
+                )
 
         if job_updates and self._formation is not None:
             self._formation.record_job_updates(member, job_updates)
@@ -998,6 +1051,67 @@ class ClusterManager:
         save_state(self.state_path, state)
         self._state = state
 
+    # S4 D1: worker-side node_state assembly, attached to every heartbeat.
+    _NODE_STATE_RESCAN_INTERVAL_S = 60.0
+
+    def invalidate_node_state_cache(self) -> None:
+        """Force the next heartbeat to re-scan model dirs (after a local load/unload)."""
+        self._node_state_cache = None
+
+    def _worker_memory_ceiling(self) -> int:
+        """This node's own ``get_final_ceiling()``, verbatim (no fallback).
+
+        Reuses the EnginePool's already-wired enforcer callback
+        (`engine_pool.py:201-213`) via the injected getter rather than a
+        second wiring path; deliberately does NOT chain the pool's
+        admission fallback (`_fallback_admission_ceiling`) — D2's
+        capacity-unknown rule needs the raw 0 when this worker's guard is
+        off, not a substituted estimate.
+        """
+        pool = get_engine_pool()
+        if pool is None:
+            return 0
+        try:
+            return int(pool._current_ceiling())
+        except Exception:  # noqa: BLE001 - advisory, never blocks the beat
+            return 0
+
+    def _scan_models_present(self) -> dict[str, int]:
+        """model_id -> size_bytes for models physically on this node's disk.
+
+        Cached for `_NODE_STATE_RESCAN_INTERVAL_S` so a 5s heartbeat does
+        not re-scan the model dirs on every beat.
+        """
+        now = time.time()
+        if (
+            self._node_state_cache is not None
+            and now - self._node_state_cache_at < self._NODE_STATE_RESCAN_INTERVAL_S
+        ):
+            return self._node_state_cache
+        present: dict[str, int] = {}
+        for model_dir in self.global_settings.get_effective_model_dirs():
+            for model_id, info in discover_models(model_dir).items():
+                present.setdefault(model_id, info.estimated_size)
+        self._node_state_cache = present
+        self._node_state_cache_at = now
+        return present
+
+    def _collect_node_state(self) -> dict[str, Any] | None:
+        """Worker-side node_state payload for the heartbeat (D1).
+
+        Advisory only: any failure returns None (omitting the field, S1's
+        heartbeat shape) rather than raising into HeartbeatSender.
+        """
+        try:
+            return {
+                "total_memory": int(get_total_memory()),
+                "memory_ceiling": self._worker_memory_ceiling(),
+                "models_present": self._scan_models_present(),
+            }
+        except Exception as exc:  # noqa: BLE001 - advisory, never blocks the beat
+            logger.debug("cluster: node_state collection failed: %s", exc)
+            return None
+
     async def _start_heartbeat(
         self, identity: WorkerIdentity, *, interval_s: float | None = None
     ) -> None:
@@ -1016,6 +1130,7 @@ class ClusterManager:
             job_updates_provider=(
                 executor.pending_job_updates if executor is not None else None
             ),
+            node_state_provider=self._collect_node_state,
         )
         await self._heartbeat.start()
 

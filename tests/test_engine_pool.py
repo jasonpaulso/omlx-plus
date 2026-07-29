@@ -420,6 +420,50 @@ class TestEnginePoolStatus:
         assert pool.get_loaded_model_ids() == []
 
 
+class TestHeadCapacity:
+    """S4 D2b: `EnginePool.head_capacity()`, the pool's own placement input."""
+
+    def test_reports_ceiling_current_memory_and_models_present(
+        self, small_mock_model_dir
+    ):
+        from omlx.cluster.placement import NodeCapacity
+
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        pool._current_model_memory = 1234
+
+        capacity = pool.head_capacity()
+
+        assert isinstance(capacity, NodeCapacity)
+        assert capacity.node_id == "head"
+        assert capacity.memory_ceiling == 10 * 1024**3
+        assert capacity.current_model_memory == 1234
+        assert set(capacity.models_present) == {"model-a", "model-b"}
+        assert capacity.models_present["model-a"] > 0
+
+    def test_node_id_is_overridable(self):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        assert pool.head_capacity(node_id="studio").node_id == "studio"
+
+    def test_guard_off_falls_back_to_the_admission_ceiling(self):
+        """A ceiling of 0 (guard off) is "unknown" to placement (D2); the
+        head's own capacity input uses the same fallback cascade a load
+        already does rather than reporting spuriously unknown."""
+        pool = _make_pool(ceiling=None)  # guard off: final ceiling reads 0
+        pool._get_admission_ceiling = lambda: 2500
+
+        capacity = pool.head_capacity()
+
+        assert capacity.memory_ceiling == 2500
+
+    def test_ceiling_stays_zero_with_no_fallback_wired(self):
+        pool = _make_pool(ceiling=None)
+
+        capacity = pool.head_capacity()
+
+        assert capacity.memory_ceiling == 0
+
+
 class TestEngineEntry:
     """Tests for EngineEntry dataclass."""
 

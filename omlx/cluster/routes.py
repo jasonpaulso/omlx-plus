@@ -17,7 +17,7 @@ role gets 404 before any credential is examined.
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -31,7 +31,8 @@ from .auth import (
     require_head_role,
     require_worker_role,
 )
-from .manager import ClusterError, ClusterManager, get_cluster_manager
+from .manager import ClusterError, ClusterManager, get_cluster_manager, get_engine_pool
+from .placement import plan_placement, resolve_placement_inputs, worker_node_capacity
 from .state import Member
 
 
@@ -54,6 +55,12 @@ class HeartbeatRequest(BaseModel):
     # every update to the authenticated member and ignores any member/rank id
     # carried in the update bodies (CL2-07).
     job_updates: list[dict[str, Any]] = Field(default_factory=list)
+    # S4 D1: advisory capacity/inventory. Typed as `Any` (not `dict | None`)
+    # so any shape a worker sends is accepted by the model — the leniency
+    # binding rule (D2b) is enforced by `MemberNodeState.parse`, not by
+    # rejecting the request here; a malformed value must never fail the
+    # heartbeat's liveness path.
+    node_state: Any = None
 
 
 class LocalJoinRequest(BaseModel):
@@ -164,6 +171,38 @@ async def distributed_status() -> dict[str, Any]:
         raise _http_error(exc) from exc
 
 
+@_operator_router.get("/placement")
+async def preview_placement(
+    model: str, prefer: Literal["auto", "local", "distributed"] = "auto"
+) -> dict[str, Any]:
+    """Dry-run placement preview (S4 D3): zero side effects, no formation."""
+    manager = _manager()
+    pool = get_engine_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool is not available")
+    entry = pool.get_entry(model)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Unknown model: {model}")
+    est_size, model_config = resolve_placement_inputs(entry.model_path)
+    head = pool.head_capacity()
+    workers = []
+    for candidate in manager.state.members:
+        live = manager.liveness(candidate.id)
+        node_state = manager.node_state(candidate.id)
+        if live is not None and live.status == "active" and node_state is not None:
+            workers.append(worker_node_capacity(candidate.id, node_state))
+    decision = plan_placement(
+        model_id=model,
+        model_type=entry.model_type,
+        est_size=est_size,
+        model_config=model_config,
+        head=head,
+        workers=workers,
+        prefer=prefer,
+    )
+    return decision.to_dict()
+
+
 @_join_router.post("/join")
 async def join_cluster(request: Request, body: JoinRequest) -> dict[str, Any]:
     """Admit a worker. Address comes from the socket, never from the body."""
@@ -189,7 +228,11 @@ async def heartbeat(
     """Record liveness for the authenticated member."""
     try:
         return _manager().record_heartbeat(
-            member, seq=body.seq, epoch=body.epoch, job_updates=body.job_updates
+            member,
+            seq=body.seq,
+            epoch=body.epoch,
+            job_updates=body.job_updates,
+            node_state=body.node_state,
         )
     except ClusterError as exc:
         raise _http_error(exc) from exc

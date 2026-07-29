@@ -905,6 +905,33 @@ def cluster_command(args):
         )
         return
 
+    if action == "placement":
+        from urllib.parse import urlencode
+
+        if not args.model:
+            print("A model id is required: omlx cluster placement <model>")
+            sys.exit(1)
+        query = urlencode({"model": args.model, "prefer": args.prefer})
+        result = _cluster_request(
+            "GET", f"{base_url}/v1/cluster/placement?{query}", headers
+        )
+        print(f"Placement for {args.model} (prefer={args.prefer}): {result['mode']}")
+        print(
+            f"  world_size={result['world_size']} "
+            f"per_rank_estimate={result['per_rank_estimate']} "
+            f"divisible={result['divisible']} "
+            f"requires_eviction={result['requires_eviction']}"
+        )
+        for node_id, fit in result.get("fits", {}).items():
+            present = result.get("presence", {}).get(node_id)
+            print(
+                f"  {node_id}: ceiling={fit['ceiling']} projected={fit['projected']} "
+                f"ok={fit['ok']} present={present}"
+            )
+        for reason in result.get("reasons", []):
+            print(f"  reason: {reason}")
+        return
+
     # status
     if settings.cluster.role == "worker":
         result = _cluster_request("GET", f"{base_url}/v1/cluster/local/status", headers)
@@ -1320,10 +1347,11 @@ Example directory structure:
     cluster_parser.add_argument(
         "action",
         type=str,
-        choices=["token", "leave", "status", "load", "unload"],
+        choices=["token", "leave", "status", "load", "unload", "placement"],
         help="token: mint (or --revoke) a bootstrap join token (head); "
         "leave: leave the cluster (worker); status: show cluster state; "
-        "load/unload <model>: stand a distributed model up/down (head)",
+        "load/unload <model>: stand a distributed model up/down (head); "
+        "placement <model>: preview local/distributed placement (head)",
     )
     cluster_parser.add_argument(
         "--revoke",
@@ -1335,7 +1363,14 @@ Example directory structure:
         type=str,
         nargs="?",
         default=None,
-        help="With 'load'/'unload': the model id to form or tear down",
+        help="With 'load'/'unload'/'placement': the model id",
+    )
+    cluster_parser.add_argument(
+        "--prefer",
+        type=str,
+        choices=["auto", "local", "distributed"],
+        default="auto",
+        help="With 'placement': steer the preview (default: auto)",
     )
 
     for cluster_client_parser in (join_parser, cluster_parser):

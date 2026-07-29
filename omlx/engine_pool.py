@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from .cluster.placement import NodeCapacity
     from .model_settings import ModelSettingsManager
 
 import mlx.core as mx
@@ -228,6 +229,33 @@ class EnginePool:
             return int(cb())
         except Exception:  # noqa: BLE001
             return 0
+
+    def head_capacity(self, *, node_id: str = "head") -> NodeCapacity:
+        """This pool's own capacity as an S4 D2 placement input.
+
+        Read-only; the only piece of `omlx/cluster/` that ever touches the
+        pool's memory-ceiling internals directly (D2b). Ceiling resolution
+        mirrors the admission cascade a load already uses
+        (`_current_ceiling()` then `_fallback_admission_ceiling()`,
+        `:928-932`) — D2's capacity-unknown rule treats a ceiling of 0 as
+        "unknown", so applying the same fallback here means the head's own
+        placement input is never spuriously unknown just because the guard
+        is disabled.
+        """
+        from .cluster.placement import NodeCapacity
+
+        ceiling = self._current_ceiling()
+        if ceiling <= 0:
+            ceiling = self._fallback_admission_ceiling()
+        models_present = {
+            model_id: entry.estimated_size for model_id, entry in self._entries.items()
+        }
+        return NodeCapacity(
+            node_id=node_id,
+            memory_ceiling=max(0, ceiling),
+            current_model_memory=self._current_model_memory,
+            models_present=models_present,
+        )
 
     def _admission_soft_target(self) -> int:
         """Soft watermark that pre-load eviction targets (#2319).

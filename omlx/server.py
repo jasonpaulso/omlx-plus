@@ -1832,6 +1832,14 @@ def init_server(
         scheduler_config=scheduler_config,
     )
 
+    # S4 D4/D2b: inject the pool accessor the cluster package uses instead
+    # of reaching into `_server_state` (the placement preview endpoint and
+    # a worker's own node_state both need it). Mirrors the admin
+    # `set_admin_getters(pool_getter=...)` precedent.
+    from .cluster.manager import set_engine_pool_getter
+
+    set_engine_pool_getter(lambda: _server_state.engine_pool)
+
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager
     _server_state.engine_pool.discover_models(dir_list, pinned_models)

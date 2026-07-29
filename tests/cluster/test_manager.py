@@ -7,9 +7,10 @@ import pytest
 
 from omlx.cluster.client import ClusterClientError
 from omlx.cluster.credentials import cluster_state_path, load_state, verify_secret
-from omlx.cluster.manager import ClusterError, ClusterManager
+from omlx.cluster.manager import ClusterError, ClusterManager, set_engine_pool_getter
 from omlx.cluster.state import MemberLiveness
 from omlx.cluster.versions import PackageVersion, VersionInfo, collect_versions
+from omlx.model_discovery import discover_models
 
 from .conftest import FakeClusterClient, make_settings, running_manager
 
@@ -215,6 +216,72 @@ class TestHeartbeatAndScrub:
             assert restarted.liveness(member.id).last_seq == 8
             restarted.record_heartbeat(member, seq=1, epoch="e2")
             assert restarted.liveness(member.id).epoch == "e2"
+
+
+class TestNodeState:
+    """S4 D1: advisory node_state riding the heartbeat."""
+
+    NODE_STATE = {
+        "total_memory": 1000,
+        "memory_ceiling": 100,
+        "models_present": {"m": 50},
+    }
+
+    async def test_valid_node_state_is_stored_and_stamped(self, head_settings):
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+
+            manager.record_heartbeat(
+                member, seq=1, epoch="e1", node_state=self.NODE_STATE
+            )
+
+            stored = manager.node_state(member.id)
+            assert stored.total_memory == 1000
+            assert stored.memory_ceiling == 100
+            assert stored.models_present == {"m": 50}
+            assert stored.received_at > 0
+
+    async def test_absent_node_state_is_fail_soft(self, head_settings):
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+
+            manager.record_heartbeat(member, seq=1, epoch="e1")
+
+            assert manager.node_state(member.id) is None
+            assert manager.liveness(member.id).status == "active"
+
+    async def test_malformed_node_state_is_dropped_but_liveness_still_records(
+        self, head_settings
+    ):
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+
+            garbage_values = ("a string", ["a", "list"], {"memory_ceiling": "nope"}, {})
+            for i, garbage in enumerate(garbage_values):
+                manager.record_heartbeat(
+                    member, seq=1, epoch=f"e{i}", node_state=garbage
+                )
+
+            assert manager.node_state(member.id) is None
+            assert manager.liveness(member.id).status == "active"
+
+    async def test_node_state_is_dropped_when_the_member_is_removed(
+        self, head_settings
+    ):
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+            manager.record_heartbeat(
+                member, seq=1, epoch="e1", node_state=self.NODE_STATE
+            )
+            assert manager.node_state(member.id) is not None
+
+            await manager.remove_member(member.id)
+
+            assert manager.node_state(member.id) is None
 
 
 class TestRevocation:
@@ -425,6 +492,87 @@ class TestWorkerSide:
         async with running_manager(worker_settings, client_factory=factory) as manager:
             await manager.local_join("http://10.0.0.1:8000", "join-token")
             assert "s" * 64 not in json.dumps(manager.local_status())
+
+
+class TestWorkerNodeStateCollection:
+    """S4 D1: the worker-side node_state provider wired into the heartbeat."""
+
+    async def test_collect_node_state_combines_ceiling_and_inventory(
+        self, worker_settings, tmp_path, monkeypatch
+    ):
+        model_a = tmp_path / "model-a"
+        model_a.mkdir()
+        (model_a / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_a / "model.safetensors").write_bytes(b"0" * 1024)
+
+        async with running_manager(worker_settings) as manager:
+            monkeypatch.setattr(
+                manager.global_settings, "get_effective_model_dirs", lambda: [tmp_path]
+            )
+            monkeypatch.setattr("omlx.cluster.manager.get_total_memory", lambda: 999)
+
+            class _StubPool:
+                def _current_ceiling(self):
+                    return 123
+
+            set_engine_pool_getter(lambda: _StubPool())
+            try:
+                node_state = manager._collect_node_state()
+            finally:
+                set_engine_pool_getter(None)
+
+            assert node_state["total_memory"] == 999
+            assert node_state["memory_ceiling"] == 123
+            assert "model-a" in node_state["models_present"]
+            assert node_state["models_present"]["model-a"] > 0
+
+    async def test_ceiling_is_zero_with_no_pool_getter_installed(self, worker_settings):
+        async with running_manager(worker_settings) as manager:
+            set_engine_pool_getter(None)
+            assert manager._worker_memory_ceiling() == 0
+
+    async def test_models_present_is_cached_within_the_rescan_window(
+        self, worker_settings, tmp_path, monkeypatch
+    ):
+        model_a = tmp_path / "model-a"
+        model_a.mkdir()
+        (model_a / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model_a / "model.safetensors").write_bytes(b"0" * 1024)
+
+        async with running_manager(worker_settings) as manager:
+            monkeypatch.setattr(
+                manager.global_settings, "get_effective_model_dirs", lambda: [tmp_path]
+            )
+            calls = []
+            real_discover = discover_models
+
+            def counting_discover(path):
+                calls.append(path)
+                return real_discover(path)
+
+            monkeypatch.setattr(
+                "omlx.cluster.manager.discover_models", counting_discover
+            )
+
+            first = manager._scan_models_present()
+            second = manager._scan_models_present()
+
+            assert first == second
+            assert len(calls) == 1
+
+            manager.invalidate_node_state_cache()
+            manager._scan_models_present()
+            assert len(calls) == 2
+
+    async def test_collection_failure_returns_none(self, worker_settings, monkeypatch):
+        async with running_manager(worker_settings) as manager:
+
+            def boom():
+                raise RuntimeError("no total memory")
+
+            monkeypatch.setattr("omlx.cluster.manager.get_total_memory", boom)
+
+            assert manager._collect_node_state() is None
 
 
 class TestSnapshot:

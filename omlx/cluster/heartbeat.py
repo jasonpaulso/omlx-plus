@@ -49,6 +49,7 @@ class HeartbeatSender:
         client_factory: Callable[[str], ClusterClient] | None = None,
         command_sink: Callable[[list[Any]], None] | None = None,
         job_updates_provider: Callable[[], list[dict[str, Any]]] | None = None,
+        node_state_provider: Callable[[], dict[str, Any] | None] | None = None,
     ) -> None:
         self.identity = identity
         self.interval_s = max(0.1, interval_s)
@@ -59,6 +60,10 @@ class HeartbeatSender:
         self._client_factory = client_factory or (lambda url: ClusterClient(url))
         self._command_sink = command_sink
         self._job_updates_provider = job_updates_provider
+        # S4 D1: advisory capacity/inventory attached to every heartbeat. The
+        # provider is best-effort — returning None (or raising, caught below)
+        # simply omits the field, exactly S1's heartbeat shape.
+        self._node_state_provider = node_state_provider
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -86,6 +91,14 @@ class HeartbeatSender:
         payload: dict[str, Any] = {"seq": sent_seq, "epoch": self.epoch}
         if self._job_updates_provider is not None:
             payload["job_updates"] = self._job_updates_provider()
+        if self._node_state_provider is not None:
+            try:
+                node_state = self._node_state_provider()
+            except Exception as exc:  # noqa: BLE001 - advisory, never blocks the beat
+                node_state = None
+                logger.debug("cluster: node_state provider failed: %s", exc)
+            if node_state is not None:
+                payload["node_state"] = node_state
         # CL2-11: the head address was pinned into WorkerIdentity at join and
         # is never changed by a command, so a heartbeat only ever reaches the
         # join-resolved head.
