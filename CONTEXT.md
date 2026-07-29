@@ -84,9 +84,29 @@ more specific than the CLAUDE.md orchestration policy, so no `verifier` was disp
 the evidence as self-reported. The rig numbers are the exception in kind — they come from the
 pinned gate over a raw dump, recomputable without re-running anything.
 
+## S3 slice acceptance — where it actually stands
+
+Checked against `discovery/spec/s3-plan.md` §Acceptance, not against "the rows are green":
+
+| # | Item | State |
+| --- | --- | --- |
+| 1 | Concurrent matrix on the live pair + D7 throughput gate | **met** — 6/6 rows, both backends |
+| 2 | Scheduler dynamics intact, "sole edit = the D4 inert seam" | **met in spirit, deviated in letter** — `87fb0e2e` added `waiting_queue_capacity()` and `preflight_queue_or_raise()` to `scheduler.py`. Recorded then and still true; `df100432` added nothing there |
+| 3 | E4 tax ≤ 10.268 ms/token | **met** — stop condition never fired |
+| 4 | D6 cache seams | **met** |
+| 5 | All unit + cluster tests green at final commit | **met** |
+| 6 | `docs/cluster/s3-measurements.md` readable without re-running | **met** |
+| 7 | **Fresh verifier CONFIRMED at both boundaries (P2 code, P3 rig)** | **NOT met** |
+
+**#7 stays open on acceptance item 7 alone.** Four sessions running, no fresh-context verifier:
+the two dispatched ones went idle without reporting, and since then the session-level "do not
+call the AgentTool unless the user requested it" has been the operative rule. Closing the slice
+needs either that verifier or an explicit decision to waive the item — a call for the user, not
+for a session that would be verifying its own work.
+
 ## Next
 
-1. **#7 — S3 completion.** Row 4 was the last open acceptance item; nothing else blocks it.
+1. **#7 — S3 completion**, blocked only on acceptance item 7 above.
 2. Single-node cold-burst hole (same defect, different accounting) — its own slice.
 3. Optional: dedicated ring-vs-jaccl comparison, driven by the TTFT gap (4.0–12.4 s vs
    1.3–5.8 s), not the throughput ratio.

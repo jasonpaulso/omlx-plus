@@ -484,12 +484,14 @@ over-admitting by a few was immaterial. That reasoning was wrong for a cold
 burst: the gate does not over-admit by a few, it does not engage at all.
 Reservation needs a preflight→submit identity, and the route passes
 `request_id` from an `x-request-id` header that is usually absent, so it is a
-design change rather than a patch. Left for a decision.
+design change rather than a patch. Left for a decision. *(The identity claim
+turned out to be wrong — counted reservations need none. See "Row 4 — CLOSED".)*
 
 **jaccl not run — a decision, not an omission.** The defect is in the head's
 route/engine layer and cannot vary with the collective backend; ring is
 decisive and a jaccl session would cost a fresh-daemon cycle to reproduce a
-foreordained result. If the reservation lands, re-run both.
+foreordained result. If the reservation lands, re-run both. *(Done — both were
+re-run at `df100432`, below.)*
 
 ### Row 4 — CLOSED, both backends, 2026-07-29 at `df100432`
 
