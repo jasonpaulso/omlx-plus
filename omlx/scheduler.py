@@ -1434,6 +1434,36 @@ def waiting_queue_capacity(max_num_seqs: int) -> int:
     return max(max_num_seqs * 4, 32)
 
 
+def total_queue_capacity(max_num_seqs: int) -> int:
+    """Total in-flight capacity before ``add_request`` /
+    ``preflight_queue_or_raise`` reject: the running batch plus a full
+    waiting queue.
+
+    ``preflight_queue_or_raise`` claims a reservation for a request that has
+    not reached ``add_request`` yet — see ``Scheduler._reserved``. A
+    reservation is not a waiting-queue entry, it's a placeholder for one, so
+    it only adds up correctly measured against total occupancy (running +
+    prefilling + waiting + reservations); comparing it to the waiting-only
+    cap would double-count once the request actually lands in
+    ``self.waiting``. Mirrors ``omlx.cluster.scheduler_config.
+    rank_inflight_capacity``, which computes the same ceiling for a rank-0
+    scheduler the head engine can't call this directly to ask.
+    """
+    return max_num_seqs + waiting_queue_capacity(max_num_seqs)
+
+
+# How long a preflight reservation stays counted if its request never reaches
+# add_request's insert into self.waiting. Mirrors
+# ``omlx.cluster.engine._RESERVATION_TTL_S``: covers a request abandoned
+# between preflight and submission (a client disconnect, a route raising in
+# between) — add_request itself releases explicitly on every exit path (see
+# ``Scheduler._release_reservation``), so this backstop only matters for a
+# request that never reaches add_request at all. Long enough that no real
+# preflight->submit gap (chat templating + encode) expires early; short
+# enough that a leak cannot hold slots for a meaningful part of a burst.
+_RESERVATION_TTL_S = 30.0
+
+
 @dataclass
 class SchedulerOutput:
     """
@@ -1647,6 +1677,23 @@ class Scheduler:
         # Chunked prefill queue: requests whose prefill spans multiple steps.
         # Populated when chunked_prefill=True and prompt exceeds prefill_step_size.
         self.prefilling: deque[Request] = deque()
+
+        # Preflight reservations: monotonic expiry deadlines for requests
+        # that cleared preflight_queue_or_raise but haven't reached
+        # add_request's insert into self.waiting yet. Counting, not identity
+        # — see _release_reservation.
+        #
+        # Needs a lock, unlike omlx.cluster.engine's equivalent deque:
+        # preflight_queue_or_raise runs synchronously on the asyncio loop
+        # thread (BaseEngine._preflight_queue calls it directly, no executor
+        # hop), while add_request runs on the dedicated single-worker MLX
+        # executor thread (engine_core.py: run_in_executor(self._mlx_executor,
+        # self.scheduler.add_request, request)). Those are two different OS
+        # threads, so a sweep-then-pop on one can race a pop on the other and
+        # hit an empty deque mid-sweep without one — individual deque ops are
+        # GIL-atomic, but that compound sequence isn't.
+        self._reserved: deque[float] = deque()
+        self._reservation_lock = threading.Lock()
         self._prefill_states: dict[str, _PrefillState] = {}
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
@@ -6759,32 +6806,93 @@ class Scheduler:
         self._try_specprefill_scoring(request)
         self._prefix_cache_prepared.add(request.request_id)
 
+    def _reserved_slots(self) -> int:
+        """Live preflight reservations, expiring stale ones first.
+
+        Mirrors ``ClusterEngine._reserved_slots``, plus a lock — see the
+        threading note on ``self._reserved`` in ``__init__``.
+        """
+        now = time.monotonic()
+        with self._reservation_lock:
+            while self._reserved and self._reserved[0] <= now:
+                self._reserved.popleft()
+            return len(self._reserved)
+
+    def _release_reservation(self) -> None:
+        """Give back one slot claimed by ``preflight_queue_or_raise``.
+
+        Counting, not identity: reservations are interchangeable, so the
+        oldest is dropped rather than a specific request's. An
+        ``add_request`` call that never preflighted (an internal caller, or a
+        test driving the scheduler directly) therefore releases nothing when
+        the deque is empty, and at worst returns a slot one request early —
+        which relaxes the gate toward pre-reservation behaviour instead of
+        leaking a slot no request owns.
+        """
+        with self._reservation_lock:
+            if self._reserved:
+                self._reserved.popleft()
+
+    def _queue_occupancy(self) -> int:
+        """Running + prefilling + waiting + live preflight reservations.
+
+        The total-occupancy figure both ``preflight_queue_or_raise`` and
+        ``add_request`` gate on against ``total_queue_capacity``. See that
+        function for why a reservation only adds up correctly measured this
+        way.
+        """
+        return (
+            self._num_admitted_requests() + len(self.waiting) + self._reserved_slots()
+        )
+
     def add_request(self, request: Request) -> None:
         """
         Add a new request to the scheduler.
 
-        Raises SchedulerQueueFullError when the waiting queue is at or above
-        the configured cap (max(max_num_seqs * 4, 32)). Server layer maps
+        Raises SchedulerQueueFullError when total occupancy (running +
+        prefilling + waiting + live preflight reservations) is at or above
+        the configured cap (``total_queue_capacity``). Server layer maps
         this to HTTP 503 + Retry-After.
 
         Args:
             request: The request to add
         """
+        # Release the reservation preflight_queue_or_raise claimed for this
+        # request — a no-op if none was claimed, see _release_reservation.
+        # Must happen before the occupancy check below, not after: by the
+        # time add_request runs, this request is no longer "in flight toward
+        # insertion" (it is either about to land in self.waiting right now,
+        # or about to fail before it gets there), so its own reservation
+        # must not also count as outstanding occupancy in the check it is
+        # about to run. Releasing at the end instead double-counts every
+        # admitted request against itself — a burst that exactly fills
+        # capacity at preflight (reservations == capacity) would then have
+        # every add_request call see occupancy already at the cap and
+        # reject itself, turning "admitted, please proceed" into "the whole
+        # burst 503s at submission", which is worse than the defect this
+        # reservation exists to fix.
+        self._release_reservation()
+
         if request.request_id in self.requests:
             raise ValueError(f"Request {request.request_id} already exists")
 
-        # Cap the waiting queue so client-side polling can't accumulate
+        # Cap total occupancy so client-side polling can't accumulate
         # unbounded work and the scheduler can apply backpressure via 503.
         # Streaming requests are gated earlier, in preflight_queue_or_raise —
         # by the time we get here on that path the response may already be
         # committed, so this check is the authority but not the whole story.
-        max_waiting = waiting_queue_capacity(self.config.max_num_seqs)
-        if len(self.waiting) >= max_waiting:
+        # Total form, not waiting-only: a reservation claimed by preflight
+        # isn't a waiting-queue entry, so it only adds up correctly measured
+        # against total occupancy — see total_queue_capacity.
+        max_num_seqs = self.config.max_num_seqs
+        capacity = total_queue_capacity(max_num_seqs)
+        occupancy = self._queue_occupancy()
+        if occupancy >= capacity:
             from .exceptions import SchedulerQueueFullError
 
             raise SchedulerQueueFullError(
-                current_depth=len(self.waiting),
-                max_depth=max_waiting,
+                current_depth=max(0, occupancy - max_num_seqs),
+                max_depth=waiting_queue_capacity(max_num_seqs),
             )
 
         # Tokenize if needed
@@ -8068,7 +8176,7 @@ class Scheduler:
         )
 
     def preflight_queue_or_raise(self) -> None:
-        """Pre-StreamingResponse waiting-queue check.
+        """Pre-StreamingResponse total-occupancy check, with a reservation.
 
         ``add_request`` is reached from inside the route's response generator
         on the streaming path (``batched.py:817``), and starlette has already
@@ -8079,6 +8187,21 @@ class Scheduler:
         ahead of the commit point, where ``scheduler_queue_full_handler`` can
         still answer.
 
+        Gates on total occupancy (running + prefilling + waiting + live
+        reservations) against ``total_queue_capacity``, not the waiting
+        queue alone. ``self.waiting`` is only populated inside
+        ``add_request``, which the streaming path only reaches once
+        starlette starts iterating the response generator — i.e. after the
+        route has already committed to the ``StreamingResponse``. On a cold
+        burst every request in the burst preflights before any of them
+        reaches ``add_request``, so a waiting-only check reads an empty
+        queue for the whole burst and never engages — that was the gap this
+        method now closes. Claiming a reservation here — released by the
+        matching ``add_request`` once it either lands the request in
+        ``self.waiting`` or fails trying (see ``_release_reservation``) —
+        makes the check see the burst instead of a queue that only starts
+        filling after every preflight in it has already passed.
+
         Deliberately independent of the memory guard: unlike
         ``preflight_or_raise`` there is no enabling flag to short-circuit on,
         so this fires whatever the memory settings are. ``add_request``
@@ -8086,15 +8209,22 @@ class Scheduler:
         racy, so a burst can still overshoot by a few requests and fall back
         to the in-stream path.
         """
-        max_waiting = waiting_queue_capacity(self.config.max_num_seqs)
-        depth = len(self.waiting)
-        if depth >= max_waiting:
+        max_num_seqs = self.config.max_num_seqs
+        capacity = total_queue_capacity(max_num_seqs)
+        occupancy = self._queue_occupancy()
+        if occupancy >= capacity:
             from .exceptions import SchedulerQueueFullError
 
             raise SchedulerQueueFullError(
-                current_depth=depth,
-                max_depth=max_waiting,
+                current_depth=max(0, occupancy - max_num_seqs),
+                max_depth=waiting_queue_capacity(max_num_seqs),
             )
+        # Claim the slot in the same synchronous frame that checked for it —
+        # preflight_queue_or_raise never awaits, so no other preflight call
+        # on this (event loop) thread can see this check without also
+        # seeing this claim.
+        with self._reservation_lock:
+            self._reserved.append(time.monotonic() + _RESERVATION_TTL_S)
 
     def preflight_or_raise(
         self,

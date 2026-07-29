@@ -837,12 +837,23 @@ class TestPreflightQueueThroughTheEngines:
 
     @staticmethod
     def _saturated_scheduler():
+        """A scheduler at the total-occupancy cap: a full running batch AND
+        a full waiting queue. The cap gates on running + prefilling +
+        waiting + live preflight reservations together (see
+        ``omlx.scheduler.total_queue_capacity``), so waiting alone at its
+        own cap is no longer "full" — running must be saturated too.
+        """
         from omlx.exceptions import SchedulerQueueFullError
         from omlx.scheduler import waiting_queue_capacity
 
         scheduler = _make_scheduler()
         scheduler._prefill_memory_guard = False
-        for i in range(waiting_queue_capacity(scheduler.config.max_num_seqs)):
+        max_num_seqs = scheduler.config.max_num_seqs
+        for i in range(max_num_seqs):
+            request = MagicMock()
+            request.request_id = f"running-{i}"
+            scheduler.running[request.request_id] = request
+        for i in range(waiting_queue_capacity(max_num_seqs)):
             request = MagicMock()
             request.request_id = f"waiting-{i}"
             scheduler.waiting.append(request)
