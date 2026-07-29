@@ -60,8 +60,9 @@ def stream_request(url, api_key, body, label, abort_after=None, timeout=600):
         "status": None,
         "error": None,
         "submit_t": CLOCK(),
-        "arrivals": [],  # perf_counter at each content-bearing chunk
+        "arrivals": [],  # perf_counter at each token-bearing chunk
         "text_len": 0,
+        "reasoning_len": 0,
         "usage": None,
         "aborted": False,
         "finish_reason": None,
@@ -89,12 +90,23 @@ def stream_request(url, api_key, body, label, abort_after=None, timeout=600):
             if not choices:
                 continue
             delta = choices[0].get("delta") or {}
+            # Reasoning models (MiniMax-M2.7) stream decoded tokens into
+            # `reasoning_content` and emit `content` only at the end. Both are
+            # tokens produced by the batch, which is exactly what the D7 decode
+            # gate measures, so both count as arrivals -- counting `content`
+            # alone records one arrival for a 128-token generation and makes
+            # the baseline span zero.
             piece = delta.get("content")
+            if piece:
+                rec["text_len"] += len(piece)
+            else:
+                piece = delta.get("reasoning_content")
+                if piece:
+                    rec["reasoning_len"] += len(piece)
             if choices[0].get("finish_reason"):
                 rec["finish_reason"] = choices[0]["finish_reason"]
             if piece:
                 rec["arrivals"].append(CLOCK())
-                rec["text_len"] += len(piece)
                 if abort_after is not None and len(rec["arrivals"]) >= abort_after:
                     rec["aborted"] = True
                     break
