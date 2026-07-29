@@ -337,9 +337,22 @@ def done_frame(
     return frame
 
 
-def error_frame(request_id: str, error: str) -> dict[str, Any]:
-    """A terminal failure frame for one request."""
-    return {"ok": False, "request_id": request_id, "error": error}
+def error_frame(
+    request_id: str, error: str, *, code: str | None = None, **extra: Any
+) -> dict[str, Any]:
+    """A terminal failure frame for one request.
+
+    ``code`` is a closed, machine-readable classification (S3 D5): the only
+    value defined so far is ``"queue_full"``, which the daemon-side engine
+    maps back to ``SchedulerQueueFullError`` so the existing HTTP 503 path
+    fires. ``extra`` carries whatever that code needs reconstructed on the
+    other end (``current_depth``/``max_depth`` for ``queue_full``).
+    """
+    frame: dict[str, Any] = {"ok": False, "request_id": request_id, "error": error}
+    if code is not None:
+        frame["code"] = code
+    frame.update(extra)
+    return frame
 
 
 # -- the head->worker command schema (CL2-04) --------------------------------

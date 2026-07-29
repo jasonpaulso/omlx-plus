@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The head-daemon engine for a tensor-parallel formation (D6).
+"""The head-daemon engine for a tensor-parallel formation (D5/D6).
 
 ``ClusterEngine`` is a :class:`BatchedEngine` whose weights do not live in this
 process: the model is sharded across the rank child processes, and this engine
@@ -9,9 +9,13 @@ shaping stay in the inherited :class:`BatchedEngine` layer; the only things this
 subclass replaces are the four generation entry points, which route a templated
 token stream through the rank-0 pipe instead of a local scheduler.
 
-Single-request rule (S2): one active generation at a time, FIFO — the rank loop
-serves one request, and S3 replaces this with real scheduler integration. There
-is no ``RequestOutputCollector`` and no ``EngineCore``; this engine *is* the
+Multiplexing (S3 D5): rank 0 now runs the real ``Scheduler`` and can drive
+several requests concurrently, so this engine is a multiplexing pipe client,
+not a FIFO gate. One writer lock (``LocalCluster.write``'s own) serialises
+stdin; a single background reader task demultiplexes rank 0's one reply pipe
+by ``request_id`` into a per-request ``asyncio.Queue``, so concurrent HTTP
+streams genuinely interleave instead of queueing behind each other. There is
+no ``RequestOutputCollector`` and no ``EngineCore``; this engine *is* the
 serving layer for a distributed model.
 """
 
@@ -21,12 +25,14 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from ..api.utils import clean_special_tokens
 from ..engine.base import GenerationOutput
 from ..engine.batched import BatchedEngine
+from ..exceptions import SchedulerQueueFullError
 from .launcher import LocalCluster
 from .protocol import GenerationSpec
 
@@ -34,8 +40,44 @@ logger = logging.getLogger(__name__)
 
 # Idle timeout for a single reply frame from rank 0 (salvage generate-idle
 # value): a rank that dies mid-collective leaves rank 0 blocked, and this is
-# what turns that into a clean error instead of a hang.
+# what turns that into a clean error instead of a hang. Also the demux
+# reader's poll interval while genuinely idle -- it just loops again.
 GENERATE_IDLE_TIMEOUT_S = 600.0
+
+# S3 non-goal (spec S3): VLM and SpecPrefill requests are rejected with a
+# clear error rather than silently generating text-only / unsparsified output
+# -- there is no image encoding or draft-model wiring in a rank process.
+_MULTIMODAL_CONTENT_TYPES = frozenset(
+    {"image_url", "input_image", "image", "input_audio", "video_url"}
+)
+
+
+class ClusterNonGoalError(ValueError):
+    """A request touched a feature S3 explicitly does not support on a
+    distributed instance (VLM, SpecPrefill/spec-decode). Distinct from
+    ``SchedulerQueueFullError``: there is nothing to retry.
+    """
+
+
+def _reject_if_multimodal(messages: list[dict[str, Any]]) -> None:
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get("type") in _MULTIMODAL_CONTENT_TYPES:
+                raise ClusterNonGoalError(
+                    "VLM requests are not supported on a distributed cluster "
+                    "instance (S3 non-goal); serve this model single-node."
+                )
+
+
+def _reject_if_specprefill(kwargs: dict[str, Any]) -> None:
+    if kwargs.get("specprefill"):
+        raise ClusterNonGoalError(
+            "SpecPrefill is not supported on a distributed cluster instance "
+            "(S3 non-goal); no draft model is wired into a rank process."
+        )
 
 
 def _final_trim(text: str, stops: list[str]) -> str:
@@ -44,6 +86,21 @@ def _final_trim(text: str, stops: list[str]) -> str:
         if stop and text.endswith(stop):
             return text[: -len(stop)]
     return text
+
+
+def _error_from_frame(frame: dict[str, Any]) -> Exception:
+    """Translate a rank-0 error frame into the typed exception it means.
+
+    ``code == "queue_full"`` reconstructs ``SchedulerQueueFullError`` so it
+    propagates through the same registered FastAPI handler single-node uses
+    (D5) -- everything else is a generic rank/generation failure.
+    """
+    if frame.get("code") == "queue_full":
+        return SchedulerQueueFullError(
+            current_depth=int(frame.get("current_depth", 0)),
+            max_depth=int(frame.get("max_depth", 0)),
+        )
+    return RuntimeError(frame.get("error") or "rank error")
 
 
 class ClusterEngine(BatchedEngine):
@@ -61,7 +118,12 @@ class ClusterEngine(BatchedEngine):
         self._cluster = cluster
         self._resolved_path = resolved_path or model_name
         self._model_type_value: str | None = None
-        self._request_lock = asyncio.Lock()
+        # D5 multiplexing: one demux reader task fans rank 0's single reply
+        # pipe out to a per-request queue by request_id; the writer side
+        # serialises on LocalCluster's own stdin lock (write() takes it).
+        self._pending: dict[str, asyncio.Queue[Any]] = {}
+        self._reader_task: asyncio.Task[None] | None = None
+        self._reader_error: BaseException | None = None
         # Last request's D9 coordination-tax summary, from rank 0's done frame.
         self._last_tax: dict[str, Any] | None = None
 
@@ -107,21 +169,35 @@ class ClusterEngine(BatchedEngine):
         if cluster is not None:
             await asyncio.get_running_loop().run_in_executor(None, cluster.stop)
         self._loaded = False
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            self._reader_task = None
 
     @property
     def model_type(self) -> str | None:
         return self._model_type_value
 
     def get_stats(self) -> dict[str, Any]:
+        # D5 named a live on-demand "stats" op over the pipe; that would mean
+        # a synchronous round trip inside a method every caller invokes
+        # directly off the event loop (routes.py's /state handler, formation
+        # .snapshot() -- neither offloads to an executor), which would block
+        # or (since the demux reader that could answer it also only runs on
+        # that same loop) deadlock. get_stats() stays purely local instead;
+        # `num_active_requests` is exact (it's just the demux's own pending
+        # count) and needs no round trip. The rank-0 "stats" op still exists
+        # on the wire (rank_worker.py) for a future async-safe caller.
         return {
             "engine_type": "cluster-distributed",
             "model_name": self._model_name,
             "loaded": self._loaded,
             "world_size": self._cluster.world_size,
             # The backend the formation actually formed on (D9 negotiated
-            # backend), and the last request's coordination-tax summary.
+            # backend), the last completed request's coordination-tax
+            # summary, and how many requests the scheduler is juggling now.
             "negotiated_backend": self._cluster.backend,
             "last_tax": self._last_tax,
+            "num_active_requests": len(self._pending),
         }
 
     def get_cache_stats(self) -> dict[str, Any] | None:
@@ -130,15 +206,20 @@ class ClusterEngine(BatchedEngine):
         return None
 
     def has_active_requests(self) -> bool:
-        return self._request_lock.locked()
+        return bool(self._pending)
 
-    async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
+    async def preflight_chat(
+        self, messages: list[dict[str, Any]] | None = None, *args: Any, **kwargs: Any
+    ) -> None:
         # No local scheduler and no prefill memory guard on the distributed
-        # path — the base no-op is the correct behaviour here.
-        return None
+        # path -- but S3's non-goals (VLM, SpecPrefill) are cheap to catch
+        # here, before the route wraps the response in a StreamingResponse.
+        if messages:
+            _reject_if_multimodal(messages)
+        _reject_if_specprefill(kwargs)
 
     async def preflight_completion(self, *args: Any, **kwargs: Any) -> None:
-        return None
+        _reject_if_specprefill(kwargs)
 
     # ---- generation ------------------------------------------------------
 
@@ -193,6 +274,8 @@ class ClusterEngine(BatchedEngine):
     ) -> AsyncIterator[GenerationOutput]:
         if not self._loaded:
             await self.start()
+        _reject_if_specprefill(kwargs)
+        await self._ensure_reader()
 
         request_id = str(kwargs.get("request_id") or uuid.uuid4())
         spec = self._build_spec(
@@ -212,60 +295,129 @@ class ClusterEngine(BatchedEngine):
             yield GenerationOutput(text="", finished=True, finish_reason="stop")
             return
 
-        payload = {"op": "generate", "spec": spec.to_dict()}
         prompt_tokens = len(spec.prompt_ids)
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        # Own queue submitted+consumed here (D5): no per-request lock, so
+        # concurrent stream_generate calls interleave naturally, each reading
+        # only the frames the demux routed to its own request_id.
+        self._pending[request_id] = queue
 
-        # FIFO: one active generation through the rank loop at a time (S2).
-        async with self._request_lock:
-            frames = self._pump(payload)
-            text = ""
-            completion = 0
-            finished_normally = False
-            try:
-                async for frame in frames:
-                    if not frame.get("ok", False):
-                        raise RuntimeError(frame.get("error") or "rank error")
-                    if frame.get("done"):
-                        finished_normally = True
-                        self._last_tax = frame.get("tax")
-                        # Stop detection ran in the rank loop; a final trim in
-                        # the engine (D6) strips any trailing stop string left
-                        # on the terminal text — a no-op when the rank already
-                        # removed it.
-                        final_text = _final_trim(frame.get("text", text), spec.stop)
-                        yield GenerationOutput(
-                            text=final_text,
-                            new_text="",
-                            prompt_tokens=int(
-                                frame.get("prompt_tokens", prompt_tokens)
-                            ),
-                            completion_tokens=int(
-                                frame.get("completion_tokens", completion)
-                            ),
-                            finished=True,
-                            finish_reason=frame.get("finish_reason", "stop"),
-                        )
-                        break
-                    chunk = frame.get("chunk", "")
-                    text += chunk
-                    completion = int(frame.get("tokens", completion))
-                    yield GenerationOutput(
-                        text=text,
-                        new_text=chunk,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion,
-                        finished=False,
-                        finish_reason=None,
+        loop = asyncio.get_running_loop()
+        payload = {"op": "generate", "spec": spec.to_dict()}
+        try:
+            await loop.run_in_executor(None, self._cluster.write, payload)
+        except Exception:
+            self._pending.pop(request_id, None)
+            raise
+
+        text = ""
+        completion = 0
+        finished_normally = False
+        try:
+            while True:
+                item = await queue.get()
+                if isinstance(item, BaseException):
+                    raise item
+                frame = item
+                if not frame.get("ok", False):
+                    raise _error_from_frame(frame)
+                if frame.get("done"):
+                    finished_normally = True
+                    self._last_tax = frame.get("tax")
+                    # Stop detection ran in the scheduler; a final trim in
+                    # the engine (D6) strips any trailing stop string left
+                    # on the terminal text — a no-op when it was already
+                    # removed. clean_special_tokens matches BatchedEngine's
+                    # own finalization (batched.py:748,827) so the terminal
+                    # text is identical to single-node's, not just the token
+                    # stream (S3 Acceptance 1's greedy-parity test also
+                    # compares rendered text, not only tokens).
+                    final_text = clean_special_tokens(
+                        _final_trim(frame.get("text", text), spec.stop)
                     )
-            except GeneratorExit:
-                # Client disconnected: forward the abort over the rank-0 control
-                # pipe (it lands as a delta at the next step) and re-raise.
+                    yield GenerationOutput(
+                        text=final_text,
+                        new_text="",
+                        prompt_tokens=int(frame.get("prompt_tokens", prompt_tokens)),
+                        completion_tokens=int(
+                            frame.get("completion_tokens", completion)
+                        ),
+                        finished=True,
+                        finish_reason=frame.get("finish_reason", "stop"),
+                    )
+                    break
+                chunk = frame.get("chunk", "")
+                text += chunk
+                completion = int(frame.get("tokens", completion))
+                yield GenerationOutput(
+                    text=text,
+                    new_text=chunk,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion,
+                    finished=False,
+                    finish_reason=None,
+                )
+        except GeneratorExit:
+            # Client disconnected: forward the abort over the rank-0 control
+            # pipe (it lands as a delta at the next step) and re-raise.
+            self._cluster.abort(request_id)
+            raise
+        finally:
+            if not finished_normally:
                 self._cluster.abort(request_id)
-                raise
-            finally:
-                if not finished_normally:
-                    self._cluster.abort(request_id)
-                await frames.aclose()
+            self._pending.pop(request_id, None)
+
+    # ---- D5 demux ----------------------------------------------------------
+
+    async def _ensure_reader(self) -> None:
+        """Start the single background reader task, once, lazily.
+
+        Every ``stream_generate`` call shares this one task: rank 0 has
+        exactly one reply pipe, so exactly one reader may ever be draining it
+        (a second reader would steal frames belonging to the first).
+        """
+        if self._reader_task is not None:
+            return
+        if self._reader_error is not None:
+            raise self._reader_error
+        loop = asyncio.get_running_loop()
+        self._reader_task = loop.create_task(self._reader_loop())
+
+    async def _reader_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                frame = await loop.run_in_executor(
+                    None, self._cluster.read_reply, GENERATE_IDLE_TIMEOUT_S
+                )
+            except Exception as exc:  # noqa: BLE001 - fanned out below
+                logger.warning("cluster: reply pipe reader stopped: %s", exc)
+                self._reader_error = exc
+                self._fail_all_pending(exc)
+                return
+            if frame is None:
+                # Idle timeout with the pipe still open: nothing to route,
+                # keep waiting for the next frame.
+                continue
+            self._dispatch(frame)
+
+    def _dispatch(self, frame: dict[str, Any]) -> None:
+        rid = frame.get("request_id")
+        if not rid:
+            # "ready" (consumed by wait_ready() before this reader ever
+            # starts) and the unknown-op error frame both carry no
+            # request_id; nothing here is waiting on either.
+            logger.debug("cluster: dropping request-id-less frame: %s", frame)
+            return
+        queue = self._pending.get(rid)
+        if queue is None:
+            logger.debug("cluster: dropping frame for unknown request %s", rid)
+            return
+        queue.put_nowait(frame)
+
+    def _fail_all_pending(self, exc: BaseException) -> None:
+        for queue in list(self._pending.values()):
+            queue.put_nowait(exc)
 
     def _build_spec(
         self,
@@ -303,42 +455,3 @@ class ClusterEngine(BatchedEngine):
             seed=kwargs.get("seed"),
             request_id=request_id,
         )
-
-    async def _pump(
-        self, payload: dict[str, Any]
-    ) -> AsyncGenerator[dict[str, Any], None]:
-        """Drive the blocking rank-0 pipe generator from the event loop.
-
-        ``LocalCluster.stream`` is a synchronous select-loop generator; running
-        it on a worker thread and handing frames back over an asyncio queue
-        keeps the event loop free while a decode step blocks in a collective.
-        """
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[Any] = asyncio.Queue()
-        sentinel = object()
-
-        def run() -> None:
-            try:
-                for frame in self._cluster.stream(
-                    payload, timeout=GENERATE_IDLE_TIMEOUT_S
-                ):
-                    loop.call_soon_threadsafe(queue.put_nowait, frame)
-            except Exception as exc:  # noqa: BLE001 - surfaced to the consumer
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, sentinel)
-
-        worker = loop.run_in_executor(None, run)
-        try:
-            while True:
-                item = await queue.get()
-                if item is sentinel:
-                    break
-                if isinstance(item, BaseException):
-                    raise item
-                yield item
-        finally:
-            # Let the worker thread drain the generator to completion (after an
-            # abort, rank 0 still emits its terminal frame) so the pipe is clean
-            # for the next request.
-            await worker

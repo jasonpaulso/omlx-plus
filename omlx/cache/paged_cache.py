@@ -80,6 +80,7 @@ def compute_block_hash(
     token_ids: List[int],
     extra_keys: Optional[Tuple[Any, ...]] = None,
     model_name: Optional[str] = None,
+    shard_config: Optional[str] = None,
 ) -> BlockHash:
     """
     Compute hash for a block based on its content and parent block.
@@ -92,6 +93,10 @@ def compute_block_hash(
         token_ids: Token IDs in this block
         extra_keys: Additional keys (e.g., LoRA, multimodal)
         model_name: Model name for cache isolation between different models
+        shard_config: Cluster shard identity (e.g. "2xring"), for isolating
+            distributed-instance cache entries from single-node ones (S3
+            D6(a)). ``None`` everywhere today (reserved, not yet consumed) and
+            must produce a byte-identical hash to omitting this argument.
 
     Returns:
         Content-based hash for this block
@@ -108,6 +113,9 @@ def compute_block_hash(
     else:
         # Use fixed seed for reproducibility
         hasher.update(b"omlx-root")
+
+    if shard_config:
+        hasher.update(shard_config.encode("utf-8"))
 
     # Include token content
     hasher.update(bytes(str(tuple(token_ids)), "utf-8"))
@@ -1093,6 +1101,7 @@ class PagedCacheManager(CacheManager):
         tokens: List[int],
         parent_hash: Optional[BlockHash] = None,
         extra_keys: Optional[Tuple[Any, ...]] = None,
+        shard_config: Optional[str] = None,
     ) -> Optional[CacheBlock]:
         """
         Find a cached block matching the given tokens using chain hash.
@@ -1101,6 +1110,7 @@ class PagedCacheManager(CacheManager):
             tokens: Token IDs to look up
             parent_hash: Hash of the parent block (for chain), or None for first block
             extra_keys: Additional keys for hash (e.g., VLM image hash)
+            shard_config: Cluster shard identity (S3 D6(a) reserved seam)
 
         Returns:
             Cached block if found, None otherwise
@@ -1111,7 +1121,7 @@ class PagedCacheManager(CacheManager):
         with self._lock:
             block_hash = compute_block_hash(
                 parent_hash, tokens, extra_keys=extra_keys,
-                model_name=self.model_name,
+                model_name=self.model_name, shard_config=shard_config,
             )
             block = self.cached_block_hash_to_block.get_block(block_hash)
             if block:

@@ -87,9 +87,15 @@ def test_group_forms_decodes_and_reports_tax():
         assert done["completion_tokens"] == 8
         # Every earlier frame is a streamed chunk for the same request.
         assert all(f["request_id"] == "r1" for f in frames)
-        # D9 tax accounting is present and per-step.
+        # D9 tax accounting is present. S3 replaces S2's decode-step-only
+        # count with LeaderModelProxy's global per-broadcast count (D7):
+        # every model invocation broadcasts an op, not just decode steps, so
+        # 8 completion tokens cost >= 8 broadcasts (a standalone prefill op
+        # for this short prompt, plus TPBatchGenerator.insert()'s admission
+        # delta-forward, plus one op per decode step -- see s3-plan.md D2/D7
+        # and the interface audit's admission-delta finding).
         tax = done["tax"]
-        assert tax["steps"] == 8
+        assert tax["steps"] >= 8
         assert tax["avg_ms"] >= 0.0
 
 

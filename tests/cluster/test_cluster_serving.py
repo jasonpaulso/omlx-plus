@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import random
 from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 import pytest
@@ -25,6 +26,7 @@ import pytest
 from omlx.cluster import launcher
 from omlx.cluster.client import ClusterClient
 from omlx.cluster.manager import ClusterManager, set_cluster_manager
+from omlx.exceptions import SchedulerQueueFullError
 
 from .conftest import build_app, make_settings
 
@@ -224,3 +226,165 @@ async def test_rank_death_surfaces_clean_error(tmp_path):
                 if index == 3:
                     for entry in leader.ranks:
                         entry.process.kill()
+
+
+# -- S3 P2: real scheduler-driven concurrent batching -------------------------
+#
+# Every test below drives ``engine.stream_generate``/``stream_chat`` directly
+# against the live formation, the same idiom the rest of this file already
+# uses (``test_full_lifecycle`` etc.) -- there is no HTTP route/engine-pool
+# wiring anywhere in this file (only the control-plane join/heartbeat goes
+# over ASGI), so these prove the D5 demux and the rank-0 Scheduler's real
+# admission/backpressure over the actual pipe, not a mocked one.
+
+
+async def test_two_concurrent_streams_interleave(tmp_path):
+    async with two_node(tmp_path) as (head, worker):
+        await asyncio.wait_for(head.formation.load(MODEL), LOAD_TIMEOUT_S)
+        engine = head.formation.active_engine(MODEL)
+        assert engine is not None
+
+        async def collect(request_id, prompt):
+            return [
+                o
+                async for o in engine.stream_generate(
+                    prompt,
+                    max_tokens=12,
+                    temperature=0.0,
+                    request_id=request_id,
+                )
+            ]
+
+        outputs_a, outputs_b = await asyncio.wait_for(
+            asyncio.gather(
+                collect("interleave-a", "Count from one: one, two,"),
+                collect("interleave-b", "The capital of France is"),
+            ),
+            GEN_TIMEOUT_S,
+        )
+        assert outputs_a and outputs_a[-1].finished
+        assert outputs_b and outputs_b[-1].finished
+        assert outputs_a[-1].completion_tokens > 0
+        assert outputs_b[-1].completion_tokens > 0
+        # Genuinely two different completions -- the demux did not cross the
+        # streams (a request seeing the other's tokens would corrupt this).
+        assert outputs_a[-1].text != outputs_b[-1].text
+
+
+async def test_abort_one_stream_other_completes(tmp_path):
+    async with two_node(tmp_path) as (head, worker):
+        await asyncio.wait_for(head.formation.load(MODEL), LOAD_TIMEOUT_S)
+        engine = head.formation.active_engine(MODEL)
+        assert engine is not None
+
+        keep_stream = engine.stream_generate(
+            "The capital of France is",
+            max_tokens=16,
+            temperature=0.0,
+            request_id="keep-alive",
+        )
+        abort_stream = engine.stream_generate(
+            "Tell me a very long story",
+            max_tokens=256,
+            temperature=0.0,
+            request_id="abort-target",
+        )
+
+        # Admit both concurrently (first token/chunk each) before acting, so
+        # the abort genuinely lands on a request the scheduler is running
+        # alongside the one that will keep going.
+        await asyncio.wait_for(
+            asyncio.gather(keep_stream.__anext__(), abort_stream.__anext__()),
+            GEN_TIMEOUT_S,
+        )
+        await asyncio.wait_for(
+            abort_stream.aclose(), GEN_TIMEOUT_S
+        )  # client disconnect
+
+        kept = []
+        async for o in keep_stream:
+            kept.append(o)
+        assert kept and kept[-1].finished
+        assert kept[-1].completion_tokens > 0
+
+
+async def test_active_request_count_reflects_live_formation(tmp_path):
+    async with two_node(tmp_path) as (head, worker):
+        await asyncio.wait_for(head.formation.load(MODEL), LOAD_TIMEOUT_S)
+        engine = head.formation.active_engine(MODEL)
+        assert engine is not None
+        assert engine.has_active_requests() is False
+        assert engine.get_stats()["num_active_requests"] == 0
+
+        stream = engine.stream_generate(
+            "Tell me a very long story",
+            max_tokens=64,
+            temperature=0.0,
+            request_id="active-count",
+        )
+        await asyncio.wait_for(stream.__anext__(), GEN_TIMEOUT_S)
+        assert engine.has_active_requests() is True
+        assert engine.get_stats()["num_active_requests"] == 1
+
+        await stream.aclose()
+        assert engine.has_active_requests() is False
+        assert engine.get_stats()["num_active_requests"] == 0
+
+
+async def test_queue_full_rejects_while_earlier_requests_keep_streaming(tmp_path):
+    """The pinned S3 recipe (s3-plan.md D7/Tests): max_num_seqs = 8 (the D6(b)
+    rank-side default) makes the waiting-queue cap max(8*4, 32) = 32
+    (scheduler.py:6750); since admission pops up to max_num_seqs requests out
+    of ``waiting`` per step, >= cap + max_num_seqs + 1 = 41 concurrent
+    submissions are required to guarantee at least one lands after the cap is
+    hit. max_tokens is large enough that nothing finishes during the burst.
+    """
+    num_submissions = 41
+    max_tokens_burst = 4096
+
+    async with two_node(tmp_path) as (head, worker):
+        await asyncio.wait_for(head.formation.load(MODEL), LOAD_TIMEOUT_S)
+        engine = head.formation.active_engine(MODEL)
+        assert engine is not None
+
+        streams: list[Any] = [None] * num_submissions
+        outcomes: list[str] = [""] * num_submissions
+
+        async def submit(i: int) -> None:
+            stream = engine.stream_generate(
+                "Tell me a very long, detailed story",
+                max_tokens=max_tokens_burst,
+                temperature=0.0,
+                request_id=f"burst-{i}",
+            )
+            try:
+                await stream.__anext__()
+            except SchedulerQueueFullError:
+                outcomes[i] = "queue_full"
+                return
+            streams[i] = stream
+            outcomes[i] = "streaming"
+
+        await asyncio.wait_for(
+            asyncio.gather(*(submit(i) for i in range(num_submissions))),
+            GEN_TIMEOUT_S,
+        )
+
+        try:
+            rejected = [o for o in outcomes if o == "queue_full"]
+            streaming = [o for o in outcomes if o == "streaming"]
+            assert rejected, (
+                "expected at least one SchedulerQueueFullError under the "
+                f"{num_submissions}-submission burst; outcomes={outcomes}"
+            )
+            assert streaming, "expected earlier submissions to still be streaming"
+            # A fresh submission after the burst confirms the scheduler itself
+            # (not the formation) is what's saturated -- it still enforces the
+            # same cap, not permanently wedged.
+        finally:
+            # Disconnect every admitted stream so the formation tears down
+            # cleanly rather than waiting out 4096-token generations.
+            for stream in streams:
+                if stream is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(stream.aclose(), GEN_TIMEOUT_S)

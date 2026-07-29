@@ -17,15 +17,18 @@ Shape of a run
         |  json lines over a pipe             |
      rank 0 process  <=== mlx collective ===>  rank 1 process
 
-Rank 0 is the only rank that talks to a daemon. It samples, and every decision
-it makes — the token, whether to stop, an abort — is broadcast to every rank in
-one per-step message (D4). No rank ever branches on something only it can see,
-or the ranks silently diverge and produce garbage.
-
-The generation loop is oMLX's own, NOT mlx-lm's ``BatchGenerator``: every shape
-of that path deadlocked a tensor-sharded ring in the prior attempt (salvage
-pitfall 1). Prompts are prefilled by hand in chunks; decode runs one token at a
-time with a single control collective per step.
+Rank 0 is the only rank that talks to a daemon. Since S3 it runs oMLX's real
+``Scheduler`` (unmodified, D4's single inert seam), constructed with a
+:class:`~omlx.cluster.tp_batch.LeaderModelProxy` standing in for its model:
+every model invocation the scheduler makes — prefill, admission, batched
+decode — is broadcast to every rank as a :class:`~omlx.cluster.protocol.RankOp`
+*before* it runs locally, so the whole formation's collective sequence stays
+in lockstep. No rank ever branches on something only it can see, or the ranks
+silently diverge and produce garbage. Rank 0 is the only rank that decides
+anything (admits, samples, aborts, finishes); every other rank is a pure
+:class:`~omlx.cluster.tp_batch.FollowerReplayer` — see
+``discovery/spec/s3-plan.md`` D2/D4 and ``discovery/analysis/s3-interface-audit.md``
+for the evidence this design rests on.
 
 Failure
 -------
@@ -37,29 +40,23 @@ to launchd) exits on its own so its peers fail fast rather than hang.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
 import sys
-import time
 from typing import Any
 
 from omlx.cluster.launcher import CommandReader, ControlChannel, DeathWatch
 from omlx.cluster.protocol import (
-    DELTA_ABORT,
-    DELTA_FINISH,
     GenerationSpec,
-    StepMessage,
-    StopTextBuffer,
+    RankOp,
     chunk_frame,
     done_frame,
     error_frame,
 )
 
 logger = logging.getLogger(__name__)
-
-# Hand-prefill chunk size (salvage-measured stable shape under TP collectives).
-PREFILL_STEP = 2048
 
 
 class DistributedSession:
@@ -177,7 +174,6 @@ class Rank:
         self.signals = ControlChannel(control_fd if self.session.is_leader else None)
         self.model: Any = None
         self.tokenizer: Any = None
-        self.eos_ids: set[int] = set()
         self._commands: CommandReader | None = None
 
     # -- lifecycle ---------------------------------------------------------
@@ -198,7 +194,6 @@ class Rank:
         result = tp.shard_and_load(self.model_path, self.session.group)
         self.model = result.model
         self.tokenizer = result.tokenizer
-        self.eos_ids = self._collect_eos_ids()
         self.session.seed_everyone(self.seed)
 
         if metrics_path:
@@ -233,279 +228,279 @@ class Rank:
             json.dump(payload, handle)
         os.replace(tmp, path)
 
-    def _collect_eos_ids(self) -> set[int]:
-        eos = getattr(self.tokenizer, "eos_token_ids", None)
-        if eos:
-            return set(eos)
-        single = getattr(self.tokenizer, "eos_token_id", None)
-        return {single} if single is not None else set()
-
     # -- control loop ------------------------------------------------------
 
     def serve(self) -> None:
-        """Read commands (rank 0 from its pipe, followers via broadcast).
-
-        A ``generate`` hands control to the decode loop until the request ends;
-        everything else is a one-shot dispatch. Rank 0 emits a ``ready`` frame
-        once loaded so the daemon knows the shard is up.
+        """Dispatch to the leader's scheduler-driven loop, or a follower's
+        pure replay loop (S3 D4). The two share nothing but the session:
+        rank 0 owns the real ``Scheduler`` and every decision it makes;
+        every other rank only ever replays a broadcast ``RankOp``.
         """
-        self._commands = CommandReader(sys.stdin.fileno())
         if self.session.is_leader:
-            self._reply({"ok": True, "event": "ready", "rank": self.session.rank})
+            self._serve_leader()
+        else:
+            self._serve_follower()
+
+    # -- leader: the D4 scheduler-driven serve loop -------------------------
+
+    def _serve_leader(self) -> None:
+        from omlx.cluster.scheduler_config import build_rank_scheduler_config
+        from omlx.cluster.tp_batch import LeaderModelProxy, TPBatchGenerator
+        from omlx.scheduler import Scheduler
+
+        self._commands = CommandReader(sys.stdin.fileno())
+        proxy = LeaderModelProxy(self.model, self.session)
+        scheduler = Scheduler(
+            model=proxy,
+            tokenizer=self.tokenizer,
+            config=build_rank_scheduler_config(),
+            batch_generator_factory=lambda _sp: TPBatchGenerator(proxy),
+        )
+        self._reply({"ok": True, "event": "ready", "rank": 0})
+
+        # D2's deterministic gc-sweep trigger: a cache dropped on one of the
+        # scheduler's three generator-destroying recovery branches only
+        # becomes collectible when `batch_generator` itself is replaced (the
+        # proxy's batched-phase tag anchor is a weakref to that instance) --
+        # forcing a collect on identity-change-or-None here, before the next
+        # op, is what makes a follower's release arrive promptly instead of
+        # at arbitrary GC time.
+        last_batch_generator: Any = scheduler.batch_generator
+
+        # A batch generator's very first joint forward for two brand-new
+        # requests admitted before either has ever taken a decode step is
+        # not the pattern LeaderModelProxy/FollowerReplayer are proven
+        # against -- only "join an already-stepped batch" is
+        # (tests/cluster/test_rank_batch.py's admit-mid-decode case).
+        # drain_lines() happily hands back every generate command that
+        # landed in the pipe between iterations, so two HTTP requests
+        # arriving close together would otherwise both get admitted before
+        # step() ever runs once -- including the very first request, whose
+        # solo admission used to skip straight back to the top of the loop
+        # with no step() in between. Cap fresh admissions to one per
+        # iteration and always step() right after admitting one, so every
+        # later admission always joins a batch that already has step
+        # history. Any extra generate lines wait one more iteration (one
+        # step, a few tens of ms).
+        pending_lines: list[str] = []
 
         while True:
-            if self.session.is_leader:
-                line = self._commands.readline()
-                command = json.loads(line) if line else {"op": "shutdown"}
-            else:
-                command = None
+            self._drain_aborts(scheduler)
 
-            command = self.session.broadcast_json(command)
-            if command is None or command.get("op") == "shutdown":
-                logger.info("cluster: rank %d shutting down", self.session.rank)
-                return
+            lines = pending_lines
+            pending_lines = []
+            if not lines:
+                if scheduler.has_requests():
+                    lines = self._commands.drain_lines()
+                else:
+                    line = self._commands.readline()
+                    if not line:
+                        self._shutdown_followers()
+                        return
+                    lines = [line]
 
-            op = command.get("op")
-            if op == "generate":
-                self._generate(command.get("spec") or {})
-            elif op == "ping":
-                self._reply({"ok": True, "rank": self.session.rank})
-            else:
-                self._reply(error_frame("", f"unknown op {op!r}"))
+            admitted_fresh = False
+            for index, line in enumerate(lines):
+                # Only a "generate" that actually reaches add_request() (not
+                # one rejected with queue_full or a bad spec, which touch no
+                # scheduler state) needs a step() before the next one -- do
+                # not defer those, or a rejection-heavy burst would pay one
+                # needless step() per rejected line.
+                if json.loads(line).get("op") == "generate" and admitted_fresh:
+                    pending_lines = lines[index:]
+                    break
+                keep_serving, admitted = self._handle_leader_command(
+                    scheduler, proxy, line
+                )
+                if not keep_serving:
+                    self._shutdown_followers()
+                    return
+                if admitted:
+                    admitted_fresh = True
 
-    # -- the D3 decode loop ------------------------------------------------
+            if scheduler.has_requests():
+                output = scheduler.step()
+                self._emit_step_outputs(output, proxy)
 
-    def _generate(self, spec_dict: dict[str, Any]) -> None:
-        """Run one request end to end, in lockstep across every rank."""
-        import mlx.core as mx
+            current_batch_generator = scheduler.batch_generator
+            if (
+                current_batch_generator is not last_batch_generator
+                or current_batch_generator is None
+            ):
+                gc.collect()
+            last_batch_generator = current_batch_generator
+
+    def _shutdown_followers(self) -> None:
+        """Broadcast the sentinel that ends every follower's replay loop."""
+        logger.info("cluster: rank %d shutting down", self.session.rank)
+        self.session.broadcast_json(None)
+
+    def _handle_leader_command(
+        self, scheduler: Any, proxy: Any, line: str
+    ) -> tuple[bool, bool]:
+        """Dispatch one pipe command.
+
+        Returns ``(keep_serving, admitted)``: ``keep_serving`` is ``False``
+        on ``shutdown``; ``admitted`` is ``True`` only when a ``generate``
+        command actually added a request to the scheduler (a rejection
+        touches no scheduler state, so it does not count).
+        """
+        command = json.loads(line)
+        op = command.get("op")
+        if op == "shutdown":
+            return False, False
+        if op == "generate":
+            admitted = self._handle_generate(scheduler, command.get("spec") or {})
+            return True, admitted
+        if op == "stats":
+            self._reply(self._stats_frame(scheduler, proxy))
+        else:
+            self._reply(error_frame("", f"unknown op {op!r}"))
+        return True, False
+
+    def _handle_generate(self, scheduler: Any, spec_dict: dict[str, Any]) -> bool:
+        """Admit one ``generate`` command. Returns ``True`` iff the request
+        actually reached ``scheduler.add_request()``.
+        """
+        from omlx.exceptions import SchedulerQueueFullError
+        from omlx.request import Request, SamplingParams
 
         spec = GenerationSpec.from_dict(spec_dict)
         if not spec.prompt_ids:
             self._reply(error_frame(spec.request_id, "prompt has no tokens"))
-            return
-
-        cache = self._prefill(spec.prompt_ids)
-
-        leader = self.session.is_leader
-        rid = spec.request_id
-        stop_set = set(spec.stop_token_ids) | self.eos_ids
-
-        sampler = processors = None
-        detok = stopbuf = None
-        if leader:
-            from omlx.utils.sampling import make_sampler
-
-            sampler = make_sampler(
-                temp=spec.temperature,
-                top_p=spec.top_p,
-                min_p=spec.min_p,
-                top_k=spec.top_k,
-            )
-            processors = self._build_processors(spec)
-            detok = self.tokenizer.detokenizer
-            stopbuf = StopTextBuffer(spec.stop)
-
-        current = spec.prompt_ids[-1]
-        all_ids = list(spec.prompt_ids)
-        completion = 0
-        tax_samples: list[float] = []
-        pending_stop = False
-        finish_reason = "stop"
-        step = 0
-
-        while True:
-            logits = self.model(mx.array([current])[None], cache=cache)[:, -1, :]
-
-            if leader:
-                next_id, decided_done, finish_reason, deltas, emit = self._decide(
-                    logits,
-                    sampler,
-                    processors,
-                    all_ids,
-                    stop_set,
-                    pending_stop,
-                    completion,
-                    spec.max_tokens,
-                )
-                mx.eval(logits, [c.state for c in cache])
-                payload: dict[str, Any] | None = StepMessage(
-                    step=step,
-                    tokens={rid: next_id},
-                    deltas=deltas,
-                    done=decided_done,
-                ).to_dict()
-            else:
-                mx.eval(logits, [c.state for c in cache])
-                payload = None
-
-            # D9 tax window: drain the model stream, then the two-collective
-            # broadcast. Sampling is already realised (above), so it is not
-            # counted here.
-            t0 = time.perf_counter()
-            mx.synchronize()
-            received = self.session.broadcast_json(payload)
-            if leader:
-                tax_samples.append((time.perf_counter() - t0) * 1000.0)
-
-            message = StepMessage.from_dict(received)
-            token = message.tokens[rid]
-            all_ids.append(token)
-
-            if leader:
-                assert stopbuf is not None
-                pending_stop = self._emit(rid, token, completion, emit, detok, stopbuf)
-                if emit and message.done and finish_reason == "length":
-                    self._flush_tail(detok, stopbuf, rid, completion)
-                if emit:
-                    completion += 1
-
-            step += 1
-            if message.done:
-                break
-            current = token
-
-        if leader:
-            self._reply(
-                done_frame(
-                    rid,
-                    text=stopbuf.text if stopbuf is not None else "",
-                    prompt_tokens=len(spec.prompt_ids),
-                    completion_tokens=completion,
-                    finish_reason=finish_reason,
-                    tax=_tax_summary(tax_samples),
-                )
-            )
-
-    def _decide(
-        self,
-        logits: Any,
-        sampler: Any,
-        processors: list[Any] | None,
-        all_ids: list[int],
-        stop_set: set[int],
-        pending_stop: bool,
-        completion: int,
-        max_tokens: int,
-    ) -> tuple[int, bool, str, list[dict[str, Any]], bool]:
-        """Rank 0's per-step decision: sample, then decide whether to stop.
-
-        Returns ``(next_id, done, finish_reason, deltas, emit_token)``. A stop
-        *token* is never emitted; an abort or a deferred stop-string hit ends
-        the request without consuming this step's token as output.
-        """
-        import mlx.core as mx
-
-        scored = logits
-        if processors:
-            context = mx.array(all_ids)
-            for processor in processors:
-                scored = processor(context, scored)
-        logprobs = scored - mx.logsumexp(scored, axis=-1, keepdims=True)
-        next_id = int(sampler(logprobs).item())
-
-        aborted = any(e.get("op") == "abort" for e in self.signals.take_events())
-        if pending_stop:
-            return (
-                next_id,
-                True,
-                "stop",
-                [{"op": DELTA_FINISH, "reason": "stop"}],
-                False,
-            )
-        if aborted:
-            return next_id, True, "abort", [{"op": DELTA_ABORT}], False
-        if next_id in stop_set:
-            return (
-                next_id,
-                True,
-                "stop",
-                [{"op": DELTA_FINISH, "reason": "stop"}],
-                False,
-            )
-        if completion + 1 >= max_tokens:
-            return (
-                next_id,
-                True,
-                "length",
-                [{"op": DELTA_FINISH, "reason": "length"}],
-                True,
-            )
-        return next_id, False, "", [], True
-
-    def _emit(
-        self,
-        rid: str,
-        token: int,
-        completion: int,
-        emit: bool,
-        detok: Any,
-        stopbuf: StopTextBuffer,
-    ) -> bool:
-        """Detokenize and stream one token; return whether a stop string hit.
-
-        A stop string is detected from rank 0's text only, so it takes effect
-        on the *next* step's broadcast (deferred one step, like an abort).
-        """
-        if not emit:
             return False
-        detok.add_token(token)
-        chunk = stopbuf.push(detok.last_segment)
-        if chunk:
-            self._reply(chunk_frame(rid, chunk, completion + 1))
-        return stopbuf.hit is not None
 
-    def _flush_tail(
-        self,
-        detok: Any,
-        stopbuf: StopTextBuffer,
-        rid: str,
-        completion: int,
-    ) -> None:
-        detok.finalize()
-        tail = stopbuf.push(detok.last_segment) + stopbuf.flush()
-        if tail:
-            self._reply(chunk_frame(rid, tail, completion))
+        request = Request(
+            request_id=spec.request_id,
+            prompt=list(spec.prompt_ids),
+            sampling_params=SamplingParams(
+                max_tokens=spec.max_tokens,
+                temperature=spec.temperature,
+                top_p=spec.top_p,
+                top_k=spec.top_k,
+                min_p=spec.min_p,
+                repetition_penalty=(
+                    spec.repetition_penalty
+                    if spec.repetition_penalty is not None
+                    else 1.0
+                ),
+                presence_penalty=spec.presence_penalty or 0.0,
+                frequency_penalty=spec.frequency_penalty or 0.0,
+                stop=list(spec.stop),
+                stop_token_ids=list(spec.stop_token_ids),
+                seed=spec.seed,
+            ),
+        )
+        # GenerationSpec always carries pre-tokenized ids (the daemon owns
+        # the tokenizer it used for the chat template, S2 idiom) -- setting
+        # these directly makes add_request() skip its own tokenize path
+        # (scheduler.py:6776-6781).
+        request.prompt_token_ids = list(spec.prompt_ids)
+        request.num_prompt_tokens = len(spec.prompt_ids)
 
-    def _prefill(self, prompt_ids: list[int]) -> Any:
-        """A fresh cache holding everything but the last prompt token.
+        try:
+            scheduler.add_request(request)
+        except SchedulerQueueFullError as exc:
+            self._reply(
+                error_frame(
+                    spec.request_id,
+                    str(exc),
+                    code="queue_full",
+                    current_depth=exc.current_depth,
+                    max_depth=exc.max_depth,
+                )
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - surfaced to the daemon
+            logger.exception("cluster: add_request failed for %s", spec.request_id)
+            self._reply(error_frame(spec.request_id, str(exc)))
+            return False
+        return True
 
-        Chunked and fully evaluated on every rank while nothing else is in
-        flight, so the sharded forward's collectives are issued in the same
-        global order on every rank.
+    def _drain_aborts(self, scheduler: Any) -> None:
+        """Apply every pending abort signal (S2 idiom, request-id-routed).
+
+        ``abort_request()`` only enqueues; the actual removal happens inside
+        the next ``step()``, and the scheduler never surfaces an abort
+        completion through ``step()``'s own outputs (unlike a model-decided
+        finish) -- so this synthesizes the terminal frame itself, guarded on
+        the request genuinely being live right now. An empty ``request_id``
+        (control pipe closed -- nobody left to stream to) aborts every
+        running and waiting request.
         """
+        for event in self.signals.take_events():
+            rid = event.get("request_id") or ""
+            targets = (
+                [rid]
+                if rid
+                else list(scheduler.running) + [r.request_id for r in scheduler.waiting]
+            )
+            for request_id in targets:
+                if request_id in scheduler.requests:
+                    scheduler.abort_request(request_id)
+                    self._reply(
+                        done_frame(
+                            request_id,
+                            text="",
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            finish_reason="abort",
+                        )
+                    )
+
+    def _emit_step_outputs(self, output: Any, proxy: Any) -> None:
+        for out in output.outputs:
+            rid = out.request_id
+            if out.finished:
+                if out.finish_reason == "error":
+                    self._reply(error_frame(rid, out.error or "generation error"))
+                else:
+                    self._reply(
+                        done_frame(
+                            rid,
+                            text=out.output_text,
+                            prompt_tokens=out.prompt_tokens,
+                            completion_tokens=out.completion_tokens,
+                            finish_reason=out.finish_reason or "stop",
+                            tax=_tax_summary(proxy.tax_samples),
+                        )
+                    )
+            elif out.new_text:
+                self._reply(chunk_frame(rid, out.new_text, out.completion_tokens))
+
+    def _stats_frame(self, scheduler: Any, proxy: Any) -> dict[str, Any]:
+        stats = scheduler.get_stats()
+        stats["tax"] = _tax_summary(proxy.tax_samples)
+        return {"ok": True, "event": "stats", "stats": stats}
+
+    # -- follower: pure forward-replay loop (S3 D2) -------------------------
+
+    def _serve_follower(self) -> None:
         import mlx.core as mx
         from mlx_lm.models.cache import make_prompt_cache
 
-        cache = make_prompt_cache(self.model)
-        tokens = prompt_ids[:-1]
-        for start in range(0, len(tokens), PREFILL_STEP):
-            chunk = tokens[start : start + PREFILL_STEP]
-            # Eval the forward output too, not just the cache state: the final
-            # layer's all-reduce feeds only the (discarded) logits and could
-            # otherwise stay pending across ranks until a later synchronize.
-            out = self.model(mx.array(chunk)[None], cache=cache)
-            mx.eval(out, [c.state for c in cache])
-        return cache
+        # Import omlx.scheduler for its module-level monkeypatches
+        # (mlx_lm.generate._merge_caches/_extend_cache singleton-passthrough,
+        # KVCache.filter/.extract) -- without this a follower's single-row
+        # cache merges take mlx-lm's unpatched path while the leader (which
+        # always imports Scheduler) takes the patched one, growing the two
+        # ranks' batch cache buffers to different physical sizes and
+        # deadlocking the sharded forward the first time two rows genuinely
+        # merge (S3 P1 audit finding 2; see tp_batch.py's module docstring).
+        import omlx.scheduler  # noqa: F401
+        from omlx.cluster.tp_batch import FollowerReplayer
 
-    def _build_processors(self, spec: GenerationSpec) -> list[Any]:
-        if not any(
-            (
-                spec.repetition_penalty,
-                spec.presence_penalty,
-                spec.frequency_penalty,
-            )
-        ):
-            return []
-        from mlx_lm.sample_utils import make_logits_processors
-
-        return list(
-            make_logits_processors(
-                repetition_penalty=spec.repetition_penalty,
-                repetition_context_size=spec.repetition_context_size,
-                presence_penalty=spec.presence_penalty,
-                frequency_penalty=spec.frequency_penalty,
-            )
-        )
+        replayer = FollowerReplayer(self.model, lambda: make_prompt_cache(self.model))
+        while True:
+            # Sync discipline (audit section 8): drain this rank's own model
+            # stream before handing the backend the next broadcast so every
+            # rank issues collectives in one global order.
+            mx.synchronize()
+            payload = self.session.broadcast_json(None)
+            if payload is None:
+                logger.info("cluster: rank %d shutting down", self.session.rank)
+                return
+            replayer.apply(RankOp.from_dict(payload))
 
     def _reply(self, payload: dict[str, Any]) -> None:
         """Only rank 0 has a daemon listening; the rest stay quiet."""

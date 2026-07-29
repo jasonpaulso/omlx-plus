@@ -579,10 +579,12 @@ class BlockAwarePrefixCache(CacheManager):
 
             # Check if this block already exists (deduplication)
             if len(block_tokens) == self.block_size:
+                # shard_config: S3 D6(a) reserved seam, always None today.
                 existing_block = self.paged_cache.find_cached_block(
                     block_tokens,
                     parent_hash,
                     extra_keys=block_extra_keys,
+                    shard_config=None,
                 )
                 if existing_block:
                     # Reuse existing block
@@ -610,11 +612,13 @@ class BlockAwarePrefixCache(CacheManager):
             block_table.num_tokens += len(block_tokens)
 
             # Compute chain hash for this block
+            # shard_config: S3 D6(a) reserved seam, always None today.
             block.block_hash = compute_block_hash(
                 parent_hash,
                 block_tokens,
                 extra_keys=block_extra_keys,
                 model_name=self.paged_cache.model_name,
+                shard_config=None,
             )
 
             # Register hash for full blocks (for deduplication)

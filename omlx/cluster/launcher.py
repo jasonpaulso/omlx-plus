@@ -714,31 +714,64 @@ class LocalCluster:
         ``timeout`` is an *idle* timeout — the longest this waits for the next
         reply. A rank that dies mid-collective leaves rank 0 blocked in mlx with
         no way to notice; without this the caller hangs until it gives up.
+
+        One request at a time only: this reads every reply off rank 0's pipe
+        until ``done``, so a second concurrent caller would steal frames that
+        belong to this one. S2 callers (single generation in flight) and tests
+        that drive exactly one request use this; S3's continuous-batching
+        ``ClusterEngine`` uses :meth:`write` / :meth:`read_reply` directly
+        instead, through its own demux (D5) — several requests genuinely
+        interleave on the same pipe there.
+        """
+        self.write(payload)
+        while True:
+            reply = self.read_reply(timeout)
+            if reply is None:
+                raise RuntimeError(
+                    f"rank 0 sent nothing for {timeout:.0f}s; the collective is "
+                    "most likely blocked on a rank that died"
+                )
+            yield reply
+            if reply.get("done") or not reply.get("ok", False):
+                return
+
+    def write(self, payload: dict) -> None:
+        """Write one command line to rank 0's stdin.
+
+        Serialised by the same lock every writer uses, so two concurrent
+        submissions (D5's multiplexing client) never interleave partial JSON
+        lines on the wire.
         """
         leader = self.leader
         if leader is None:
             raise RuntimeError("this node does not own rank 0")
         proc = leader.process
-        assert proc.stdin is not None and proc.stdout is not None
-
+        assert proc.stdin is not None
         with self._stdin_lock:
             proc.stdin.write(json.dumps(payload) + "\n")
             proc.stdin.flush()
 
+    def read_reply(self, timeout: float | None = None) -> dict | None:
+        """Block for the next reply frame from rank 0's single reply pipe.
+
+        Returns ``None`` on an idle timeout (the caller decides what that
+        means — S2's :meth:`stream` treats it as fatal; D5's demux reader
+        just loops). Raises ``RuntimeError`` once the pipe is closed (EOF) —
+        there is exactly one rank-0 reply pipe per formation, so this is the
+        only read path every consumer, single- or multi-request, shares.
+        """
+        leader = self.leader
+        if leader is None:
+            raise RuntimeError("this node does not own rank 0")
+        assert leader.process.stdout is not None
         reader = self._reply_reader(leader)
-        while True:
-            line = reader.readline(timeout)
-            if line is None:
-                raise RuntimeError(
-                    f"rank 0 sent nothing for {timeout:.0f}s; the collective is "
-                    "most likely blocked on a rank that died"
-                )
-            if not line:
-                raise RuntimeError("rank 0 closed its reply channel")
-            reply = json.loads(line)
-            yield reply
-            if reply.get("done") or not reply.get("ok", False):
-                return
+        line = reader.readline(timeout)
+        if line is None:
+            return None
+        if not line:
+            raise RuntimeError("rank 0 closed its reply channel")
+        frame: dict = json.loads(line)
+        return frame
 
     def abort(self, request_id: str = "") -> bool:
         """Ask a running generation to stop, out of band.

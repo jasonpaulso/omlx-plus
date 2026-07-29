@@ -85,6 +85,73 @@ class TestComputeBlockHash:
         # Each hash should be unique
         assert len({hash1, hash2, hash3}) == 3
 
+    # -- S3 D6(a): shard_config seam ------------------------------------------
+    #
+    # Digests below were captured from compute_block_hash() BEFORE the
+    # shard_config parameter was added (see discovery/analysis/s3-plan.md
+    # D6(a)), so a byte-for-byte match proves the None default really did not
+    # change the function's existing behavior -- not just that the function
+    # is internally self-consistent.
+
+    def test_shard_config_none_default_matches_pinned_digest(self):
+        h = compute_block_hash(None, [1, 2, 3])
+        assert h.hex() == (
+            "bbae1d7b58b0342987ac2fc87c5c3a190f737d0357d739d9c3fb1f65b2df8d4f"
+        )
+
+    def test_shard_config_none_explicit_matches_no_argument(self):
+        """Passing shard_config=None explicitly must be byte-identical to
+        omitting the argument entirely (the plan's byte-stability guarantee).
+        """
+        tokens = [1, 2, 3]
+        assert compute_block_hash(None, tokens) == compute_block_hash(
+            None, tokens, shard_config=None
+        )
+
+    def test_shard_config_none_with_parent_matches_pinned_digest(self):
+        parent = BlockHash(
+            b"0123456789abcdef0123456789abcdef01234567890abcdef123456789abcde"
+        )
+        h = compute_block_hash(parent, [4, 5, 6])
+        assert h.hex() == (
+            "e42598a74c2d8c1c86cb408222ef71431b39834e998df35cb142bdffe98c5542"
+        )
+
+    def test_shard_config_none_with_extra_keys_matches_pinned_digest(self):
+        h = compute_block_hash(None, [1, 2, 3], extra_keys=("lora-1",))
+        assert h.hex() == (
+            "32e5ccebf740e04888dcf9078ff2cc0605600d3a97b7cb6b477cd02e7eea3945"
+        )
+
+    def test_shard_config_none_with_model_name_matches_pinned_digest(self):
+        h = compute_block_hash(
+            None, [1, 2, 3], model_name="mlx-community/Llama-3.2-1B-Instruct-4bit"
+        )
+        assert h.hex() == (
+            "61399523e8e1dec7c220014a77d96a3cabe9dc5df53c3da4017a87fc36b3181c"
+        )
+
+    def test_shard_config_string_produces_distinct_hash(self):
+        """A real (non-None) shard_config must change the hash, proving the
+        injection point actually participates in the digest."""
+        tokens = [1, 2, 3]
+        without = compute_block_hash(None, tokens)
+        with_shard = compute_block_hash(None, tokens, shard_config="2xring")
+        assert without != with_shard
+
+    def test_shard_config_distinguishes_different_formations(self):
+        tokens = [1, 2, 3]
+        ring = compute_block_hash(None, tokens, shard_config="2xring")
+        jaccl = compute_block_hash(None, tokens, shard_config="2xjaccl")
+        assert ring != jaccl
+
+    def test_empty_string_shard_config_matches_none(self):
+        """An empty string is falsy, same code path as None (no update call)."""
+        tokens = [1, 2, 3]
+        assert compute_block_hash(None, tokens, shard_config="") == compute_block_hash(
+            None, tokens, shard_config=None
+        )
+
 
 class TestResolveBlockExtraKeys:
     """Tests for segmented cache-key resolution."""
