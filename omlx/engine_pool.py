@@ -112,6 +112,25 @@ class EngineEntry:
     load_failure_at: float | None = None
 
 
+def _resolve_cluster_engine(model_id: str):
+    """Return the distributed ClusterEngine for a model, or None.
+
+    Flag-gated by cluster role: the local import mirrors admin.routes' pattern
+    (avoids a cluster<->admin import cycle), and a non-head role returns None
+    immediately, so a server with ``cluster.role=off`` behaves exactly as it
+    did before this touchpoint existed.
+    """
+    from omlx.cluster.manager import get_cluster_manager
+
+    manager = get_cluster_manager()
+    if manager is None or manager.role != "head":
+        return None
+    formation = manager.formation
+    if formation is None:
+        return None
+    return formation.active_engine(model_id)
+
+
 class EnginePool:
     """
     Manages multiple model engines with LRU-based memory management.
@@ -821,6 +840,15 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
+        # E1 cluster touchpoint: when this node is a cluster head with an active
+        # distributed formation for the model, serve it through the pinned
+        # ClusterEngine instead of loading it locally. Flag-gated: the helper
+        # returns None immediately unless the head role is active, so role=off
+        # takes the identical path it always has.
+        cluster_engine = _resolve_cluster_engine(model_id)
+        if cluster_engine is not None:
+            return cluster_engine
+
         async with self._lock:
             entry = self._entries.get(model_id)
             if not entry:
@@ -904,9 +932,7 @@ class EnginePool:
                 best_effort = ceiling > 0
             if ceiling > 0:
                 soft_target = self._admission_soft_target()
-                evict_target = (
-                    min(soft_target, ceiling) if soft_target > 0 else ceiling
-                )
+                evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
                 evicted_any = unloaded_for_admission
                 while True:
                     # Consult the tracked accumulator alongside live memory:

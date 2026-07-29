@@ -19,8 +19,9 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from ..admin.auth import fingerprint_key
 from .client import ClusterClient, ClusterClientError
-from .credentials import generate_epoch
+from .credentials import digest_secret, generate_epoch, verify_command_response
 from .state import WorkerIdentity
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,16 @@ HEARTBEAT_PATH = "/v1/cluster/heartbeat"
 
 
 class HeartbeatSender:
-    """Posts heartbeats to the head until stopped."""
+    """Posts heartbeats to the head until stopped.
+
+    When wired with a ``command_sink``/``job_updates_provider`` (the worker's
+    command executor) the heartbeat becomes the D2 command channel: the request
+    carries pending ``job_updates`` and the response may carry ``commands``.
+    A commands-bearing response is acted on only after it (1) echoes the exact
+    epoch+seq of the heartbeat just sent (CL2-06) and (2) carries a valid HMAC
+    derived from this worker's own secret (CL2-05). Absent either callback the
+    behaviour is exactly S1's.
+    """
 
     def __init__(
         self,
@@ -37,6 +47,8 @@ class HeartbeatSender:
         *,
         interval_s: float,
         client_factory: Callable[[str], ClusterClient] | None = None,
+        command_sink: Callable[[list[Any]], None] | None = None,
+        job_updates_provider: Callable[[], list[dict[str, Any]]] | None = None,
     ) -> None:
         self.identity = identity
         self.interval_s = max(0.1, interval_s)
@@ -45,6 +57,8 @@ class HeartbeatSender:
         self.last_success_at: float | None = None
         self.last_error: str | None = None
         self._client_factory = client_factory or (lambda url: ClusterClient(url))
+        self._command_sink = command_sink
+        self._job_updates_provider = job_updates_provider
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -68,12 +82,19 @@ class HeartbeatSender:
     async def send_once(self) -> dict[str, Any] | None:
         """Send one heartbeat. Returns the head's reply, or None on failure."""
         self.seq += 1
+        sent_seq = self.seq
+        payload: dict[str, Any] = {"seq": sent_seq, "epoch": self.epoch}
+        if self._job_updates_provider is not None:
+            payload["job_updates"] = self._job_updates_provider()
+        # CL2-11: the head address was pinned into WorkerIdentity at join and
+        # is never changed by a command, so a heartbeat only ever reaches the
+        # join-resolved head.
         client = self._client_factory(self.identity.head_url)
         try:
             reply = await client.post_json(
                 HEARTBEAT_PATH,
                 token=self.identity.secret,
-                payload={"seq": self.seq, "epoch": self.epoch},
+                payload=payload,
             )
         except ClusterClientError as exc:
             self.last_error = str(exc)
@@ -81,7 +102,40 @@ class HeartbeatSender:
             return None
         self.last_error = None
         self.last_success_at = time.time()
+        self._handle_commands(reply, sent_seq)
         return reply
+
+    def _handle_commands(self, reply: dict[str, Any], sent_seq: int) -> None:
+        """Act on a commands-bearing response, or discard it (CL2-05/CL2-06)."""
+        commands = reply.get("commands")
+        if not commands:
+            return
+        if self._command_sink is None:
+            # S1 behaviour: a node with no command executor ignores commands.
+            return
+        # CL2-06: the response must echo the exact heartbeat we just sent, or it
+        # is a replayed/reordered response and cannot be trusted.
+        if reply.get("command_epoch") != self.epoch or reply.get("command_seq") != (
+            sent_seq
+        ):
+            logger.warning(
+                "cluster: discarding commands with mismatched epoch/seq echo"
+            )
+            return
+        # CL2-05: a commands-bearing response must carry a valid HMAC derived
+        # from this worker's own secret. Absent or wrong -> discard + log.
+        digest = digest_secret(self.identity.secret)
+        signature = str(reply.get("command_sig") or "")
+        if not verify_command_response(
+            digest, commands, epoch=self.epoch, seq=sent_seq, signature=signature
+        ):
+            logger.warning(
+                "cluster: discarding commands with absent/invalid response "
+                "signature (fp=%s)",
+                fingerprint_key(signature),
+            )
+            return
+        self._command_sink(commands)
 
     async def _loop(self) -> None:
         while True:

@@ -409,6 +409,13 @@ class LocalCluster:
     seed: int = 0
     python: str = field(default_factory=lambda: sys.executable)
     metrics_dir: str | Path | None = None
+    # CL2-09 is the WORKER's own exhaustion accounting: a worker spawning a
+    # head-commanded rank claims the single per-machine formation slot. The
+    # head forming its own rank 0 is operator-initiated and serialised by the
+    # E6 queue, so it does not hold the worker's slot — and colocating both in
+    # one process (the single-host integration test) needs exactly one of them
+    # to hold it. The head constructs with this False; the worker leaves it True.
+    enforce_spawn_bound: bool = True
     ranks: list[RankProcess] = field(default_factory=list)
     _workdir: Path | None = None
     _deathwatch: DeathWatch | None = None
@@ -434,7 +441,8 @@ class LocalCluster:
         D7 predicate before it can enter the hostfile (CL2-03); with the subnet
         unset the caller has already validated them.
         """
-        _register_formation(self)
+        if self.enforce_spawn_bound:
+            _register_formation(self)
         try:
             self._start(
                 ranks,
@@ -445,7 +453,8 @@ class LocalCluster:
             )
         except BaseException:
             self.kill()
-            _release_formation(self)
+            if self.enforce_spawn_bound:
+                _release_formation(self)
             raise
 
     def _start(

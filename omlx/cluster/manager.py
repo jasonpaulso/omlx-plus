@@ -16,15 +16,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import secrets
 import socket
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from .formation import FormationManager
+
+from ..admin.auth import fingerprint_key
 from ..settings import ClusterSettings, GlobalSettings
 from .client import ClusterClient, ClusterClientError, validate_head_url
 from .credentials import (
@@ -34,8 +39,21 @@ from .credentials import (
     load_state,
     mint_bootstrap_token,
     save_state,
+    sign_command_response,
 )
 from .heartbeat import HeartbeatSender
+from .hostfile import LinkScopeError, require_link_scope
+from .launcher import SpawnBoundError
+from .protocol import (
+    Backend,
+    PresenceCommand,
+    ProtocolError,
+    SpawnRankCommand,
+    SweepCommand,
+    TeardownCommand,
+    make_job_update,
+    parse_command,
+)
 from .queue import ClusterCommandQueue
 from .state import (
     ClusterState,
@@ -52,6 +70,12 @@ JOIN_PATH = "/v1/cluster/join"
 LEAVE_PATH = "/v1/cluster/leave"
 MEMBER_ID_BYTES = 8
 MAX_MEMBER_NAME_LENGTH = 64
+# CL2-10: a ceiling on the head-supplied heartbeat interval so a hostile join
+# reply cannot set it absurdly high (silencing the worker) or be non-numeric.
+MAX_HEARTBEAT_INTERVAL_S = 3600.0
+# CL2-10: an upper bound on a head-commanded world size — each rank loads a
+# multi-GB shard, so an unbounded world is machine-level exhaustion.
+MAX_WORLD_SIZE = 64
 
 _cluster_manager: ClusterManager | None = None
 
@@ -76,6 +100,385 @@ class ClusterError(Exception):
         self.detail = detail
 
 
+class ClusterFormationError(Exception):
+    """A worker refused to act on a head command (CL2-03/09/10/12)."""
+
+
+class ModelNotPresentError(Exception):
+    """A command named a model absent from this node's own model dirs (CL2-02)."""
+
+
+@dataclass
+class _PreparedSpawn:
+    """The validated, locally-derived inputs for one rank spawn.
+
+    Nothing here is trusted verbatim from the head: ``model_path`` is resolved
+    against this node's own model dirs (CL2-02), ``ips`` has the worker's own
+    address in its own rank slot and every entry re-validated against this
+    node's own subnet (CL2-03), ``base_port`` is this node's own setting.
+    """
+
+    rank: int
+    world_size: int
+    backend: str
+    model_path: str
+    ips: list[str]
+    base_port: int
+    seed: int
+
+
+class WorkerCommandExecutor:
+    """Applies head->worker heartbeat commands under full CL2 confinement.
+
+    Every command is untrusted input: a compromised or impersonated head must
+    never become code execution on the worker (the CL2 review's ordering
+    framing — worker-side confinement is the control, not head authentication).
+    The executor therefore, for every command:
+
+    * fails closed on an unknown kind/field or off-version schema (CL2-04),
+    * resolves a model IDENTIFIER against its OWN model dirs — never a path
+      (CL2-02),
+    * re-validates every hostfile entry against its OWN data-plane settings and
+      computes its own rank's entry from its own address (CL2-03),
+    * builds the rank env locally from an allowlist — no env crosses the wire
+      (CL2-01, enforced in the launcher),
+    * refuses to form with no own data-plane config (CL2-12),
+    * bounds itself to one live formation (CL2-09),
+    * treats a re-delivered ``(job_id, step)`` as a no-op ack (CL2-06).
+
+    Commands are applied off the heartbeat path on an internal queue: formation
+    is minutes-scale, so a rank spawn must not stall the liveness loop.
+    """
+
+    def __init__(
+        self,
+        global_settings: GlobalSettings,
+        *,
+        spawn_fn: Callable[[_PreparedSpawn], Any] | None = None,
+        model_resolver: Callable[[str], tuple[str, int] | None] | None = None,
+        local_addresses: set[str] | None = None,
+    ) -> None:
+        self._global_settings = global_settings
+        self._spawn_fn = spawn_fn
+        self._model_resolver = model_resolver or self._default_resolve_model
+        self._local_addresses = local_addresses
+        self._applied: dict[tuple[str, int], dict[str, Any]] = {}
+        self._seen: set[tuple[str, int]] = set()
+        self._updates: list[dict[str, Any]] = []
+        self._cluster: Any = None
+        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def settings(self) -> ClusterSettings:
+        return self._global_settings.cluster
+
+    @property
+    def cluster(self) -> Any:
+        """The active local formation, or None."""
+        return self._cluster
+
+    async def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await self._teardown_local()
+
+    # ---- heartbeat integration -------------------------------------------
+
+    def deliver(self, commands: list[Any]) -> None:
+        """Enqueue verified commands, deduped by ``(job_id, step)`` (CL2-06).
+
+        Called from the heartbeat loop after the response signature has been
+        checked, so it must stay fast: it only dedups and enqueues, never
+        spawns. A re-delivered command that already produced an ack re-emits
+        that ack and never spawns again.
+        """
+        for raw in commands:
+            if not isinstance(raw, dict):
+                continue
+            key = self._replay_key(raw)
+            if key is not None and key in self._seen:
+                prior = self._applied.get(key)
+                if prior is not None:
+                    self._updates.append(prior)
+                continue
+            if key is not None:
+                self._seen.add(key)
+            self._queue.put_nowait(raw)
+
+    def pending_job_updates(self) -> list[dict[str, Any]]:
+        """Drain the job updates accumulated since the last heartbeat."""
+        updates, self._updates = self._updates, []
+        return updates
+
+    # ---- command application (off the heartbeat path) --------------------
+
+    async def _run(self) -> None:
+        while True:
+            raw = await self._queue.get()
+            try:
+                update = await self._apply(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reported, never crash the loop
+                logger.warning("cluster: worker command failed: %s", exc)
+                update = make_job_update(
+                    str(raw.get("job_id") or ""),
+                    self._safe_step(raw),
+                    status="error",
+                    detail=str(exc),
+                )
+            key = self._replay_key(raw)
+            if key is not None:
+                self._applied[key] = update
+            self._updates.append(update)
+
+    async def _apply(self, raw: dict[str, Any]) -> dict[str, Any]:
+        try:
+            command = parse_command(raw)  # CL2-04: fail closed on anything unexpected
+        except ProtocolError as exc:
+            logger.warning(
+                "cluster: rejected head command (fp=%s): %s",
+                fingerprint_key(json.dumps(raw, sort_keys=True, default=str)),
+                exc,
+            )
+            return make_job_update(
+                str(raw.get("job_id") or ""),
+                self._safe_step(raw),
+                status="rejected",
+                detail=str(exc),
+            )
+        try:
+            return await self._dispatch(command)
+        except (
+            ClusterFormationError,
+            ModelNotPresentError,
+            SpawnBoundError,
+            LinkScopeError,
+        ) as exc:
+            # A confinement refusal travels back as a job_update — never
+            # swallowed — and is logged (CL2-04 note).
+            logger.warning("cluster: refused %s command: %s", command.kind.value, exc)
+            return make_job_update(
+                command.job_id, command.step, status="error", detail=str(exc)
+            )
+
+    async def _dispatch(self, command: Any) -> dict[str, Any]:
+        if isinstance(command, PresenceCommand):
+            return self._do_presence(command)
+        if isinstance(command, SweepCommand):
+            from .launcher import sweep_orphaned_ranks
+
+            killed = sweep_orphaned_ranks()
+            return make_job_update(
+                command.job_id, command.step, status="swept", killed=killed
+            )
+        if isinstance(command, TeardownCommand):
+            await self._teardown_local()
+            return make_job_update(command.job_id, command.step, status="torn_down")
+        # The command union is closed; anything else is a schema/parse invariant
+        # violation. Fail closed rather than assert (which -O compiles out on the
+        # spawn dispatch path).
+        if not isinstance(command, SpawnRankCommand):
+            raise ProtocolError(f"unhandled command kind {command!r}")
+        return await self._do_spawn(command)
+
+    def _do_presence(self, command: PresenceCommand) -> dict[str, Any]:
+        resolved = self._model_resolver(command.model_id)
+        present = resolved is not None
+        return make_job_update(
+            command.job_id,
+            command.step,
+            status="present" if present else "absent",
+            model_id=command.model_id,
+            present=present,
+            resolved_size=(resolved[1] if resolved is not None else 0),
+            data_plane_address=self._reportable_address(),
+        )
+
+    async def _do_spawn(self, command: SpawnRankCommand) -> dict[str, Any]:
+        prepared = self._prepare_spawn(command)  # raises on any CL2 violation
+        spawn = self._spawn_fn or self._default_spawn
+        loop = asyncio.get_running_loop()
+        cluster = await loop.run_in_executor(None, spawn, prepared)
+        self._cluster = cluster
+        return make_job_update(
+            command.job_id,
+            command.step,
+            status="spawned",
+            rank=prepared.rank,
+            world_size=prepared.world_size,
+            backend=prepared.backend,
+        )
+
+    def _prepare_spawn(self, command: SpawnRankCommand) -> _PreparedSpawn:
+        cs = self.settings
+        # CL2-12: an unreviewed node with no own data-plane config must never
+        # degrade to trusting head-supplied values.
+        if not cs.data_plane_subnet or not cs.data_plane_address:
+            raise ClusterFormationError(
+                "this node has no cluster.data_plane_subnet/data_plane_address "
+                "configured; refusing to form (CL2-12)"
+            )
+        # CL2-09: the worker's own exhaustion accounting — one live formation.
+        if self._cluster is not None and self._cluster.any_alive():
+            raise SpawnBoundError(
+                "a formation is already live on this worker; refusing a second "
+                "spawn (CL2-09)"
+            )
+        # CL2-10: bound the head-supplied topology relationships (the scalars
+        # themselves are bounded by the Pydantic schema).
+        if command.world_size > MAX_WORLD_SIZE:
+            raise ClusterFormationError(
+                f"world_size {command.world_size} exceeds the {MAX_WORLD_SIZE} "
+                "ceiling"
+            )
+        if command.rank >= command.world_size:
+            raise ClusterFormationError(
+                f"rank {command.rank} is not < world_size {command.world_size}"
+            )
+        if len(command.peers) != command.world_size:
+            raise ClusterFormationError(
+                f"{len(command.peers)} peer addresses != world_size "
+                f"{command.world_size}"
+            )
+        own = cs.data_plane_address
+        if not self._address_is_local(own):
+            raise ClusterFormationError(
+                f"configured data_plane_address {own} is not bound to any local "
+                "interface (D7)"
+            )
+        # CL2-02: resolve the id against this node's OWN model dirs; a
+        # head-supplied path can never reach the loader.
+        resolved = self._model_resolver(command.model_id)
+        if resolved is None:
+            raise ModelNotPresentError(
+                f"model {command.model_id!r} is not present in this node's model "
+                "dirs; S5 has no auto-download"
+            )
+        model_path, _size = resolved
+        # CL2-03: compute this rank's own entry from its own address, and
+        # re-validate every entry against this node's own subnet.
+        ips: list[str] = []
+        for index, peer in enumerate(command.peers):
+            address = own if index == command.rank else peer
+            require_link_scope(
+                address,
+                data_plane_subnet=cs.data_plane_subnet,
+                allow_routable_data_plane=cs.allow_routable_data_plane,
+                allow_loopback=cs.allow_loopback,
+            )
+            ips.append(address)
+        return _PreparedSpawn(
+            rank=command.rank,
+            world_size=command.world_size,
+            backend=self._resolve_backend(command.backend),
+            model_path=model_path,
+            ips=ips,
+            base_port=int(cs.data_plane_base_port),
+            seed=command.seed,
+        )
+
+    def _resolve_backend(self, backend: Backend) -> str:
+        if backend == Backend.RING:
+            return "ring"
+        raise ClusterFormationError(
+            f"backend {backend.value!r} is not supported by the P2 launcher "
+            "(ring only; jaccl lands in P3)"
+        )
+
+    def _default_spawn(self, prepared: _PreparedSpawn) -> Any:
+        from .launcher import LocalCluster
+
+        cs = self.settings
+        cluster = LocalCluster(
+            model=prepared.model_path,
+            world_size=prepared.world_size,
+            backend=prepared.backend,
+            base_port=prepared.base_port,
+            seed=prepared.seed,
+        )
+        cluster.start(
+            [prepared.rank],
+            ips=prepared.ips,
+            data_plane_subnet=cs.data_plane_subnet,
+            allow_routable_data_plane=cs.allow_routable_data_plane,
+            allow_loopback=cs.allow_loopback,
+        )
+        cluster.start_deathwatch()
+        return cluster
+
+    async def _teardown_local(self) -> None:
+        cluster, self._cluster = self._cluster, None
+        if cluster is None:
+            return
+        await asyncio.get_running_loop().run_in_executor(None, cluster.stop)
+
+    def _default_resolve_model(self, model_id: str) -> tuple[str, int] | None:
+        from ..model_discovery import discover_models_from_dirs
+
+        dirs = self._global_settings.get_effective_model_dirs()
+        discovered = discover_models_from_dirs(dirs)
+        entry = discovered.get(model_id)
+        if entry is None:
+            for candidate in discovered.values():
+                if candidate.source_repo_id == model_id:
+                    entry = candidate
+                    break
+        if entry is None:
+            return None
+        return entry.model_path, int(entry.estimated_size)
+
+    def _reportable_address(self) -> str:
+        address = self.settings.data_plane_address
+        if not address:
+            return ""
+        if not self._address_is_local(address):
+            logger.warning(
+                "cluster: configured data_plane_address %s is not bound to a "
+                "local interface; not reporting it",
+                address,
+            )
+            return ""
+        return address
+
+    def _address_is_local(self, address: str) -> bool:
+        if not address:
+            return False
+        if self._local_addresses is not None:
+            return address in self._local_addresses
+        try:
+            import psutil
+
+            for infos in psutil.net_if_addrs().values():
+                for info in infos:
+                    if info.address == address:
+                        return True
+            return False
+        except Exception:  # noqa: BLE001 - the subnet predicate is the real gate
+            return True
+
+    @staticmethod
+    def _replay_key(raw: dict[str, Any]) -> tuple[str, int] | None:
+        job_id = raw.get("job_id")
+        step = raw.get("step")
+        if isinstance(job_id, str) and job_id and isinstance(step, int):
+            return (job_id, step)
+        return None
+
+    @staticmethod
+    def _safe_step(raw: dict[str, Any]) -> int:
+        step = raw.get("step")
+        return step if isinstance(step, int) else 0
+
+
 class ClusterManager:
     """Owns cluster state for one node, in whichever role it was started."""
 
@@ -96,6 +499,10 @@ class ClusterManager:
         self._heartbeat: HeartbeatSender | None = None
         self._versions: VersionInfo | None = None
         self._started = False
+        # Worker role: applies head commands under CL2 confinement.
+        self._executor: WorkerCommandExecutor | None = None
+        # Head role: drives formation jobs on the E6 queue (D8), set in start().
+        self._formation: FormationManager | None = None
 
     # ---- basic accessors -------------------------------------------------
 
@@ -145,9 +552,15 @@ class ClusterManager:
         self._state = load_state(self.state_path)
         await self._queue.start()
         if self.role == "head":
+            from .formation import FormationManager
+
+            self._formation = FormationManager(self)
             self._scrub_task = asyncio.create_task(self._scrub_loop())
-        elif self.role == "worker" and self._state.worker is not None:
-            await self._start_heartbeat(self._state.worker)
+        elif self.role == "worker":
+            self._executor = WorkerCommandExecutor(self.global_settings)
+            await self._executor.start()
+            if self._state.worker is not None:
+                await self._start_heartbeat(self._state.worker)
         self._started = True
         logger.info("Cluster manager started (role=%s)", self.role)
 
@@ -160,8 +573,24 @@ class ClusterManager:
         if self._heartbeat is not None:
             await self._heartbeat.stop()
             self._heartbeat = None
+        if self._formation is not None:
+            await self._formation.stop()
+            self._formation = None
+        if self._executor is not None:
+            await self._executor.stop()
+            self._executor = None
         await self._queue.stop()
         self._started = False
+
+    @property
+    def formation(self) -> FormationManager | None:
+        """The head's formation manager, or None off the head role."""
+        return self._formation
+
+    @property
+    def executor(self) -> WorkerCommandExecutor | None:
+        """The worker's command executor, or None off the worker role."""
+        return self._executor
 
     # ---- head commands ---------------------------------------------------
 
@@ -275,7 +704,12 @@ class ClusterManager:
         return await self._queue.submit("remove_member", _apply)
 
     def record_heartbeat(
-        self, member: Member, *, seq: int, epoch: str
+        self,
+        member: Member,
+        *,
+        seq: int,
+        epoch: str,
+        job_updates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Record liveness for a heartbeat. Touches no persisted state.
 
@@ -283,6 +717,13 @@ class ClusterManager:
         already authenticated by the member secret, so an epoch change is
         a restart, not an unauthenticated replay. Inside a live epoch the
         sequence must strictly increase.
+
+        The optional ``job_updates`` are attributed to the AUTHENTICATED
+        ``member`` and any member/rank id in the update bodies is ignored
+        (CL2-07). When the head has formation work queued for this member the
+        reply carries ``commands`` plus a signature over the commands and the
+        echoed epoch+seq (CL2-05/CL2-06); S1 heartbeats (no updates, no
+        pending commands) get exactly the S1 reply.
         """
         if not epoch:
             raise ClusterError(400, "Heartbeat epoch must not be empty")
@@ -300,15 +741,63 @@ class ClusterManager:
         )
         if revived:
             logger.info("Cluster member revived: id=%s", member.id)
-        return {
+
+        if job_updates and self._formation is not None:
+            self._formation.record_job_updates(member, job_updates)
+
+        reply: dict[str, Any] = {
             "member_id": member.id,
             "status": "active",
             "heartbeat_interval_s": float(self.settings.heartbeat_interval_s),
         }
+        commands = (
+            self._formation.commands_for(member.id)
+            if self._formation is not None
+            else []
+        )
+        if commands:
+            digest = self._state.member_digests.get(member.id, "")
+            reply["commands"] = commands
+            reply["command_epoch"] = epoch
+            reply["command_seq"] = seq
+            reply["command_sig"] = sign_command_response(
+                digest, commands, epoch=epoch, seq=seq
+            )
+        return reply
 
     async def member_leave(self, member: Member) -> dict[str, Any]:
         """Handle a member's own leave: revoke its secret."""
         return await self.remove_member(member.id)
+
+    # ---- distributed formation (D8) --------------------------------------
+
+    async def load_distributed(self, model_id: str) -> dict[str, Any]:
+        """Stand a tensor-parallel model up across the pair (head only)."""
+        if self._formation is None:
+            raise ClusterError(
+                404, "distributed formation is only available on the head"
+            )
+        if not model_id:
+            raise ClusterError(400, "a model id is required")
+        return await self._formation.load(model_id)
+
+    async def unload_distributed(self, model_id: str) -> dict[str, Any]:
+        """Tear a distributed formation down (head only)."""
+        if self._formation is None:
+            raise ClusterError(
+                404, "distributed formation is only available on the head"
+            )
+        if not model_id:
+            raise ClusterError(400, "a model id is required")
+        return await self._formation.unload(model_id)
+
+    def formation_status(self) -> dict[str, Any]:
+        """Read-only formation/job state (head only)."""
+        if self._formation is None:
+            raise ClusterError(
+                404, "distributed formation is only available on the head"
+            )
+        return self._formation.snapshot()
 
     async def scrub(self) -> list[str]:
         """Mark members past the timeout as lost. Never revokes a credential.
@@ -371,8 +860,9 @@ class ClusterManager:
                 joined_at=time.time(),
             )
             self._persist(replace(self._state, worker=identity))
-            interval = float(
-                reply.get("heartbeat_interval_s") or self.settings.heartbeat_interval_s
+            interval = _bounded_interval(
+                reply.get("heartbeat_interval_s"),
+                default=float(self.settings.heartbeat_interval_s),
             )
             await self._start_heartbeat(identity, interval_s=interval)
             logger.info("Joined cluster head %s as member %s", base_url, member_id)
@@ -458,6 +948,8 @@ class ClusterManager:
         }
         if self.role == "worker":
             snapshot["local"] = self.local_status()
+        if self._formation is not None:
+            snapshot["formation"] = self._formation.snapshot()
         return snapshot
 
     # ---- internals -------------------------------------------------------
@@ -471,6 +963,7 @@ class ClusterManager:
     ) -> None:
         if self._heartbeat is not None:
             await self._heartbeat.stop()
+        executor = self._executor
         self._heartbeat = HeartbeatSender(
             identity,
             interval_s=(
@@ -479,6 +972,10 @@ class ClusterManager:
                 else float(self.settings.heartbeat_interval_s)
             ),
             client_factory=self._client_factory,
+            command_sink=executor.deliver if executor is not None else None,
+            job_updates_provider=(
+                executor.pending_job_updates if executor is not None else None
+            ),
         )
         await self._heartbeat.start()
 
@@ -492,6 +989,21 @@ class ClusterManager:
                 raise
             except Exception as exc:  # noqa: BLE001 - the loop must survive
                 logger.warning("Cluster scrub failed: %s", exc)
+
+
+def _bounded_interval(value: Any, *, default: float) -> float:
+    """Clamp a head-supplied heartbeat interval, rejecting non-numeric (CL2-10).
+
+    A hostile or broken join reply must not be able to silence the worker with
+    an absurd interval, or crash it with a non-numeric one.
+    """
+    try:
+        interval = float(value)
+    except (TypeError, ValueError):
+        return default
+    if interval <= 0:
+        return default
+    return min(interval, MAX_HEARTBEAT_INTERVAL_S)
 
 
 def _sanitize_name(name: str | None) -> str:

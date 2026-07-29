@@ -524,6 +524,20 @@ class ClusterSettings:
     # (CL-10 otherwise rejects loopback, unspecified and multicast).
     allow_loopback: bool = False
     node_name: str = ""
+    # D7 data-plane addressing. Every field is this node's OWN configuration:
+    # a worker validates hostfile entries and resolves its rank against these,
+    # never against head-supplied values (CL2-03/CL2-12). ``data_plane_subnet``
+    # unset makes formation refuse — an unreviewed node must never degrade to
+    # trusting the head.
+    data_plane_subnet: str = ""
+    data_plane_address: str = ""
+    backend: str = "auto"
+    data_plane_base_port: int = 41100
+    rdma_device: str = ""
+    # Operator override: accept a data-plane address outside data_plane_subnet
+    # (any management-LAN address, private or not). Dangerous — see
+    # docs/cluster/s2-security-notes.md; default-deny keeps CL-09 intact.
+    allow_routable_data_plane: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -539,10 +553,19 @@ class ClusterSettings:
             bootstrap_token_ttl_s=float(data.get("bootstrap_token_ttl_s", 900.0)),
             allow_loopback=bool(data.get("allow_loopback", False)),
             node_name=str(data.get("node_name") or ""),
+            data_plane_subnet=str(data.get("data_plane_subnet") or ""),
+            data_plane_address=str(data.get("data_plane_address") or ""),
+            backend=normalize_cluster_backend(data.get("backend")),
+            data_plane_base_port=int(data.get("data_plane_base_port", 41100)),
+            rdma_device=str(data.get("rdma_device") or ""),
+            allow_routable_data_plane=bool(
+                data.get("allow_routable_data_plane", False)
+            ),
         )
 
 
 VALID_CLUSTER_ROLES = {"off", "head", "worker"}
+VALID_CLUSTER_BACKENDS = {"ring", "jaccl", "auto"}
 
 
 def normalize_cluster_role(value: Any) -> str:
@@ -556,6 +579,15 @@ def normalize_cluster_role(value: Any) -> str:
         logger.warning(f"Invalid cluster role: {value!r}, using 'off'")
         return "off"
     return role
+
+
+def normalize_cluster_backend(value: Any) -> str:
+    """Coerce a data-plane backend to a known value, defaulting to ``auto``."""
+    backend = str(value or "auto").strip().lower()
+    if backend not in VALID_CLUSTER_BACKENDS:
+        logger.warning(f"Invalid cluster backend: {value!r}, using 'auto'")
+        return "auto"
+    return backend
 
 
 @dataclass
@@ -1058,6 +1090,28 @@ class GlobalSettings:
             }
         if node_name := os.getenv("OMLX_CLUSTER_NODE_NAME"):
             self.cluster.node_name = node_name
+        if subnet := os.getenv("OMLX_CLUSTER_DATA_PLANE_SUBNET"):
+            self.cluster.data_plane_subnet = subnet
+        if dp_address := os.getenv("OMLX_CLUSTER_DATA_PLANE_ADDRESS"):
+            self.cluster.data_plane_address = dp_address
+        if backend := os.getenv("OMLX_CLUSTER_BACKEND"):
+            self.cluster.backend = normalize_cluster_backend(backend)
+        if base_port := os.getenv("OMLX_CLUSTER_DATA_PLANE_BASE_PORT"):
+            try:
+                self.cluster.data_plane_base_port = int(base_port)
+            except ValueError:
+                logger.warning(
+                    f"Invalid OMLX_CLUSTER_DATA_PLANE_BASE_PORT value: {base_port}"
+                )
+        if rdma_device := os.getenv("OMLX_CLUSTER_RDMA_DEVICE"):
+            self.cluster.rdma_device = rdma_device
+        if allow_routable := os.getenv("OMLX_CLUSTER_ALLOW_ROUTABLE_DATA_PLANE"):
+            self.cluster.allow_routable_data_plane = allow_routable.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
 
         # MCP settings
         if mcp_config := os.getenv("OMLX_MCP_CONFIG"):
@@ -1185,6 +1239,33 @@ class GlobalSettings:
             self.cluster.role = normalize_cluster_role(args.cluster_role)
         if hasattr(args, "cluster_allow_loopback") and args.cluster_allow_loopback:
             self.cluster.allow_loopback = True
+        if (
+            hasattr(args, "cluster_data_plane_subnet")
+            and args.cluster_data_plane_subnet is not None
+        ):
+            self.cluster.data_plane_subnet = args.cluster_data_plane_subnet
+        if (
+            hasattr(args, "cluster_data_plane_address")
+            and args.cluster_data_plane_address is not None
+        ):
+            self.cluster.data_plane_address = args.cluster_data_plane_address
+        if hasattr(args, "cluster_backend") and args.cluster_backend is not None:
+            self.cluster.backend = normalize_cluster_backend(args.cluster_backend)
+        if (
+            hasattr(args, "cluster_data_plane_base_port")
+            and args.cluster_data_plane_base_port is not None
+        ):
+            self.cluster.data_plane_base_port = args.cluster_data_plane_base_port
+        if (
+            hasattr(args, "cluster_rdma_device")
+            and args.cluster_rdma_device is not None
+        ):
+            self.cluster.rdma_device = args.cluster_rdma_device
+        if (
+            hasattr(args, "cluster_allow_routable_data_plane")
+            and args.cluster_allow_routable_data_plane
+        ):
+            self.cluster.allow_routable_data_plane = True
 
         # MCP settings
         if hasattr(args, "mcp_config") and args.mcp_config is not None:

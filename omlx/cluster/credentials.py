@@ -15,6 +15,7 @@ own secret in plaintext — it has to present it on every heartbeat.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ import secrets
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 from ..admin.auth import compare_keys
 from .state import BootstrapTokenRecord, ClusterState
@@ -31,6 +33,12 @@ logger = logging.getLogger(__name__)
 CLUSTER_STATE_FILENAME = "cluster.json"
 SECRET_BYTES = 32
 EPOCH_BYTES = 8
+
+# Domain-separation label for the CL2-05 command-response key. The response
+# key is derived from the member digest (which both head and worker hold) so
+# it is never the bearer verifier itself — a command-bearing heartbeat
+# response is authenticated with a key that cannot also pass member auth.
+_RESPONSE_KEY_LABEL = b"omlx.cluster.command-response.v1"
 
 
 def cluster_state_path(base_path: Path) -> Path:
@@ -58,6 +66,53 @@ def verify_secret(provided: str, expected_digest: str) -> bool:
     if not provided or not expected_digest:
         return False
     return compare_keys(digest_secret(provided), expected_digest)
+
+
+def _derive_response_key(digest: str) -> bytes:
+    """Derive the CL2-05 command-response MAC key from a member digest.
+
+    The head holds ``sha256(secret)`` (the stored digest) and the worker
+    derives the same value from its own secret, so both compute an identical
+    key without either shipping new material. Domain-separated from the digest
+    so the response key is never usable as the member bearer credential.
+    """
+    return hmac.new(
+        digest.encode("utf-8", "surrogatepass"), _RESPONSE_KEY_LABEL, hashlib.sha256
+    ).digest()
+
+
+def canonical_command_payload(commands: Any, *, epoch: str, seq: int) -> bytes:
+    """Canonicalise the signed content of a command-bearing response.
+
+    Both sides serialise the same logical ``commands`` list with sorted keys
+    and no whitespace, then bind the head-echoed ``epoch`` and ``seq`` so a MAC
+    captured in one heartbeat cannot be replayed onto another (CL2-06). The
+    worker canonicalises the decoded ``commands`` list exactly as received, and
+    the head canonicalises the list it is about to send — identical JSON.
+    """
+    body = json.dumps(commands, sort_keys=True, separators=(",", ":"))
+    return f"{body}|{epoch}|{seq}".encode("utf-8", "surrogatepass")
+
+
+def sign_command_response(digest: str, commands: Any, *, epoch: str, seq: int) -> str:
+    """MAC a command-bearing heartbeat response (CL2-05, head side)."""
+    key = _derive_response_key(digest)
+    payload = canonical_command_payload(commands, epoch=epoch, seq=seq)
+    return hmac.new(key, payload, hashlib.sha256).hexdigest()
+
+
+def verify_command_response(
+    digest: str, commands: Any, *, epoch: str, seq: int, signature: str
+) -> bool:
+    """Constant-time check of a command-bearing response MAC (CL2-05, worker).
+
+    Returns False for an absent or wrong signature so the worker can discard a
+    commands-bearing response it cannot authenticate.
+    """
+    if not signature:
+        return False
+    expected = sign_command_response(digest, commands, epoch=epoch, seq=seq)
+    return compare_keys(expected, signature)
 
 
 def mint_bootstrap_token(

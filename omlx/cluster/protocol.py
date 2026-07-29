@@ -325,6 +325,26 @@ def parse_command(data: Any) -> Command:
         raise ProtocolError(f"invalid {kind} command: {exc}") from exc
 
 
+def command_to_wire(command: Command) -> dict[str, Any]:
+    """Serialise a command to the JSON dict the heartbeat response carries."""
+    return command.model_dump(mode="json")
+
+
+def make_job_update(
+    job_id: str, step: int, *, status: str, **extra: Any
+) -> dict[str, Any]:
+    """Build a worker->head job update.
+
+    The head attributes every update to the AUTHENTICATED member and ignores
+    any member/rank id carried here (CL2-07), so this shape deliberately does
+    not name a member. ``status`` is one of ``accepted``, ``spawned``,
+    ``present``, ``absent``, ``swept``, ``torn_down``, ``error``, ``rejected``.
+    """
+    update: dict[str, Any] = {"job_id": job_id, "step": step, "status": status}
+    update.update(extra)
+    return update
+
+
 # -- stop-sequence straddle handling -----------------------------------------
 
 

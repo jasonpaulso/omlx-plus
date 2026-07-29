@@ -50,11 +50,19 @@ class JoinRequest(BaseModel):
 class HeartbeatRequest(BaseModel):
     seq: int = Field(ge=0)
     epoch: str
+    # Worker->head rank status (D2). Absent = S1 behaviour. The head attributes
+    # every update to the authenticated member and ignores any member/rank id
+    # carried in the update bodies (CL2-07).
+    job_updates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class LocalJoinRequest(BaseModel):
     head_url: str
     token: str
+
+
+class DistributedModelRequest(BaseModel):
+    model: str
 
 
 def _manager() -> ClusterManager:
@@ -129,6 +137,33 @@ async def remove_member(member_id: str) -> dict[str, Any]:
         raise _http_error(exc) from exc
 
 
+@_operator_router.post("/models/load")
+async def load_distributed_model(body: DistributedModelRequest) -> dict[str, Any]:
+    """Stand a tensor-parallel model up across the pair (head, operator tier)."""
+    try:
+        return await _manager().load_distributed(body.model)
+    except ClusterError as exc:
+        raise _http_error(exc) from exc
+
+
+@_operator_router.post("/models/unload")
+async def unload_distributed_model(body: DistributedModelRequest) -> dict[str, Any]:
+    """Tear a distributed formation down (head, operator tier)."""
+    try:
+        return await _manager().unload_distributed(body.model)
+    except ClusterError as exc:
+        raise _http_error(exc) from exc
+
+
+@_operator_router.get("/models/status")
+async def distributed_status() -> dict[str, Any]:
+    """Read-only formation/job state (head, operator tier)."""
+    try:
+        return _manager().formation_status()
+    except ClusterError as exc:
+        raise _http_error(exc) from exc
+
+
 @_join_router.post("/join")
 async def join_cluster(request: Request, body: JoinRequest) -> dict[str, Any]:
     """Admit a worker. Address comes from the socket, never from the body."""
@@ -153,7 +188,9 @@ async def heartbeat(
 ) -> dict[str, Any]:
     """Record liveness for the authenticated member."""
     try:
-        return _manager().record_heartbeat(member, seq=body.seq, epoch=body.epoch)
+        return _manager().record_heartbeat(
+            member, seq=body.seq, epoch=body.epoch, job_updates=body.job_updates
+        )
     except ClusterError as exc:
         raise _http_error(exc) from exc
 

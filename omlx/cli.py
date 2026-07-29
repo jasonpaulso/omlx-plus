@@ -390,7 +390,9 @@ def launch_command(args, extra_args: list[str] | None = None):
     # for connecting. Wildcard addresses (0.0.0.0, ::) are valid bind targets
     # but not connectable — fall back to localhost in that case.
     first_bind = [h.strip() for h in host.split(",") if h.strip()][0] if host else ""
-    connect_host = first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    connect_host = (
+        first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
+    )
 
     # Check if oMLX server is running
     base_url = f"http://{connect_host}:{port}"
@@ -477,7 +479,9 @@ def launch_command(args, extra_args: list[str] | None = None):
     # If the model was chosen interactively (no --model and no explicit tier flags),
     # use the picked model for all tiers instead of letting settings-based tier
     # models override the user's selection.
-    if args.model is None and not (cli_opus_model or cli_sonnet_model or cli_haiku_model):
+    if args.model is None and not (
+        cli_opus_model or cli_sonnet_model or cli_haiku_model
+    ):
         opus_model = None
         sonnet_model = None
         haiku_model = None
@@ -885,6 +889,22 @@ def cluster_command(args):
             print("Warning: the head could not be reached; remove the member there.")
         return
 
+    if action in ("load", "unload"):
+        if not args.model:
+            print(f"A model id is required: omlx cluster {action} <model>")
+            sys.exit(1)
+        result = _cluster_request(
+            "POST",
+            f"{base_url}/v1/cluster/models/{action}",
+            headers,
+            {"model": args.model},
+        )
+        print(
+            f"{action.capitalize()} {result.get('model')}: "
+            f"{result.get('status')} (job {result.get('job_id')})"
+        )
+        return
+
     # status
     if settings.cluster.role == "worker":
         result = _cluster_request("GET", f"{base_url}/v1/cluster/local/status", headers)
@@ -910,6 +930,11 @@ def cluster_command(args):
             f"  {member.get('id')}  {member.get('address')}:{member.get('port')}  "
             f"{member.get('status')}  {member.get('name') or ''}"
         )
+    formation = result.get("formation")
+    if formation:
+        print(f"Distributed model: {formation.get('active_model') or '(none)'}")
+        for alarm in formation.get("alarms") or []:
+            print(f"  ALARM: {alarm}")
 
 
 def main():
@@ -1152,6 +1177,44 @@ Example directory structure:
         action="store_true",
         help="Admit cluster members whose address is loopback (single-host testing)",
     )
+    serve_parser.add_argument(
+        "--cluster-data-plane-subnet",
+        type=str,
+        default=None,
+        help="CIDR of the Thunderbolt link subnet, e.g. 10.0.2.0/24 (D7). "
+        "Formation refuses if unset",
+    )
+    serve_parser.add_argument(
+        "--cluster-data-plane-address",
+        type=str,
+        default=None,
+        help="This node's own address inside the data-plane subnet",
+    )
+    serve_parser.add_argument(
+        "--cluster-backend",
+        type=str,
+        choices=["ring", "jaccl", "auto"],
+        default=None,
+        help="Data-plane collective backend (default: auto)",
+    )
+    serve_parser.add_argument(
+        "--cluster-data-plane-base-port",
+        type=int,
+        default=None,
+        help="First ring listening port (default: 41100)",
+    )
+    serve_parser.add_argument(
+        "--cluster-rdma-device",
+        type=str,
+        default=None,
+        help="RDMA device name for the jaccl backend, e.g. rdma_en2",
+    )
+    serve_parser.add_argument(
+        "--cluster-allow-routable-data-plane",
+        action="store_true",
+        help="Accept a data-plane address outside data_plane_subnet (dangerous; "
+        "weakens CL-09 link scoping)",
+    )
 
     # Launch command
     launch_parser = subparsers.add_parser(
@@ -1257,14 +1320,22 @@ Example directory structure:
     cluster_parser.add_argument(
         "action",
         type=str,
-        choices=["token", "leave", "status"],
+        choices=["token", "leave", "status", "load", "unload"],
         help="token: mint (or --revoke) a bootstrap join token (head); "
-        "leave: leave the cluster (worker); status: show cluster state",
+        "leave: leave the cluster (worker); status: show cluster state; "
+        "load/unload <model>: stand a distributed model up/down (head)",
     )
     cluster_parser.add_argument(
         "--revoke",
         action="store_true",
         help="With 'token': invalidate the current bootstrap join token",
+    )
+    cluster_parser.add_argument(
+        "model",
+        type=str,
+        nargs="?",
+        default=None,
+        help="With 'load'/'unload': the model id to form or tear down",
     )
 
     for cluster_client_parser in (join_parser, cluster_parser):
