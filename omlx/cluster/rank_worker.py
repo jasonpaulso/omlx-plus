@@ -244,6 +244,8 @@ class Rank:
     # -- leader: the D4 scheduler-driven serve loop -------------------------
 
     def _serve_leader(self) -> None:
+        import mlx.core as mx
+
         from omlx.cluster.scheduler_config import build_rank_scheduler_config
         from omlx.cluster.tp_batch import LeaderModelProxy, TPBatchGenerator
         from omlx.scheduler import Scheduler
@@ -254,6 +256,31 @@ class Rank:
             model=proxy,
             tokenizer=self.tokenizer,
             config=build_rank_scheduler_config(),
+            # Rank 0 must run every GPU op on the SAME stream a follower uses
+            # (the process default), so pin the engine stream instead of
+            # letting it default to mlx-lm's `generation_stream`. That default
+            # is an `mx.new_thread_local_stream(...)` handle: it resolves to a
+            # fresh per-thread GPU stream (gpu/1 on the main thread, gpu/3,
+            # gpu/5, ... on others) and never to gpu/0.
+            #
+            # Leaving it unpinned gave rank 0 three streams -- the scheduler's
+            # gpu/1 (prefill, cache merges, sampling), the proxy's gpu/0 (the
+            # sharded forward), and the cpu stream every TP all-reduce
+            # actually executes on (`AllReduce::eval_gpu` throws "has no GPU
+            # implementation"; mlx routes the collective to a cpu-stream
+            # task). A follower has only two. Once a batched forward on gpu/0
+            # consumed a cache built on gpu/1 -- i.e. the first genuinely
+            # multi-row forward after an admit -- the cpu-stream collective
+            # inherited a fence on that other GPU stream and mlx's
+            # `Fence::wait` spun on it forever: rank 0's collective never
+            # reached the wire, so its ring socket threads sat idle while
+            # every follower blocked in `recvfrom` inside the matching
+            # all-reduce. Native stacks in
+            # `discovery/spike/s3-deadlock/` (`sample_2_*.txt`) show exactly
+            # that split. One stream per rank removes the cross-stream fence,
+            # and makes `LeaderModelProxy._compute_stream` the invariant's
+            # second line of defence rather than its only one.
+            stream=mx.default_stream(mx.default_device()),
             batch_generator_factory=lambda _sp: TPBatchGenerator(proxy),
         )
         self._reply({"ok": True, "event": "ready", "rank": 0})

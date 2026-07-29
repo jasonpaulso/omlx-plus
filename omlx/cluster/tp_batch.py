@@ -112,8 +112,28 @@ class LeaderModelProxy:
     """
 
     def __init__(self, model: Any, session: Broadcaster) -> None:
+        import mlx.core as mx
+
         self._model = model
         self._session = session
+        # Every model forward this proxy delegates executes under ONE fixed
+        # stream, captured here — the process default at rank startup, before
+        # any Scheduler exists, and the same stream every follower replays on.
+        #
+        # A TP all-reduce never runs on a GPU stream: `AllReduce::eval_gpu`
+        # throws "has no GPU implementation", so mlx routes the collective to
+        # a cpu-stream task and fences it against whatever GPU stream produced
+        # its input. One GPU stream per rank means that fence is always
+        # against work the same rank is already about to finish. A *second*
+        # GPU stream on the leader is what deadlocked S3: the cpu-stream
+        # collective ended up waiting on a fence the other GPU stream never
+        # signalled, mlx's `Fence::wait` spun on it forever, rank 0's
+        # all-reduce never reached the wire, and every follower sat in
+        # `recvfrom` inside the matching collective. `rank_worker
+        # ._serve_leader` pins the Scheduler's engine stream for that reason;
+        # this pin is the second line of defence, covering any caller that
+        # wraps a forward in a stream context of its own.
+        self._compute_stream = mx.default_stream(mx.default_device())
         self._tag_source = itertools.count(1)
         self._standalone: dict[int, _StandaloneEntry] = {}
         self._standalone_by_cache_id: dict[int, int] = {}
@@ -240,26 +260,31 @@ class LeaderModelProxy:
         self._session.broadcast_json(op.to_dict())
         self.tax_samples.append((time.perf_counter() - t0) * 1000.0)
 
-        result = self._model(tokens, cache=cache, **kwargs)
-        # Force this forward's TP collectives to run before any later call
-        # can race ahead and issue a different collective (a new broadcast,
-        # or the next op's own forward) out of step with every follower —
-        # who forces the identical pair (its own output plus its own cache
-        # state) immediately after its own model call in
-        # FollowerReplayer.apply(). Evaluating cache state alone is not
-        # enough: cache writes come from each layer's local K/V projection,
-        # before that layer's own attention-output/MLP all-reduce, so the
-        # *last* layer's all-reduce is never on cache state's dependency
-        # path — only `result` (which feeds the replicated lm_head) forces
-        # it. Skipping either half here would make this rank issue a
-        # different collective sequence than a follower that always forces
-        # both, and that mismatch deadlocks the next collective.
         import mlx.core as mx
 
-        if cache is not None:
-            mx.eval(result, [c.state for c in cache])
-        else:
-            mx.eval(result)
+        # The pinned stream (see __init__) overrides any ambient stream
+        # context a caller established around this call: the forward's TP
+        # collectives must fence against the one GPU stream this rank uses.
+        with mx.stream(self._compute_stream):
+            result = self._model(tokens, cache=cache, **kwargs)
+            # Force this forward's TP collectives to run before any later
+            # call can race ahead and issue a different collective (a new
+            # broadcast, or the next op's own forward) out of step with every
+            # follower — who forces the identical pair (its own output plus
+            # its own cache state) immediately after its own model call in
+            # FollowerReplayer.apply(). Evaluating cache state alone is not
+            # enough: cache writes come from each layer's local K/V
+            # projection, before that layer's own attention-output/MLP
+            # all-reduce, so the *last* layer's all-reduce is never on cache
+            # state's dependency path — only `result` (which feeds the
+            # replicated lm_head) forces it. Skipping either half here would
+            # make this rank issue a different collective sequence than a
+            # follower that always forces both, and that mismatch deadlocks
+            # the next collective.
+            if cache is not None:
+                mx.eval(result, [c.state for c in cache])
+            else:
+                mx.eval(result)
         return result
 
     def flush(self, tags: list[int] | None = None) -> None:
@@ -291,8 +316,16 @@ class FollowerReplayer:
     """
 
     def __init__(self, model: Any, make_cache: Any) -> None:
+        import mlx.core as mx
+
         self._model = model
         self._make_cache = make_cache
+        # Mirror of LeaderModelProxy._compute_stream: all replayed forwards
+        # execute under one fixed stream so both ranks' collective execution
+        # order is total and identical. Today this IS the process default the
+        # serve loop already runs on; capturing it explicitly keeps the
+        # invariant if a future caller wraps apply() in a stream context.
+        self._compute_stream = mx.default_stream(mx.default_device())
         self._standalone: dict[int, list[Any]] = {}
         # Tag -> already batch-wrapped, already-stepped cache produced by a
         # PHASE_ADMIT forward, waiting to be folded into the running batch by
@@ -313,18 +346,20 @@ class FollowerReplayer:
                 cache = self._make_cache()
                 self._standalone[tag] = cache
             tokens = mx.array(op.token_ids)
-            out = self._model(tokens, cache=cache)
-            # Evaluate the model's own output, not just cache state: cache
-            # writes come from each layer's *local* K/V projection, before
-            # that layer's attention-output/MLP all-reduce (D4's
-            # "sharded-to-all" shard_linear placement); the last layer's own
-            # all-reduce is never on cache state's dependency path, only on
-            # the final hidden state that feeds the (unsharded, replicated)
-            # lm_head. Forcing cache state alone silently skips that
-            # collective — this rank would never issue it, while the leader
-            # eventually does (its result feeds sampling), a per-rank
-            # collective-count mismatch that deadlocks the next op.
-            mx.eval(out, [c.state for c in cache])
+            with mx.stream(self._compute_stream):
+                out = self._model(tokens, cache=cache)
+                # Evaluate the model's own output, not just cache state: cache
+                # writes come from each layer's *local* K/V projection, before
+                # that layer's attention-output/MLP all-reduce (D4's
+                # "sharded-to-all" shard_linear placement); the last layer's
+                # own all-reduce is never on cache state's dependency path,
+                # only on the final hidden state that feeds the (unsharded,
+                # replicated) lm_head. Forcing cache state alone silently
+                # skips that collective — this rank would never issue it,
+                # while the leader eventually does (its result feeds
+                # sampling), a per-rank collective-count mismatch that
+                # deadlocks the next op.
+                mx.eval(out, [c.state for c in cache])
         elif op.phase == PHASE_ADMIT:
             tag = op.tags[0]
             cache = self._standalone.pop(tag, None)
@@ -332,15 +367,17 @@ class FollowerReplayer:
                 cache = self._make_cache()
             wrapped = _merge_caches([cache])
             tokens = mx.array(op.token_ids)
-            out = self._model(tokens, cache=wrapped)
-            mx.eval(out, [c.state for c in wrapped])
+            with mx.stream(self._compute_stream):
+                out = self._model(tokens, cache=wrapped)
+                mx.eval(out, [c.state for c in wrapped])
             self._admitted[tag] = wrapped
         elif op.phase == PHASE_BATCHED:
             self._reconcile_batched(op.tags)
             if op.tags:
                 tokens = mx.array(op.token_ids)
-                out = self._model(tokens, cache=self._batch_cache)
-                mx.eval(out, [c.state for c in self._batch_cache])
+                with mx.stream(self._compute_stream):
+                    out = self._model(tokens, cache=self._batch_cache)
+                    mx.eval(out, [c.state for c in self._batch_cache])
         else:
             raise ProtocolError(f"FollowerReplayer: unhandled phase {op.phase!r}")
 

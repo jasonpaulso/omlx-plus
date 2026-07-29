@@ -365,12 +365,22 @@ async def test_queue_full_rejects_while_earlier_requests_keep_streaming(tmp_path
             streams[i] = stream
             outcomes[i] = "streaming"
 
-        await asyncio.wait_for(
-            asyncio.gather(*(submit(i) for i in range(num_submissions))),
-            GEN_TIMEOUT_S,
-        )
-
+        tasks = [asyncio.create_task(submit(i)) for i in range(num_submissions)]
         try:
+            # Deliberately NOT gather(): most of these submissions never settle
+            # within the test, by design. Only max_num_seqs (8) requests reach
+            # the running batch and emit a first token; the next 32 fill the
+            # waiting queue and stay parked there behind 4096-token
+            # generations -- that saturation is the precondition the burst
+            # exists to create -- and only the overflow past the cap raises.
+            # Waiting on all 41 would therefore always time out, whatever the
+            # scheduler does. Wait for the two outcomes actually under test.
+            await _wait_for(
+                lambda: any(o == "queue_full" for o in outcomes)
+                and any(o == "streaming" for o in outcomes),
+                GEN_TIMEOUT_S,
+            )
+
             rejected = [o for o in outcomes if o == "queue_full"]
             streaming = [o for o in outcomes if o == "streaming"]
             assert rejected, (
@@ -378,12 +388,11 @@ async def test_queue_full_rejects_while_earlier_requests_keep_streaming(tmp_path
                 f"{num_submissions}-submission burst; outcomes={outcomes}"
             )
             assert streaming, "expected earlier submissions to still be streaming"
-            # A fresh submission after the burst confirms the scheduler itself
-            # (not the formation) is what's saturated -- it still enforces the
-            # same cap, not permanently wedged.
         finally:
             # Disconnect every admitted stream so the formation tears down
             # cleanly rather than waiting out 4096-token generations.
+            for task in tasks:
+                task.cancel()
             for stream in streams:
                 if stream is not None:
                     with contextlib.suppress(Exception):
