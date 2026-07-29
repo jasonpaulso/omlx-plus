@@ -186,6 +186,12 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--n", type=int, default=4)
     ap.add_argument("--abort-after", type=int, default=8)
+    ap.add_argument(
+        "--hold-s",
+        type=float,
+        default=90.0,
+        help="flood only: bounded window to hold proven slots open",
+    )
     ap.add_argument("--backend", default="", help="recorded as metadata only")
     ap.add_argument("--out", required=True, help="raw JSON dump path")
     args = ap.parse_args()
@@ -236,6 +242,12 @@ def main():
         all_reported = threading.Event()
         remaining = [args.n]
         lock = threading.Lock()
+        # ONE global deadline, not a per-thread timeout. The admitted requests
+        # ask for 4096 tokens, so slots free only after minutes and the queued
+        # 32 never report -- a per-thread wait would compound into a run far
+        # longer than the rig session. The rejection, if it comes, arrives
+        # within seconds of submission, so a bounded window is sufficient.
+        deadline = CLOCK() + args.hold_s
 
         def arrived():
             with lock:
@@ -244,8 +256,7 @@ def main():
                     all_reported.set()
 
         def hold():
-            # Generous but bounded: a deadlock must not hang the rig session.
-            all_reported.wait(timeout=180)
+            all_reported.wait(timeout=max(0.0, deadline - CLOCK()))
 
         records = run_parallel(
             [
