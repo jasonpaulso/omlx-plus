@@ -10,14 +10,17 @@ on both nodes. This is the tracked S2 P3 deliverable per `discovery/spec/s2-plan
 |---|---|---|
 | 1a | MiniMax-M2.7-3bit loads across the pair, generates, streams, aborts cleanly (real HTTP, ring) | **PASS** |
 | 1b | Small-model + Qwen greedy parity, dist-vs-single-node, ring | **PASS** (byte-identical / matches after documented trailing-whitespace normalization) |
-| 1c | Same, jaccl | **BLOCKED — not implemented in landed code, not attempted** (see below) |
+| 1c | Same, jaccl | **DEFERRED — jaccl-wiring slice in flight, follow-up run pending** (see below) |
 | 2 | E4 tax ≤ 10% of 102.682 ms/token, ring | **PASS** — 0.457 ms/token, 4.45% of budget |
-| 2 | Same, jaccl | **BLOCKED — not measurable** |
+| 2 | Same, jaccl | **DEFERRED — pending wiring slice** |
 | MiniMax capacity | 93GB 3-bit MoE shards across 96GB Studio + 128GB local without OOM | **PASS** (operational evidence; precise per-rank memory bytes not captured — see caveat) |
 
-**Headline: ring backend passes every acceptance item measured. jaccl cannot be measured in this
-session — the P2-landed launcher/formation code hard-rejects any backend other than `ring` before
-formation is attempted (code-level gap, not a rig or config issue, not an E4 breach).**
+**Headline: ring backend passes every acceptance item measured — this is the load-bearing S2 result
+(MiniMax actually loads and serves across the 96GB Studio, and the real-protocol E4 tax clears the
+10% budget with large headroom). jaccl is deferred, not failed: the P2-landed launcher/formation code
+hard-rejected any backend other than `ring` before formation was attempted, and a dedicated
+jaccl-launcher-wiring slice is already in flight to close that gap — see the jaccl section below for
+why this doc deliberately does not record the (soon-to-be-deleted) 400 as acceptance evidence.**
 
 ## E4 tax re-measurement (Task per D9)
 
@@ -123,9 +126,16 @@ identical error at the cost of a daemon restart:
 This is favorable from a safety standpoint — a jaccl request fails loudly with an explicit 400
 rather than silently forming on ring and being misrecorded (the exact failure mode D9's integrity
 rule was written to prevent) — but it means **acceptance items 1c and the jaccl row of item 2 cannot
-be satisfied in this program slice as currently landed.** This needs either a small follow-up code
-slice wiring the existing `hostfile.py` jaccl builders into the launcher/formation/manager spawn
-path, or an explicit decision to descope jaccl acceptance from S2.
+be satisfied in this program slice as currently landed.**
+
+**Status: deferred, not descoped.** A jaccl-launcher-wiring slice is in flight (isolated worktree,
+dispatched by the program lead) to wire the existing `hostfile.py` jaccl builders into the
+launcher/formation/manager spawn path. The 400 above was **not** captured live against a running
+daemon on purpose — it comes from the exact hard-gate the wiring slice is deleting, so recording it
+as "acceptance evidence" would document code that no longer exists by the time this doc is read. Once
+that slice merges and deploys, the real jaccl evidence is an actual jaccl formation result (pass, or
+a genuine hardware/RDMA failure) — a short follow-up run (form → load MiniMax → generate → E4 tax on
+jaccl) will add that row to this doc and replace this section's language accordingly.
 
 ## P2 gap found and fixed during this session
 
