@@ -149,7 +149,9 @@ class TestDisconnectGuard:
             yield "unreachable"
 
         async def consume_stream():
-            async for _ in server._release_after_stream(blocked_stream(), lease):
+            async for _ in server._release_after_stream(
+                blocked_stream(), lease, engine
+            ):
                 pass
 
         await pool._lock.acquire()

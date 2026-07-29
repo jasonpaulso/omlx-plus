@@ -60,17 +60,24 @@ class TestWaitingQueueCap:
     """
 
     def test_admits_below_cap(self, scheduler):
-        # Seed occupancy to 39 (running=8, waiting=31) — one below the total
-        # cap of 40. add_request for the next request should clear the cap
-        # check (it fails later on the duplicate-ID check, which is what
-        # proves we got past the cap rather than short-circuiting on it).
-        _fill_running(scheduler, 8)
-        for i in range(31):
+        """Total occupancy at 39 (running=7, waiting=32) — one below the
+        total cap of 40 — must actually admit the request into
+        ``self.waiting``, not merely clear the cap check en route to some
+        other rejection.
+
+        Waiting alone (32) already sits at the OLD waiting-only cap here, so
+        this composition is falsifiable: a regression back to
+        ``len(self.waiting) >= waiting_queue_capacity(...)`` rejects at this
+        exact point, where the total-form gate (running + waiting +
+        reservations vs. ``total_queue_capacity``) admits.
+        """
+        _fill_running(scheduler, 7)
+        for i in range(32):
             scheduler.waiting.append(_make_request(f"r{i}"))
         req = _make_request("r-new")
-        scheduler.requests[req.request_id] = req
-        with pytest.raises(ValueError, match="already exists"):
-            scheduler.add_request(req)
+        scheduler.add_request(req)
+        assert req in scheduler.waiting
+        assert scheduler.requests[req.request_id] is req
 
     def test_rejects_at_cap(self, scheduler):
         # Total occupancy at cap: running=8 (max_num_seqs) + waiting=32
@@ -91,16 +98,16 @@ class TestWaitingQueueCap:
         32 waiting requests with an empty running batch used to be exactly
         the old cap (waiting_queue_capacity(8) == 32) and raised. Under the
         total form the cap is 40 (max_num_seqs=8 + waiting cap 32), so 32
-        waiting alone is well under it — add_request must clear the cap
-        check and fail on the duplicate-ID check instead. A regression back
-        to the waiting-only form would raise SchedulerQueueFullError here.
+        waiting alone is well under it — add_request must actually admit
+        the new request into ``self.waiting``. A regression back to the
+        waiting-only form would raise SchedulerQueueFullError here instead.
         """
         for i in range(32):
             scheduler.waiting.append(_make_request(f"r{i}"))
         req = _make_request("r-new")
-        scheduler.requests[req.request_id] = req
-        with pytest.raises(ValueError, match="already exists"):
-            scheduler.add_request(req)
+        scheduler.add_request(req)
+        assert req in scheduler.waiting
+        assert scheduler.requests[req.request_id] is req
 
     def test_cap_scales_with_max_num_seqs(self, scheduler):
         # total cap = max_num_seqs + waiting_queue_capacity(max_num_seqs);

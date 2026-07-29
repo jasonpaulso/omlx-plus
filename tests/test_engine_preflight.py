@@ -249,6 +249,124 @@ async def test_preflight_completion_raises_for_oversize_prompt(monkeypatch):
         await engine.preflight_completion(prompt="a" * 110_000)
 
 
+def _make_scheduler_request(rid: str):
+    """A ``scheduler.add_request``-compatible stand-in, matching the shape
+    ``tests/test_scheduler_admission.py::_make_request`` uses for the same
+    real ``Scheduler``.
+    """
+    r = MagicMock()
+    r.request_id = rid
+    r.prompt = "hello"
+    r.prompt_token_ids = [1, 2, 3]
+    r.num_prompt_tokens = 3
+    r.cached_tokens = 0
+    return r
+
+
+class TestPreflightReservationLeak:
+    """Task #18: ``preflight_chat``/``preflight_completion`` used to claim
+    the queue reservation (``_preflight_queue``) BEFORE tokenization and the
+    prefill-memory check. When the memory check rejected the request, the
+    claim was never released — only ``add_request`` releases it, and a
+    rejected request never reaches ``add_request``. At the default capacity
+    of 40 (max_num_seqs=8), ~40 oversized-prompt rejections left
+    ``reserved=40`` behind on an idle server, and every subsequent preflight
+    503'd against a phantom-full queue until the 30s reservation TTL swept
+    it. The fix claims the reservation last, only on an exit that lets the
+    caller proceed to the real chat/completion path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_preflight_chat_releases_reservation_on_memory_guard_raise(self):
+        from omlx.engine.batched import BatchedEngine
+
+        scheduler = _make_scheduler()
+        scheduler._prefill_memory_guard = True
+
+        # Mock at scheduler.preflight_or_raise — the call preflight_chat's
+        # claim was moved to run after, not _preflight_or_raise_with_eviction
+        # (the wrapper around it), so mocking the wrapper would hide the
+        # ordering this test exists to pin.
+        def _always_rejects(**kwargs):
+            raise PrefillMemoryExceededError(
+                message="too big for the ceiling",
+                request_id=kwargs.get("request_id"),
+                estimated_bytes=1,
+                limit_bytes=1,
+            )
+
+        scheduler.preflight_or_raise = _always_rejects  # type: ignore[assignment]
+
+        engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+        engine._preprocess_messages = lambda m: m
+
+        capacity = 40  # total_queue_capacity(max_num_seqs=8) == 8 + 32
+        for i in range(capacity):
+            with pytest.raises(PrefillMemoryExceededError):
+                await engine.preflight_chat(
+                    messages=[{"role": "user", "content": "x"}],
+                    request_id=f"oversized-{i}",
+                )
+
+        assert scheduler._reserved_slots() == 0, (
+            f"{capacity} rejected preflights should claim nothing, but "
+            f"_reserved_slots()={scheduler._reserved_slots()} — the leak "
+            "this test guards against"
+        )
+
+        # Positive control: a request that clears the memory check right
+        # after the failed burst must succeed immediately (no phantom-full
+        # 503), must show exactly one live reservation, and add_request must
+        # bring it back to zero — proving the zero-reservations assertion
+        # above means "claims and releases correctly," not "never claims."
+        scheduler.preflight_or_raise = lambda **kwargs: None  # type: ignore[assignment]
+        await engine.preflight_chat(
+            messages=[{"role": "user", "content": "ok"}], request_id="normal"
+        )
+        assert scheduler._reserved_slots() == 1
+
+        scheduler.add_request(_make_scheduler_request("normal"))
+        assert scheduler._reserved_slots() == 0
+        assert len(scheduler.waiting) == 1
+
+    @pytest.mark.asyncio
+    async def test_preflight_completion_releases_reservation_on_memory_guard_raise(
+        self,
+    ):
+        from omlx.engine.batched import BatchedEngine
+
+        scheduler = _make_scheduler()
+        scheduler._prefill_memory_guard = True
+
+        def _always_rejects(**kwargs):
+            raise PrefillMemoryExceededError(
+                message="too big for the ceiling",
+                request_id=kwargs.get("request_id"),
+                estimated_bytes=1,
+                limit_bytes=1,
+            )
+
+        scheduler.preflight_or_raise = _always_rejects  # type: ignore[assignment]
+
+        engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+
+        capacity = 40
+        for i in range(capacity):
+            with pytest.raises(PrefillMemoryExceededError):
+                await engine.preflight_completion(
+                    prompt="a" * 200, request_id=f"oversized-{i}"
+                )
+
+        assert scheduler._reserved_slots() == 0
+
+        scheduler.preflight_or_raise = lambda **kwargs: None  # type: ignore[assignment]
+        await engine.preflight_completion(prompt="ok", request_id="normal")
+        assert scheduler._reserved_slots() == 1
+
+        scheduler.add_request(_make_scheduler_request("normal"))
+        assert scheduler._reserved_slots() == 0
+
+
 # ---------------------------------------------------------------------------
 # VLM-specific contracts (image-token budget + tools conversion + cached
 # tokens propagation through preflight_or_raise)

@@ -100,6 +100,25 @@ class BatchedEngine(BaseEngine):
             request_id=request_id,
         )
 
+    def _release_queue_reservation(self) -> None:
+        """Give back one queue reservation claimed by ``_preflight_queue``.
+
+        For a route-level raiser (e.g. a lease-abort check) that can still
+        fire after ``preflight_chat``/``preflight_completion`` returned
+        successfully but before the request reaches ``add_request`` — the
+        request never lands in ``self.waiting``, so nothing else releases
+        the reservation ``_preflight_queue`` claimed for it.
+
+        Resolves the scheduler the same way ``_preflight_queue`` does, and
+        is a no-op if it's unreachable. Server-layer callers should look
+        this up with ``getattr`` rather than assume it exists — other
+        engine implementations don't hold reservations here.
+        """
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            return
+        scheduler._release_reservation()
+
     @property
     def model_name(self) -> str:
         """Get the model name."""
@@ -950,12 +969,14 @@ class BatchedEngine(BaseEngine):
         100k-token chat takes tens of milliseconds compared to the many
         seconds the prefill it gates would consume.
 
-        Also runs the waiting-queue check, first and unconditionally — see
-        ``_preflight_queue``.
+        Runs the waiting-queue check last, after tokenization and the memory
+        check — see ``_preflight_queue`` — so a raise from either leaves no
+        reservation behind. Every exit that lets the caller proceed to the
+        real chat path (a skipped memory check included) still claims one:
+        backpressure must not inherit those exits either.
         """
         if not self._loaded:
             await self.start()
-        self._preflight_queue()
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
@@ -983,14 +1004,17 @@ class BatchedEngine(BaseEngine):
                 "the error",
                 type(e).__name__,
             )
+            self._preflight_queue()
             return
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
+            self._preflight_queue()
             return
         await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
+        self._preflight_queue()
 
     async def preflight_completion(
         self,
@@ -1000,11 +1024,11 @@ class BatchedEngine(BaseEngine):
     ) -> None:
         """Early prefill memory check for plain /v1/completions calls.
 
-        See ``preflight_chat`` for the rationale.
+        See ``preflight_chat`` for the rationale, including why the
+        waiting-queue reservation is claimed last rather than first.
         """
         if not self._loaded:
             await self.start()
-        self._preflight_queue()
         try:
             num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:
@@ -1014,14 +1038,17 @@ class BatchedEngine(BaseEngine):
                 "will surface the error",
                 type(e).__name__,
             )
+            self._preflight_queue()
             return
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
+            self._preflight_queue()
             return
         await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
+        self._preflight_queue()
 
     async def stream_chat(
         self,

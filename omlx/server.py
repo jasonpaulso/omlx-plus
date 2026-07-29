@@ -51,7 +51,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
@@ -1137,12 +1137,32 @@ async def _raise_if_llm_lease_abort_requested(lease: _LLMEngineLease) -> None:
         )
 
 
+async def _raise_if_llm_lease_abort_requested_after_preflight(
+    lease: _LLMEngineLease, engine: Any
+) -> None:
+    """Same check as ``_raise_if_llm_lease_abort_requested``, for call sites
+    reached after a successful ``preflight_chat``/``preflight_completion`` —
+    which, since df100432/6470eb71, claims a scheduler queue reservation for
+    the request. If this raises here, the request never reaches
+    ``add_request`` and nothing else releases that reservation, so release
+    it before re-raising. A no-op on engines that don't hold one.
+    """
+    try:
+        await _raise_if_llm_lease_abort_requested(lease)
+    except BaseException:
+        release = getattr(engine, "_release_queue_reservation", None)
+        if callable(release):
+            release()
+        raise
+
+
 async def _release_after_stream(
     generator: AsyncIterator[str],
     lease: _LLMEngineLease,
+    engine: Any,
 ) -> AsyncIterator[str]:
     try:
-        await _raise_if_llm_lease_abort_requested(lease)
+        await _raise_if_llm_lease_abort_requested_after_preflight(lease, engine)
         async for chunk in generator:
             yield chunk
     finally:
@@ -3040,7 +3060,11 @@ async def create_completion(
         await _raise_if_llm_lease_abort_requested(lease)
         for prompt in prompts:
             await engine.preflight_completion(prompt, request_id=upstream_request_id)
-        await _raise_if_llm_lease_abort_requested(lease)
+        # No lease-abort recheck here: the pre-preflight check above already
+        # covers this point, and a check placed after preflight would race a
+        # claimed-but-unreleased queue reservation (see
+        # BatchedEngine._release_queue_reservation for where that's instead
+        # covered, at the response-body boundary).
 
         if request.stream:
             return StreamingResponse(
@@ -3057,6 +3081,7 @@ async def create_completion(
                         keepalive_chunk=_resolve_keepalive("openai_completion"),
                     ),
                     lease,
+                    engine,
                 ),
                 media_type="text/event-stream",
                 headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -3064,7 +3089,7 @@ async def create_completion(
 
         # Non-streaming response with keepalive during prefill
         async def _build_completion():
-            await _raise_if_llm_lease_abort_requested(lease)
+            await _raise_if_llm_lease_abort_requested_after_preflight(lease, engine)
             start_time = time.perf_counter()
             choices = []
             total_completion_tokens = 0
@@ -3180,6 +3205,7 @@ async def create_completion(
             _release_after_stream(
                 _with_json_keepalive(http_request, _build_completion()),
                 lease,
+                engine,
             ),
             media_type="application/json",
         )
@@ -3548,8 +3574,11 @@ async def create_chat_completion(
             request_id=http_request.headers.get("x-request-id"),
             **chat_kwargs,
         )
-
-        await _raise_if_llm_lease_abort_requested(lease)
+        # No lease-abort recheck here: the pre-preflight check above already
+        # covers this point, and a check placed after preflight would race a
+        # claimed-but-unreleased queue reservation (see
+        # BatchedEngine._release_queue_reservation for where that's instead
+        # covered, at the response-body boundary).
 
         if request.stream:
             # Pre-mint the completion id so the keepalive frame (emitted before the
@@ -3577,6 +3606,7 @@ async def create_chat_completion(
                         keepalive_chunk=keepalive,
                     ),
                     lease,
+                    engine,
                 ),
                 media_type="text/event-stream",
                 headers=sse_headers,
@@ -3584,7 +3614,7 @@ async def create_chat_completion(
 
         # Non-streaming response with keepalive during prefill
         async def _build_chat_completion():
-            await _raise_if_llm_lease_abort_requested(lease)
+            await _raise_if_llm_lease_abort_requested_after_preflight(lease, engine)
             start_time = time.perf_counter()
 
             output = await engine.chat(messages=messages, **chat_kwargs)
@@ -3708,6 +3738,7 @@ async def create_chat_completion(
             _release_after_stream(
                 _with_json_keepalive(http_request, _build_chat_completion()),
                 lease,
+                engine,
             ),
             media_type="application/json",
             headers=json_headers,
@@ -5388,7 +5419,11 @@ async def create_anthropic_message(
             request_id=http_request.headers.get("x-request-id"),
             **chat_kwargs,
         )
-        await _raise_if_llm_lease_abort_requested(lease)
+        # No lease-abort recheck here: the pre-preflight check above already
+        # covers this point, and a check placed after preflight would race a
+        # claimed-but-unreleased queue reservation (see
+        # BatchedEngine._release_queue_reservation for where that's instead
+        # covered, at the response-body boundary).
 
         if request.stream:
             return StreamingResponse(
@@ -5405,6 +5440,7 @@ async def create_anthropic_message(
                         keepalive_chunk=_resolve_keepalive("anthropic"),
                     ),
                     lease,
+                    engine,
                 ),
                 media_type="text/event-stream",
                 headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -5412,7 +5448,7 @@ async def create_anthropic_message(
 
         # Non-streaming response with keepalive during prefill
         async def _build_anthropic_message():
-            await _raise_if_llm_lease_abort_requested(lease)
+            await _raise_if_llm_lease_abort_requested_after_preflight(lease, engine)
             start_time = time.perf_counter()
 
             output = await engine.chat(messages=messages, **chat_kwargs)
@@ -5497,6 +5533,7 @@ async def create_anthropic_message(
             _release_after_stream(
                 _with_json_keepalive(http_request, _build_anthropic_message()),
                 lease,
+                engine,
             ),
             media_type="application/json",
         )
@@ -5875,7 +5912,11 @@ async def create_response(
             request_id=http_request.headers.get("x-request-id"),
             **chat_kwargs,
         )
-        await _raise_if_llm_lease_abort_requested(lease)
+        # No lease-abort recheck here: the pre-preflight check above already
+        # covers this point, and a check placed after preflight would race a
+        # claimed-but-unreleased queue reservation (see
+        # BatchedEngine._release_queue_reservation for where that's instead
+        # covered, at the response-body boundary).
 
         if request.stream:
             return StreamingResponse(
@@ -5897,6 +5938,7 @@ async def create_response(
                         keepalive_chunk=_resolve_keepalive("openai_responses"),
                     ),
                     lease,
+                    engine,
                 ),
                 media_type="text/event-stream",
                 headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
@@ -5904,7 +5946,7 @@ async def create_response(
 
         # Non-streaming with keepalive during prefill
         async def _build_responses_api():
-            await _raise_if_llm_lease_abort_requested(lease)
+            await _raise_if_llm_lease_abort_requested_after_preflight(lease, engine)
             start_time = time.perf_counter()
             output = await engine.chat(messages=messages, **chat_kwargs)
 
@@ -6042,6 +6084,7 @@ async def create_response(
             _release_after_stream(
                 _with_json_keepalive(http_request, _build_responses_api()),
                 lease,
+                engine,
             ),
             media_type="application/json",
         )
