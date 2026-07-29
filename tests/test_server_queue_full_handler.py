@@ -59,3 +59,92 @@ class TestQueueFullHandler:
         body = resp.json()
         assert "detail" in body
         assert "queue full" in body["detail"].lower()
+
+
+class TestStreamingChatReaches503:
+    """The handler above only proves the response body. This proves the
+    wiring that made row 4 of the S3 acceptance matrix fail on the live rig.
+
+    ``Scheduler.add_request`` raises the queue-full error from inside the
+    route's response generator (``batched.py:817``), and starlette emits
+    ``http.response.start`` with status 200 before it ever iterates that
+    generator — so on ``stream: true`` the rejection could only ever reach
+    the client as a truncated/in-stream error, never as the 503 the handler
+    exists to send. The fix moves the check into the preflight seam the route
+    already awaits before committing to the ``StreamingResponse``; this test
+    asserts the status code a retrying client actually branches on.
+    """
+
+    def _run(self, *, stream: bool):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import omlx.server as srv
+
+        async def _raising_preflight(*args, **kwargs):
+            raise SchedulerQueueFullError(current_depth=32, max_depth=32)
+
+        engine = MagicMock()
+        engine.preflight_chat = AsyncMock(side_effect=_raising_preflight)
+        engine.start = AsyncMock()
+        engine.count_chat_tokens = MagicMock(return_value=16)
+        engine.model_type = "llama"
+
+        async def _get_engine_for_model(model_id, *, lease=None):
+            return engine
+
+        fake_pool = MagicMock()
+        fake_pool.get_entry = MagicMock(return_value=None)
+        fake_pool.preload_pinned_models = AsyncMock()
+        fake_pool.check_ttl_expirations = AsyncMock()
+        fake_pool.shutdown = AsyncMock()
+
+        original_get_engine = srv.get_engine_for_model
+        original_overrides = dict(srv.app.dependency_overrides)
+        original_engine_pool = srv._server_state.engine_pool
+        original_settings_manager = srv._server_state.settings_manager
+        try:
+            srv.app.dependency_overrides[srv.verify_api_key] = lambda: True
+            srv.get_engine_for_model = _get_engine_for_model  # type: ignore[assignment]
+            srv._server_state.engine_pool = fake_pool
+            # With no per-model settings, the route's SpecPrefill fallbacks
+            # (server.py:3528,3532) dereference ``ms`` behind a
+            # ``settings_manager`` truthiness check — so a manager left on the
+            # shared state by an earlier test turns this into a 500. Pin both
+            # sides of that pair rather than depending on suite order.
+            srv._server_state.settings_manager = None
+            with (
+                TestClient(srv.app, raise_server_exceptions=False) as client,
+                patch.object(srv, "resolve_model_id", lambda name: name),
+                patch.object(srv, "validate_context_window", lambda *a, **k: None),
+                patch.object(
+                    srv, "get_model_settings_for_request", lambda *a, **k: None
+                ),
+            ):
+                return client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": stream,
+                        "max_tokens": 8,
+                    },
+                )
+        finally:
+            srv.get_engine_for_model = original_get_engine
+            srv._server_state.engine_pool = original_engine_pool
+            srv._server_state.settings_manager = original_settings_manager
+            srv.app.dependency_overrides.clear()
+            srv.app.dependency_overrides.update(original_overrides)
+
+    def test_streaming_request_gets_503_not_a_200_sse_error(self):
+        resp = self._run(stream=True)
+        assert (
+            resp.status_code == 503
+        ), f"expected 503, got {resp.status_code}: {resp.text[:400]}"
+        assert resp.headers.get("Retry-After") == "1"
+        assert "queue full" in resp.json()["error"]["message"].lower()
+
+    def test_non_streaming_request_still_gets_503(self):
+        resp = self._run(stream=False)
+        assert resp.status_code == 503
+        assert resp.headers.get("Retry-After") == "1"

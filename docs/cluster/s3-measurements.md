@@ -13,6 +13,10 @@ an in-stream SSE error under HTTP 200, never as a 503.** That is the slice's
 one real defect and its main carry-forward. E4's stop condition did not fire on
 either backend.
 
+Row 4 update (2026-07-29): the defect turned out to be shared with single-node,
+not cluster-specific, and a fix has landed at the preflight seam — but the row
+stays **open** until it is re-measured on the rig. See "Follow-up" under Row 4.
+
 ---
 
 ## Rig
@@ -370,6 +374,32 @@ normal 503:
 Not fixed here — it is a route-layer change (peek the first frame before
 committing to a `StreamingResponse`, or surface queue depth pre-admission), and
 S3's scope is the batching path. Filed as the slice's main carry-forward.
+
+**Follow-up (2026-07-29): the diagnosis above is right about the mechanism and
+wrong about the blame.** Chasing the fix showed this is not a cluster defect at
+all — single-node `stream: true` degrades identically, and always has.
+`BatchedEngine.preflight_chat` only ever ran the *prefill memory* check
+(`scheduler.py`'s `preflight_or_raise`); nothing anywhere checked queue depth
+before the route committed. `Scheduler.add_request` raises from inside the
+response generator (`batched.py:817`), and starlette sends
+`http.response.start` before it iterates — the same 200-commit this row hit.
+The registered 503 handler could therefore only ever answer `stream: false`.
+The cluster path was matching single-node semantics exactly, which is what
+spec-S3 asked of it.
+
+The fix takes the second of the two options named above — surface queue depth
+pre-admission — at the preflight seam all four LLM routes already await:
+`Scheduler.preflight_queue_or_raise` for in-process engines, and a head-side
+gate on rank-0 in-flight count for `ClusterEngine`, which cannot reach that
+scheduler. Both derive their cap from one `waiting_queue_capacity` definition.
+No `server.py` change was needed. The head-side log line the second bullet
+above asks for now exists on the backstop path.
+
+**Row 4 remains rig-unverified.** The fix is covered by unit and two-rank
+integration tests, but this row was measured on the live 2-Mac pair on both
+backends and only a rig re-run can close it. Re-measure with the same `flood`
+recipe (41 concurrent, `max_tokens` large enough that nothing completes) and
+assert an actual HTTP 503 — do not mark it PASS from the test suite.
 
 ## Repeats and anomalies
 

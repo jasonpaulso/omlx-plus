@@ -103,6 +103,33 @@ class BaseEngine(ABC):
     allowing the server to use either without code changes.
     """
 
+    def _preflight_queue(self) -> None:
+        """Reject a request the waiting queue has no room for, before the
+        route commits to a ``StreamingResponse``.
+
+        ``Scheduler.add_request`` enforces the cap authoritatively, but it
+        runs from inside the route's response generator, after starlette has
+        already sent HTTP 200 — so on ``stream: true`` its rejection can only
+        degrade into a truncated or in-stream error. Calling this from
+        ``preflight_chat`` / ``preflight_completion`` moves the rejection
+        ahead of that commit, where ``scheduler_queue_full_handler`` can
+        still answer 503 + Retry-After.
+
+        Callers keep it ahead of chat templating and tokenization, and away
+        from the memory check: the memory path short-circuits when the guard
+        is disabled and returns early when tokenization fails, and
+        backpressure must not inherit either exit.
+
+        Silent when the scheduler is unreachable — a wrapper may not be
+        driving one (the preflight convention elsewhere in this module).
+        """
+        scheduler = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None), "scheduler", None
+        )
+        if scheduler is None:
+            return
+        scheduler.preflight_queue_or_raise()
+
     @property
     @abstractmethod
     def model_name(self) -> str:

@@ -377,3 +377,102 @@ async def test_preflight_completion_rejects_specprefill(make_engine):
     engine = make_engine(NORMAL)
     with pytest.raises(ClusterNonGoalError):
         await engine.preflight_completion("hi", specprefill=True)
+
+
+# -- head-side waiting-queue gate (row 4 carry-forward) ----------------------
+
+
+class TestPreflightQueueGate:
+    """Rank 0's own ``add_request`` cap cannot reach a streaming client: by
+    the time the generate command crosses the pipe the route has returned a
+    ``StreamingResponse`` and HTTP 200 is on the wire, so the rejection
+    arrives as an SSE ``error`` event (S3 P3 acceptance row 4, both
+    backends). The head therefore gates in preflight, from its own view of
+    what rank 0 is holding.
+    """
+
+    @staticmethod
+    def _fill(engine, count):
+        for i in range(count):
+            engine._pending[f"inflight-{i}"] = asyncio.Queue()
+
+    async def test_admits_below_rank_capacity(self, make_engine):
+        from omlx.cluster.scheduler_config import rank_inflight_capacity
+
+        engine = make_engine(NORMAL)
+        self._fill(engine, rank_inflight_capacity() - 1)
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        await engine.preflight_completion("hi")
+
+    async def test_rejects_at_rank_capacity(self, make_engine):
+        from omlx.cluster.scheduler_config import rank_inflight_capacity
+
+        engine = make_engine(NORMAL)
+        self._fill(engine, rank_inflight_capacity())
+        with pytest.raises(SchedulerQueueFullError) as excinfo:
+            await engine.preflight_chat([{"role": "user", "content": "hi"}])
+        # Reported the way rank 0 would: everything past the running batch is
+        # queue depth, so a client sees the same numbers as on single-node.
+        assert excinfo.value.current_depth == 32
+        assert excinfo.value.max_depth == 32
+
+    async def test_completion_path_is_gated_too(self, make_engine):
+        from omlx.cluster.scheduler_config import rank_inflight_capacity
+
+        engine = make_engine(NORMAL)
+        self._fill(engine, rank_inflight_capacity())
+        with pytest.raises(SchedulerQueueFullError):
+            await engine.preflight_completion("hi")
+
+    async def test_gate_runs_before_the_non_goal_checks(self, make_engine):
+        """A saturated formation should answer 503, not a non-goal 400 — the
+        request is retryable and nothing about it was inspected yet."""
+        from omlx.cluster.scheduler_config import rank_inflight_capacity
+
+        engine = make_engine(NORMAL)
+        self._fill(engine, rank_inflight_capacity())
+        with pytest.raises(SchedulerQueueFullError):
+            await engine.preflight_chat(
+                [{"role": "user", "content": "hi"}], specprefill=True
+            )
+
+    def test_capacity_derives_from_one_cap_definition(self):
+        from omlx.cluster.scheduler_config import (
+            rank_inflight_capacity,
+            rank_max_num_seqs,
+        )
+        from omlx.scheduler import waiting_queue_capacity
+
+        max_num_seqs = rank_max_num_seqs()
+        assert rank_inflight_capacity() == max_num_seqs + waiting_queue_capacity(
+            max_num_seqs
+        )
+        # The plan's burst recipe: cap + max_num_seqs + 1 submissions is what
+        # it takes to force a rejection, so the 41st of 41 is the one refused.
+        assert rank_inflight_capacity() + 1 == 41
+
+    async def test_backstop_frame_is_logged_head_side(self, make_engine, caplog):
+        """The preflight->submit race stays open, so rank 0 can still refuse
+        a request after the response is committed. That path was invisible:
+        no head-side log line at all, which is half of what made row 4 hard
+        to see from the daemon.
+        """
+        import logging
+
+        frames = [
+            {
+                "ok": False,
+                "request_id": "late",
+                "error": "Scheduler waiting queue full: 32 >= 32",
+                "code": "queue_full",
+                "current_depth": 32,
+                "max_depth": 32,
+            }
+        ]
+        engine = make_engine(frames)
+        with (
+            caplog.at_level(logging.WARNING, logger="omlx.cluster.engine"),
+            pytest.raises(SchedulerQueueFullError),
+        ):
+            [o async for o in engine.stream_generate("hi", request_id="late")]
+        assert any("waiting queue full" in r.getMessage() for r in caplog.records)

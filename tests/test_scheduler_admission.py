@@ -89,6 +89,66 @@ class TestWaitingQueueCap:
             scheduler.add_request(req)
 
 
+class TestPreflightQueueOrRaise:
+    """The pre-StreamingResponse half of the cap.
+
+    ``add_request`` runs inside the route's response generator on the
+    streaming path, by which point starlette has already sent HTTP 200 — so
+    its raise degrades into a truncated in-stream error and the registered
+    503 handler never fires. ``preflight_queue_or_raise`` is what the route
+    calls while it can still answer with a status code.
+    """
+
+    def test_silent_below_cap(self, scheduler):
+        for i in range(31):
+            scheduler.waiting.append(_make_request(f"r{i}"))
+        assert scheduler.preflight_queue_or_raise() is None
+
+    def test_raises_at_cap_with_the_same_depths_add_request_reports(self, scheduler):
+        for i in range(32):
+            scheduler.waiting.append(_make_request(f"r{i}"))
+        with pytest.raises(SchedulerQueueFullError) as exc:
+            scheduler.preflight_queue_or_raise()
+        assert exc.value.current_depth == 32
+        assert exc.value.max_depth == 32
+
+    def test_fires_with_the_prefill_memory_guard_disabled(self, scheduler):
+        """The guard-off configuration is the one most likely to go untested,
+        and it is the default. ``preflight_or_raise`` returns immediately when
+        ``_prefill_memory_guard`` is false; if the queue check had been folded
+        into that method — or placed after the tokenize step that feeds it —
+        backpressure would be dead for every server running without the
+        memory guard.
+        """
+        scheduler._prefill_memory_guard = False
+        scheduler._memory_hard_limit_bytes = 0
+        scheduler.memory_monitor = None
+        for i in range(32):
+            scheduler.waiting.append(_make_request(f"r{i}"))
+        with pytest.raises(SchedulerQueueFullError):
+            scheduler.preflight_queue_or_raise()
+
+    def test_shares_one_cap_definition_with_add_request(self, scheduler):
+        scheduler.config.max_num_seqs = 16
+        for i in range(64):
+            scheduler.waiting.append(_make_request(f"r{i}"))
+        with pytest.raises(SchedulerQueueFullError) as preflight_exc:
+            scheduler.preflight_queue_or_raise()
+        with pytest.raises(SchedulerQueueFullError) as admit_exc:
+            scheduler.add_request(_make_request("over"))
+        assert preflight_exc.value.max_depth == admit_exc.value.max_depth == 64
+
+
+class TestWaitingQueueCapacityHelper:
+    def test_floor_and_scaling(self):
+        from omlx.scheduler import waiting_queue_capacity
+
+        assert waiting_queue_capacity(1) == 32
+        assert waiting_queue_capacity(8) == 32
+        assert waiting_queue_capacity(9) == 36
+        assert waiting_queue_capacity(16) == 64
+
+
 class TestAdmissionPausedField:
     def test_default_false(self):
         # Direct field check on a fresh Scheduler — we want to make sure the

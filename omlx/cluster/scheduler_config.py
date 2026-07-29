@@ -34,6 +34,31 @@ from typing import Any
 _DEFAULT_MAX_NUM_SEQS = 8
 
 
+def rank_max_num_seqs() -> int:
+    """The ``max_num_seqs`` rank 0's ``Scheduler`` actually runs with.
+
+    ``rank_worker.py`` calls ``build_rank_scheduler_config()`` with no
+    overrides, so this is exact rather than a guess -- which is what lets the
+    head daemon reason about rank-0 admission limits without a round trip.
+    """
+    return _DEFAULT_MAX_NUM_SEQS
+
+
+def rank_inflight_capacity() -> int:
+    """How many requests rank 0 can hold at once: ``max_num_seqs`` in the
+    running batch plus a full waiting queue.
+
+    ``ClusterEngine`` gates on this in preflight. It cannot call
+    ``Scheduler.preflight_queue_or_raise`` -- the scheduler is in another
+    process -- so it reproduces the ceiling from the same
+    ``waiting_queue_capacity`` definition instead of a second literal.
+    """
+    from omlx.scheduler import waiting_queue_capacity
+
+    max_num_seqs = rank_max_num_seqs()
+    return max_num_seqs + waiting_queue_capacity(max_num_seqs)
+
+
 def build_rank_scheduler_config(**overrides: Any) -> Any:
     """Build a ``scheduler.SchedulerConfig`` for a rank-0 process.
 

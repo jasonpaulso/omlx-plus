@@ -817,3 +817,110 @@ class TestRejectionMessageNamesBindingCeiling:
         assert "memory_guard_tier" in rej.message
         assert "iogpu.wired_limit_mb" not in rej.message
         assert "custom_ceiling_bytes" not in rej.message
+
+
+# ---------------------------------------------------------------------------
+# Waiting-queue backpressure through the same preflight seam
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightQueueThroughTheEngines:
+    """``add_request``'s queue cap cannot reach a streaming client: it runs
+    inside the route's response generator (``batched.py:817``), after
+    starlette has committed HTTP 200. The engines therefore have to ask
+    before the route wraps the body, which is what these assert.
+
+    Every case here runs with the prefill memory guard OFF — the default —
+    because that is the configuration where a queue check folded into the
+    memory path would be silently dead.
+    """
+
+    @staticmethod
+    def _saturated_scheduler():
+        from omlx.exceptions import SchedulerQueueFullError
+        from omlx.scheduler import waiting_queue_capacity
+
+        scheduler = _make_scheduler()
+        scheduler._prefill_memory_guard = False
+        for i in range(waiting_queue_capacity(scheduler.config.max_num_seqs)):
+            request = MagicMock()
+            request.request_id = f"waiting-{i}"
+            scheduler.waiting.append(request)
+        return scheduler, SchedulerQueueFullError
+
+    @pytest.mark.asyncio
+    async def test_batched_preflight_chat_raises_when_queue_is_full(self):
+        from omlx.engine.batched import BatchedEngine
+
+        scheduler, queue_full = self._saturated_scheduler()
+        engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+        engine._preprocess_messages = lambda m: m
+
+        with pytest.raises(queue_full) as exc:
+            await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+        assert exc.value.current_depth == 32
+        assert exc.value.max_depth == 32
+
+    @pytest.mark.asyncio
+    async def test_batched_preflight_completion_raises_when_queue_is_full(self):
+        from omlx.engine.batched import BatchedEngine
+
+        scheduler, queue_full = self._saturated_scheduler()
+        engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+
+        with pytest.raises(queue_full):
+            await engine.preflight_completion(prompt="hello")
+
+    @pytest.mark.asyncio
+    async def test_vlm_preflight_chat_raises_when_queue_is_full(self):
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        scheduler, queue_full = self._saturated_scheduler()
+        engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
+
+        with pytest.raises(queue_full):
+            await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+
+    @pytest.mark.asyncio
+    async def test_vlm_preflight_completion_raises_when_queue_is_full(self):
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        scheduler, queue_full = self._saturated_scheduler()
+        engine = _build_engine_with_stub_scheduler(VLMBatchedEngine, scheduler)
+
+        with pytest.raises(queue_full):
+            await engine.preflight_completion(prompt="hello")
+
+    @pytest.mark.asyncio
+    async def test_runs_before_tokenization_so_a_broken_tokenizer_cannot_skip_it(self):
+        """Both memory preflights bail out (and return) when
+        ``tokenizer.encode`` raises. Backpressure must not inherit that exit,
+        so the queue check is ordered ahead of it.
+        """
+        from omlx.engine.batched import BatchedEngine
+
+        scheduler, queue_full = self._saturated_scheduler()
+        engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+        engine._tokenizer.encode = MagicMock(side_effect=RuntimeError("borrowed"))
+
+        with pytest.raises(queue_full):
+            await engine.preflight_completion(prompt="hello")
+
+    @pytest.mark.asyncio
+    async def test_silent_below_the_cap(self):
+        from omlx.engine.batched import BatchedEngine
+
+        scheduler, _ = self._saturated_scheduler()
+        scheduler.waiting.pop()  # one slot free
+        engine = _build_engine_with_stub_scheduler(BatchedEngine, scheduler)
+
+        assert await engine.preflight_completion(prompt="hello") is None
+
+    @pytest.mark.asyncio
+    async def test_no_scheduler_is_not_an_error(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = _build_engine_with_stub_scheduler(BatchedEngine, MagicMock())
+        engine._engine = None
+
+        assert await engine.preflight_completion(prompt="hello") is None

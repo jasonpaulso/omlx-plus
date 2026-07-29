@@ -1422,6 +1422,18 @@ class SchedulerConfig:
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
 
 
+def waiting_queue_capacity(max_num_seqs: int) -> int:
+    """The waiting-queue cap ``add_request`` enforces, given ``max_num_seqs``.
+
+    One definition, three callers: ``add_request`` (the authoritative check),
+    ``Scheduler.preflight_queue_or_raise`` (the pre-StreamingResponse check),
+    and ``omlx.cluster.engine`` (whose scheduler lives in another process and
+    so cannot call either). The hard floor of 32 keeps small ``max_num_seqs``
+    values from producing a cap so tight that ordinary bursts 503.
+    """
+    return max(max_num_seqs * 4, 32)
+
+
 @dataclass
 class SchedulerOutput:
     """
@@ -6763,7 +6775,10 @@ class Scheduler:
 
         # Cap the waiting queue so client-side polling can't accumulate
         # unbounded work and the scheduler can apply backpressure via 503.
-        max_waiting = max(self.config.max_num_seqs * 4, 32)
+        # Streaming requests are gated earlier, in preflight_queue_or_raise —
+        # by the time we get here on that path the response may already be
+        # committed, so this check is the authority but not the whole story.
+        max_waiting = waiting_queue_capacity(self.config.max_num_seqs)
         if len(self.waiting) >= max_waiting:
             from .exceptions import SchedulerQueueFullError
 
@@ -8051,6 +8066,35 @@ class Scheduler:
             f"but {binding_str} ceiling is {format_bytes(hard_limit)}. "
             f"{advice}."
         )
+
+    def preflight_queue_or_raise(self) -> None:
+        """Pre-StreamingResponse waiting-queue check.
+
+        ``add_request`` is reached from inside the route's response generator
+        on the streaming path (``batched.py:817``), and starlette has already
+        emitted ``http.response.start`` by then — so its own queue-full raise
+        degrades into a truncated/in-stream error under HTTP 200 instead of
+        the 503 the handler exists to send. Calling this from
+        ``preflight_chat`` / ``preflight_completion`` moves the rejection
+        ahead of the commit point, where ``scheduler_queue_full_handler`` can
+        still answer.
+
+        Deliberately independent of the memory guard: unlike
+        ``preflight_or_raise`` there is no enabling flag to short-circuit on,
+        so this fires whatever the memory settings are. ``add_request``
+        remains the authority — the gap between this check and admission is
+        racy, so a burst can still overshoot by a few requests and fall back
+        to the in-stream path.
+        """
+        max_waiting = waiting_queue_capacity(self.config.max_num_seqs)
+        depth = len(self.waiting)
+        if depth >= max_waiting:
+            from .exceptions import SchedulerQueueFullError
+
+            raise SchedulerQueueFullError(
+                current_depth=depth,
+                max_depth=max_waiting,
+            )
 
     def preflight_or_raise(
         self,

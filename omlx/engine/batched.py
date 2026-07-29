@@ -949,9 +949,13 @@ class BatchedEngine(BaseEngine):
         Cheap enough to run as a precondition: tokenization of even a
         100k-token chat takes tens of milliseconds compared to the many
         seconds the prefill it gates would consume.
+
+        Also runs the waiting-queue check, first and unconditionally — see
+        ``_preflight_queue``.
         """
         if not self._loaded:
             await self.start()
+        self._preflight_queue()
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
@@ -1000,6 +1004,7 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        self._preflight_queue()
         try:
             num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:

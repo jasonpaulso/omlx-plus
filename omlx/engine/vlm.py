@@ -3294,9 +3294,13 @@ class VLMBatchedEngine(BaseEngine):
         ``BatchedEngine.preflight_chat`` for the upstream rationale
         (avoiding the ``StreamingResponse`` 200 commit so HTTP 400
         actually reaches the client).
+
+        Also runs the inherited waiting-queue check, first and
+        unconditionally — same 200-commit reasoning, applied to backpressure.
         """
         if not self._loaded:
             await self.start()
+        self._preflight_queue()
         if self.is_diffusion_model:
             _, _, audio = extract_images_from_messages(messages)
             self._validate_diffusion_request(
@@ -3369,6 +3373,7 @@ class VLMBatchedEngine(BaseEngine):
         """Early prefill memory check for plain /v1/completions calls (VLM)."""
         if not self._loaded:
             await self.start()
+        self._preflight_queue()
         if self.is_diffusion_model:
             self._validate_diffusion_request(
                 stop=kwargs.get("stop"),

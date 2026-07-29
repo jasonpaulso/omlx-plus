@@ -96,6 +96,19 @@ def _error_from_frame(frame: dict[str, Any]) -> Exception:
     (D5) -- everything else is a generic rank/generation failure.
     """
     if frame.get("code") == "queue_full":
+        # Head-side visibility for the backstop path. The preflight gate
+        # (``_preflight_queue``) turns most of these into a clean 503 before
+        # the route commits, so a frame arriving here means a request slipped
+        # through the preflight->submit race -- worth a line, because by this
+        # point the client can only be told in-stream, under HTTP 200.
+        logger.warning(
+            "cluster: rank 0 rejected %s after the response was committed — "
+            "waiting queue full (%s/%s); the client sees an in-stream error, "
+            "not a 503",
+            frame.get("request_id"),
+            frame.get("current_depth"),
+            frame.get("max_depth"),
+        )
         return SchedulerQueueFullError(
             current_depth=int(frame.get("current_depth", 0)),
             max_depth=int(frame.get("max_depth", 0)),
@@ -208,17 +221,51 @@ class ClusterEngine(BatchedEngine):
     def has_active_requests(self) -> bool:
         return bool(self._pending)
 
+    def _preflight_queue(self) -> None:
+        """Reject a request rank 0 has no room for, before the route commits
+        to a ``StreamingResponse``.
+
+        Rank 0's ``Scheduler.preflight_queue_or_raise`` is unreachable from
+        here (another process), and asking over the pipe would mean a round
+        trip per request against a loop that is busy stepping. The head does
+        not need to ask: it is rank 0's only submitter, so ``_pending`` --
+        requests written and not yet terminal -- is what rank 0 is holding,
+        modulo the frames still in flight between the two.
+
+        Approximate on purpose. ``_pending`` counts running and waiting
+        together, and it lags rank 0 by one frame, so this rejects a little
+        early under churn and can let a few extra through when several
+        requests preflight before any of them submits. ``add_request`` on
+        rank 0 stays the authority; the frame it sends back on a miss is the
+        backstop (``_error_from_frame``), and it is logged there.
+        """
+        from .scheduler_config import rank_inflight_capacity, rank_max_num_seqs
+
+        capacity = rank_inflight_capacity()
+        if len(self._pending) < capacity:
+            return
+        max_num_seqs = rank_max_num_seqs()
+        # Report it the way rank 0 would: everything past the running batch
+        # is queue depth, so the numbers a client sees match single-node's.
+        raise SchedulerQueueFullError(
+            current_depth=max(0, len(self._pending) - max_num_seqs),
+            max_depth=capacity - max_num_seqs,
+        )
+
     async def preflight_chat(
         self, messages: list[dict[str, Any]] | None = None, *args: Any, **kwargs: Any
     ) -> None:
-        # No local scheduler and no prefill memory guard on the distributed
-        # path -- but S3's non-goals (VLM, SpecPrefill) are cheap to catch
-        # here, before the route wraps the response in a StreamingResponse.
+        # No prefill memory guard on the distributed path -- but the
+        # waiting-queue gate and S3's non-goals (VLM, SpecPrefill) are cheap
+        # to catch here, before the route wraps the response in a
+        # StreamingResponse.
+        self._preflight_queue()
         if messages:
             _reject_if_multimodal(messages)
         _reject_if_specprefill(kwargs)
 
     async def preflight_completion(self, *args: Any, **kwargs: Any) -> None:
+        self._preflight_queue()
         _reject_if_specprefill(kwargs)
 
     # ---- generation ------------------------------------------------------
