@@ -1,8 +1,11 @@
 # Session Context — 2026-07-29 (evening) — row 4 fixed; it was never a cluster defect
 
 **Status:** the S3 P3 row-4 carry-forward (#10) is fixed and committed at `87fb0e2e` on
-`feat/cluster-v1`. **Row 4 itself is still open** — it was measured on the live 2-Mac rig on
-both backends, and only a rig re-run closes it. S3 (#7) stays open behind it.
+`feat/cluster-v1`; a second, unrelated route-guard defect found along the way is fixed at
+`6a64e7c0`. **Row 4 itself is still open** — it was measured on the live 2-Mac rig on both
+backends, and only a rig re-run closes it. S3 (#7) stays open behind it.
+
+Branch tip `6a64e7c0`. Rig untouched all session.
 
 ## The finding that changed the shape of the fix
 
@@ -84,14 +87,23 @@ sessions where the dispatched verifier went idle. Worth solving as its own threa
    Studio checkout to `87fb0e2e` by hand** — E10 does not check it, so a stale worker joins
    cleanly and runs mismatched TP code.
 2. **#7 — S3 completion**, once row 4 closes.
-3. **Separate finding, not fixed:** `server.py:3528` and `:3532` dereference `ms` behind a
-   `_server_state.settings_manager` truthiness check —
-   `elif _server_state.settings_manager and ms.specprefill_keep_pct is not None`. `ms` is
-   `None` whenever the model has no per-model settings entry, so that is a live 500 on
-   `/v1/chat/completions`. Found because it broke a new test under suite ordering; left alone
-   per surgical-changes rule. Worth its own small fix.
-4. Optional: dedicated ring-vs-jaccl comparison, driven by the TTFT gap (4.0–12.4s vs
+2. Optional: dedicated ring-vs-jaccl comparison, driven by the TTFT gap (4.0–12.4s vs
    1.3–5.8s), not the throughput ratio.
+
+## Also fixed (`6a64e7c0`) — and a correction to how I first reported it
+
+`/v1/chat/completions` guarded its SpecPrefill fallbacks on the wrong object:
+`elif _server_state.settings_manager and ms.specprefill_keep_pct is not None` dereferences
+`ms`, not the manager. Now `elif ms and ...`, matching `if ms:` eight lines above.
+
+**I first reported this as "a live 500". That was wrong**, and wrong in a specific way worth
+remembering: I inferred it from a downstream symptom (it broke one of my tests under suite
+ordering) instead of checking the claim. Reading it afterwards: `ModelSettingsManager
+.get_settings` returns a default `ModelSettings()` rather than `None` for an unknown model,
+and an empty model id is rejected by engine resolution long before this line — so no
+production request is known to reach it. It is a real defect, masked by two invariants that
+live in other files and that this code has no business relying on. Fixed with a regression
+test that fails pre-fix; severity stated honestly in the commit.
 
 **Rig untouched this session** — no daemons started, nothing ssh'd. Daily-driver `:8899`
 (PID 87617) and Studio `:8888/:8889` were never approached.
