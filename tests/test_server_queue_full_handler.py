@@ -106,11 +106,13 @@ class TestStreamingChatReaches503:
             srv.app.dependency_overrides[srv.verify_api_key] = lambda: True
             srv.get_engine_for_model = _get_engine_for_model  # type: ignore[assignment]
             srv._server_state.engine_pool = fake_pool
-            # With no per-model settings, the route's SpecPrefill fallbacks
-            # (server.py:3528,3532) dereference ``ms`` behind a
-            # ``settings_manager`` truthiness check — so a manager left on the
-            # shared state by an earlier test turns this into a 500. Pin both
-            # sides of that pair rather than depending on suite order.
+            # Pinned so this test does not depend on what an earlier test
+            # left on the shared server state. (It used to matter more: the
+            # route's SpecPrefill fallbacks dereferenced ``ms`` behind a
+            # ``settings_manager`` check, so an inherited manager turned this
+            # into a 500. That guard is fixed — see
+            # test_server_model_settings_guard.py — but pinning both sides of
+            # the pair still keeps the run deterministic.)
             srv._server_state.settings_manager = None
             with (
                 TestClient(srv.app, raise_server_exceptions=False) as client,
