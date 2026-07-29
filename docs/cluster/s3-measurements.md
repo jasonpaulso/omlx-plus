@@ -7,7 +7,9 @@ Companion docs: `bringup.md` (rig setup), `s2-measurements.md` (S2 acceptance �
 context only; **no S2 number is the S3 gate**, see "Why S2's throughput figure is
 not the baseline" below).
 
-Status: **IN PROGRESS** — protocol pinned, rig run pending.
+Status: **ring 5 of 6 rows PASS; row 4 NOT DEMONSTRATED. jaccl pending.**
+Five passing rows are five passing rows — this is not a ring pass as a whole.
+See row 4 for what was and was not established.
 
 ---
 
@@ -188,12 +190,12 @@ Per backend, on MiniMax-M2.7-3bit.
 
 | # | Row | ring | jaccl |
 | --- | --- | --- | --- |
-| 1 | `negotiated_backend == requested` | _pending_ | _pending_ |
-| 2 | Join mid-generation (admit a request into a live batch) | _pending_ | _pending_ |
-| 3 | Abort mid-batch (client disconnect; sibling unaffected) | _pending_ | _pending_ |
-| 4 | Queue-full 503 (`max_num_seqs=8`, 41 concurrent, long `max_tokens`) | _pending_ | _pending_ |
-| 5 | D7 throughput gate (aggregate ≥ baseline) | _pending_ | _pending_ |
-| 6 | E4 decode-path tax under batch ≤ 10.268 ms/token | _pending_ | _pending_ |
+| 1 | `negotiated_backend == requested` | **PASS** | _pending_ |
+| 2 | Join mid-generation (admit a request into a live batch) | **PASS** | _pending_ |
+| 3 | Abort mid-batch (client disconnect; sibling unaffected) | **PASS** | _pending_ |
+| 4 | Queue-full 503 (`max_num_seqs=8`, 41 concurrent, long `max_tokens`) | **NOT DEMONSTRATED** | _pending_ |
+| 5 | D7 throughput gate (aggregate ≥ baseline) | **PASS** 1.893× | _pending_ |
+| 6 | E4 decode-path tax under batch ≤ 10.268 ms/token | **PASS** 0.995 / 0.330 | _pending_ |
 
 Row 4 recipe is the real hard-floored cap, not a knob: `max_waiting =
 max(max_num_seqs * 4, 32)` with a hard floor of 32 and no config override
@@ -213,8 +215,110 @@ batch), so per-token tax is expected to fall as batch size grows.
 
 ## Results
 
-_Pending the rig session._
+### ring — 2026-07-29, commit `cec04f05`, formation `world_size 2`
+
+Formation: `active_model MiniMax-M2.7-3bit`, `loaded: true`, `world_size: 2`,
+`negotiated_backend: "ring"` — **row 1 PASS**. Rank 1 loaded its shard on the
+Studio (`50 340 050 944` shard param bytes). `prompt_tokens: 761` on every
+request, matching the pinned templated count exactly.
+
+**Row 5 — D7 throughput.**
+
+| Quantity | Value |
+| --- | --- |
+| baseline (single) | **19.4029 tok/s** — (128−1) tokens / 6.5454 s |
+| aggregate (4 concurrent) | **36.7373 tok/s** — 512 tokens / 13.9368 s window |
+| ratio | **1.893×** |
+| verdict | **PASS** (`aggregate ≥ baseline`) |
+
+Token counts come from server-reported `usage`, not arrival counts. The rejected
+sum-of-rates formula would have reported 44.09 tok/s on the same data — recorded
+only to show the chosen formula is the discriminating one.
+
+**Row 6 — E4 coordination tax.** Windowed via the snapshot pair, both gated:
+
+| Window | Steps | Tokens | tok/step | ms/step | **ms/token** | % of budget |
+| --- | --- | --- | --- | --- | --- | --- |
+| single (batch=1) | 145 | 128 | 0.88 | 0.8780 | **0.9946** | 9.69 % |
+| concurrent (batch=4) | 139 | 512 | 3.68 | 1.2162 | **0.3302** | 3.22 % |
+
+Both **PASS** against the 10.268 ms/token budget; the E4 stop condition did not
+fire. Per-token tax falls as the batch grows, as predicted — one broadcast
+serves the whole batch. The 3.68 tok/step in the concurrent window is
+independent confirmation that real batching occurred, not serialization.
+
+**Row 2 — join mid-generation. PASS.** Read out of the concurrent dump: the four
+requests reached their first token at 1.30 / 2.54 / 3.79 / 5.77 s, so requests
+2–4 were admitted into a batch that was already decoding (one admission per
+step). All four then completed 128 tokens.
+
+**Row 3 — abort mid-batch. PASS.** The victim disconnected after 8 tokens; the
+sibling completed its full 128 (`finish_reason: length`) unaffected, and
+`num_active_requests` returned to 0 afterwards.
+
+**Row 4 — queue-full. NOT DEMONSTRATED.** Not a failure: the condition was never
+reached, so the assertion was never put to the system. Across three burst
+attempts all 41 submissions were accepted, and **no `queue_full` frame was ever
+emitted** — `grep` over the head's `server.log` and stdout for
+`queue_full` / `max_depth` / `current_depth` returns nothing for the whole
+session. (The single `503` in that log is a token count, not a status code.)
+
+The mechanism is wired correctly — rank 0 raises `SchedulerQueueFullError` and
+replies `code="queue_full"` (`rank_worker.py:430`), `build_rank_scheduler_config`
+pins `max_num_seqs=8` giving a waiting cap of 32 (`scheduler.py:6766`) — and it
+is covered by the passing unit test. What is missing is a client-side way to
+*hold* 41 requests resident on the live path: rank 0 admits one request per step,
+and requests terminate on their own (one finished naturally at 503 tokens,
+`finish_reason=stop`, despite `max_tokens=4096`), so slots free at least as fast
+as the queue fills. 40 of 41 streamed at least one token where only 8 can run
+concurrently, which is direct evidence of that churn.
+
+Establishing this row needs a way to pin requests resident — a prompt that
+reliably generates to the `max_tokens` ceiling, or an admission pause — and that
+is a harness question, not an S3 code question. Left open rather than reported
+either way.
 
 ## Repeats and anomalies
 
-_None yet._
+Every repeat below is logged per the no-retry rule. **No repeat was triggered by
+an unfavourable number**: in each case the run produced no computable value for
+its gate, and each fix was committed before the re-run, with no result in hand.
+The D7 and E4 scalars above come from the first run that could compute them, and
+were never re-run.
+
+1. **`single`, run 1 — instrumentation defect, discarded.** MiniMax-M2.7 is a
+   reasoning model: it streams tokens into `delta.reasoning_content` and emits
+   `delta.content` only at the end. The harness counted `content` alone, so a
+   128-token generation recorded **one** arrival and the baseline span was zero
+   — the D7 gate was not computable. Fixed in `cec04f05` (count both), re-run.
+2. **`flood`, attempt 1 — released slots.** Disconnecting after 3 tokens freed
+   each slot; with one admission per step the queue drained as fast as it
+   filled. All 41 returned 200 over 122 s (submit spread 2 ms, first-token
+   spread 121 s). Fixed in `145b3469` (hold connections open).
+3. **`flood`, attempt 2 — unbounded, killed at 10 min.** The per-thread 180 s
+   hold compounded because admitted requests generate thousands of tokens and
+   the queued ones never report. Replaced with one global deadline in
+   `9737dfc6`. My ssh session to the worker dropped during this attempt; the
+   worker daemon and rank process both survived and the formation stayed
+   healthy (member `active`, seq 231, 0 alarms) — only the pipe died.
+4. **`flood`, attempt 3 — inconclusive, see row 4.** Also revealed that the
+   capture silently dropped in-stream `error` payloads (no `choices` key), so a
+   late-arriving `queue_full` would have been invisible. Fixed before jaccl so
+   the same burst cannot produce a false negative there.
+
+### Rig facts corrected during the session
+
+- **Head is an M5 Max**, not an M4 Max as previously recorded.
+- **The E10 handshake does not check the checkout** — see the note under Rig.
+  Both SHAs were confirmed by hand with `git rev-parse` instead.
+- **`omlx` on `PATH` is a uv tool install**, not the repo. Starting it wrote its
+  own schema over `~/omlx-cluster-dev/settings.json` and reset four cluster
+  fields (`role` → `off`, `data_plane_subnet`, `data_plane_address`,
+  `rdma_device` → empty), which silently disables the entire cluster control
+  plane — every `/v1/cluster/*` route 404s. Restored by hand and re-verified
+  through the repo parser; the rig must be driven with `.venv/bin/omlx`.
+- One worker join attempt failed every heartbeat with "All connection attempts
+  failed" while `curl` and a hand-rolled `ClusterClient` from the same host
+  succeeded. Restarting the worker attached to a live ssh session fixed it. The
+  cause is **unexplained** — an attached-vs-orphaned theory was ruled out when a
+  later orphaned worker heartbeated normally.

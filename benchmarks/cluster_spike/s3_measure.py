@@ -71,6 +71,7 @@ def stream_request(url, api_key, body, label, abort_after=None, timeout=600,
         "arrivals": [],  # perf_counter at each token-bearing chunk
         "text_len": 0,
         "reasoning_len": 0,
+        "stream_error": None,
         "usage": None,
         "aborted": False,
         "finish_reason": None,
@@ -96,6 +97,15 @@ def stream_request(url, api_key, body, label, abort_after=None, timeout=600,
                 continue
             if chunk.get("usage"):
                 rec["usage"] = chunk["usage"]
+            # An in-stream error payload (e.g. queue_full arriving after the
+            # response headers are already sent) carries no `choices`, so the
+            # guard below would drop it silently and the record would be
+            # indistinguishable from "nothing ever happened". Capture it.
+            if chunk.get("error"):
+                rec["stream_error"] = chunk["error"]
+                if rec["error"] is None:
+                    rec["error"] = json.dumps(chunk["error"])[:400]
+                break
             choices = chunk.get("choices") or []
             if not choices:
                 continue
