@@ -9,11 +9,15 @@ import pickle
 import pytest
 
 from omlx.cluster.protocol import (
+    PHASE_ADMIT,
+    PHASE_BATCHED,
+    PHASE_STANDALONE,
     PROTOCOL_VERSION,
     Backend,
     CommandKind,
     GenerationSpec,
     ProtocolError,
+    RankOp,
     SpawnRankCommand,
     StepMessage,
     StopTextBuffer,
@@ -76,6 +80,133 @@ def test_step_message_rejects_wrong_shape():
     # Valid JSON but missing required fields.
     with pytest.raises(ProtocolError):
         StepMessage.from_json_bytes(json.dumps({"nope": 1}).encode("utf-8"))
+
+
+# -- RankOp (S3 forward-replay message) --------------------------------------
+
+
+def test_rank_op_round_trip_standalone():
+    op = RankOp(
+        tags=[7],
+        token_ids=[[1, 2, 3]],
+        release=[3],
+        phase=PHASE_STANDALONE,
+    )
+    restored = RankOp.from_dict(op.to_dict())
+    assert restored == op
+
+
+def test_rank_op_round_trip_batched():
+    op = RankOp(
+        tags=[1, 2, 3],
+        token_ids=[[10], [11], [12]],
+        release=[],
+        phase=PHASE_BATCHED,
+    )
+    restored = RankOp.from_dict(op.to_dict())
+    assert restored == op
+
+
+def test_rank_op_round_trip_admit():
+    op = RankOp(
+        tags=[4],
+        token_ids=[[9]],
+        release=[],
+        phase=PHASE_ADMIT,
+    )
+    restored = RankOp.from_dict(op.to_dict())
+    assert restored == op
+
+
+def test_rank_op_default_phase_is_batched():
+    op = RankOp(tags=[1], token_ids=[[5]])
+    assert op.phase == PHASE_BATCHED
+    assert RankOp.from_dict(op.to_dict()).phase == PHASE_BATCHED
+
+
+def test_rank_op_rejects_non_object():
+    with pytest.raises(ProtocolError):
+        RankOp.from_dict(["not", "a", "dict"])
+
+
+def test_rank_op_rejects_unknown_op_kind():
+    with pytest.raises(ProtocolError):
+        RankOp.from_dict(
+            {"op": "reset", "tags": [1], "token_ids": [[1]], "phase": PHASE_BATCHED}
+        )
+
+
+def test_rank_op_rejects_unknown_phase():
+    with pytest.raises(ProtocolError):
+        RankOp.from_dict(
+            {"op": "forward", "tags": [1], "token_ids": [[1]], "phase": "sideways"}
+        )
+
+
+def test_rank_op_rejects_unknown_field():
+    with pytest.raises(ProtocolError):
+        RankOp.from_dict(
+            {
+                "op": "forward",
+                "tags": [1],
+                "token_ids": [[1]],
+                "phase": PHASE_BATCHED,
+                "cwd": "/etc",
+            }
+        )
+
+
+def test_rank_op_rejects_missing_required_fields():
+    with pytest.raises(ProtocolError):
+        RankOp.from_dict({"op": "forward", "phase": PHASE_BATCHED})
+
+
+def test_rank_op_rejects_tags_token_ids_length_mismatch():
+    with pytest.raises(ProtocolError):
+        RankOp.from_dict(
+            {
+                "op": "forward",
+                "phase": PHASE_BATCHED,
+                "tags": [1, 2],
+                "token_ids": [[1]],
+            }
+        )
+
+
+def test_rank_op_rejects_standalone_with_multiple_tags():
+    with pytest.raises(ProtocolError):
+        RankOp.from_dict(
+            {
+                "op": "forward",
+                "phase": PHASE_STANDALONE,
+                "tags": [1, 2],
+                "token_ids": [[1], [2]],
+            }
+        )
+
+
+def test_rank_op_rejects_admit_with_multiple_tags():
+    with pytest.raises(ProtocolError):
+        RankOp.from_dict(
+            {
+                "op": "forward",
+                "phase": PHASE_ADMIT,
+                "tags": [1, 2],
+                "token_ids": [[1], [2]],
+            }
+        )
+
+
+def test_rank_op_rejects_wrong_field_types():
+    with pytest.raises(ProtocolError):
+        RankOp.from_dict(
+            {
+                "op": "forward",
+                "phase": PHASE_BATCHED,
+                "tags": ["not-an-int"],
+                "token_ids": [[1]],
+            }
+        )
 
 
 # -- closed command schema (CL2-04) ------------------------------------------

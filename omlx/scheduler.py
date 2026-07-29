@@ -1525,6 +1525,7 @@ class Scheduler:
         tokenizer: Any,
         config: SchedulerConfig | None = None,
         stream: Any | None = None,
+        batch_generator_factory: Callable[[SamplingParams], Any] | None = None,
     ):
         """
         Initialize the scheduler.
@@ -1535,8 +1536,17 @@ class Scheduler:
             config: Scheduler configuration
             stream: Optional mx.Stream for this engine. Falls back to the
                 module-level _default_generation_stream when not provided.
+            batch_generator_factory: S3 D4 seam. When ``None`` (the default),
+                ``_ensure_batch_generator`` builds mlx-lm's ``BatchGenerator``
+                exactly as before — behavior is byte-for-byte unchanged. When
+                provided, it replaces that construction (used by the cluster
+                path to hand back a ``TPBatchGenerator`` instead); the
+                returned object need only conform to the four methods the
+                scheduler calls (``insert``, ``next_generated``, ``remove``,
+                ``extract_cache``), not literally be a ``BatchGenerator``.
         """
         self.model = model
+        self._batch_generator_factory = batch_generator_factory
         # Deep-copy the tokenizer so the scheduler owns an independent Rust
         # tokenizer backend.  Without this, concurrent access from the asyncio
         # event loop (encode/apply_chat_template in engine handlers) and the
@@ -1817,8 +1827,11 @@ class Scheduler:
         self.request_id_to_uid: dict[str, int] = {}
         self.uid_to_request_id: dict[int, str] = {}
 
-        # BatchGenerator - the actual batching engine
-        self.batch_generator: BatchGenerator | None = None
+        # BatchGenerator - the actual batching engine. Widened beyond the
+        # literal mlx-lm type (S3 D4 seam): a batch_generator_factory may
+        # hand back any object conforming to the four consumed methods
+        # (insert/next_generated/remove/extract_cache), e.g. TPBatchGenerator.
+        self.batch_generator: BatchGenerator | Any | None = None
         self._current_sampler_params: tuple | None = None
         # Boundary cache snapshots for stateful non-sliceable caches (e.g., ArraysCache).
         # request_id -> {token_count -> snapshot_cache_or_None}
@@ -5192,7 +5205,10 @@ class Scheduler:
         """Ensure BatchGenerator exists with compatible settings."""
         # Only create once; per-request samplers are passed at insert time.
         if self.batch_generator is None:
-            self.batch_generator = self._create_batch_generator(sampling_params)
+            if self._batch_generator_factory is not None:
+                self.batch_generator = self._batch_generator_factory(sampling_params)
+            else:
+                self.batch_generator = self._create_batch_generator(sampling_params)
 
         # Track latest params for debugging/metrics.
         self._current_sampler_params = (

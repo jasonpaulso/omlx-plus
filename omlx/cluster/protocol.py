@@ -37,7 +37,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 # rejects stack skew at join (`versions.compare_versions`), so head and worker
 # always run identical code and this integer is a second, explicit guard
 # rather than the primary skew defence (CL2-04).
-PROTOCOL_VERSION = 1
+# S3 bump (was 1): adds RankOp, the forward-replay message the TP batch
+# generator broadcasts once per model invocation.
+PROTOCOL_VERSION = 2
 
 
 class ProtocolError(ValueError):
@@ -175,6 +177,132 @@ class StepMessage:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ProtocolError(f"StepMessage payload is not JSON: {exc}") from exc
         return cls.from_dict(data)
+
+
+# -- the S3 forward-replay collective message --------------------------------
+
+# The only op kind defined so far. A closed set, per D3/CL2-04: any other
+# value is rejected loudly, never ignored.
+RANK_OP_FORWARD = "forward"
+
+# ``phase`` discriminates three shapes of forward that the follower must
+# reconcile differently — inferring it from ``len(tags)`` is not reliable
+# (a single newly-admitted row's delta forward is a length-1 *batched* op),
+# so it rides the wire explicitly instead:
+#
+# * ``standalone`` — a per-request prefill forward (``scheduler.py:3191``,
+#   ``:4419``). Always exactly one tag, run over that request's own
+#   unwrapped per-layer cache; the cache lives independently of any batch
+#   until (if ever) it is admitted.
+# * ``admit`` — ``TPBatchGenerator.insert()``'s delta-batch forward: the one
+#   decode step mlx-lm's ``GenerationBatch.__init__`` runs synchronously on
+#   construction, over a *freshly batch-wrapped* (``BatchKVCache``, one row)
+#   copy of that same cache — never the running batch. Always exactly one
+#   tag. This must not be folded into ``batched`` framing: a follower
+#   reconciling a later genuinely-batched op's tag list against this op's
+#   single tag would read it as "the batch is now just this row" and drop
+#   every other running row. It also must not be folded into ``standalone``
+#   framing: unlike prefill, the leader's forward here runs over a wrapped
+#   batch-of-one cache, and replaying it against an unwrapped cache would
+#   size-mismatch the shard's collectives against the leader's. The
+#   follower stores the wrapped, now-stepped result so a later ``batched``
+#   op admitting this tag can reuse it (mirroring ``GenerationBatch.extend``
+#   folding an already-stepped delta into the persistent batch).
+# * ``batched`` — a TPBatchGenerator decode forward over the persistent
+#   running batch. ``tags`` is the full ordered row set of that batch as of
+#   this call.
+PHASE_STANDALONE = "standalone"
+PHASE_ADMIT = "admit"
+PHASE_BATCHED = "batched"
+_KNOWN_PHASES = {PHASE_STANDALONE, PHASE_ADMIT, PHASE_BATCHED}
+
+
+@dataclass
+class RankOp:
+    """One model invocation, broadcast from the leader's model proxy to every
+    follower so it can replay the identical forward on its own shard (D2/D3).
+
+    ``tags`` identifies which per-request cache(s) this call touches — a
+    monotonic, never-reused id minted by the leader's tag registry on first
+    sight of a cache. For a ``batched`` op this is the **full ordered row
+    set** of the batch (not just newly introduced tags): the follower diffs
+    its own locally-held order against this list to derive extends/filters
+    and must end up with an identical order, which turns a desync into a
+    loud error instead of a hung collective. ``token_ids`` is parallel to
+    ``tags`` — one token sequence per row (length 1 for decode, >1 for a
+    prefill chunk). ``release`` carries tags to free *after* this op's
+    forward is replayed (a sweep-detected stranded cache, mainly; ordinary
+    per-row batch removal is already implied by a row's absence from a later
+    ``batched`` op's ``tags``) — composition changes ride the same message
+    as the tokens, per D3.
+    """
+
+    tags: list[int]
+    token_ids: list[list[int]]
+    release: list[int] = field(default_factory=list)
+    done: bool = False
+    op: str = RANK_OP_FORWARD
+    phase: str = PHASE_BATCHED
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "op": self.op,
+            "phase": self.phase,
+            "tags": [int(t) for t in self.tags],
+            "token_ids": [[int(t) for t in row] for row in self.token_ids],
+            "release": [int(t) for t in self.release],
+            "done": bool(self.done),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> RankOp:
+        """Parse one broadcast op, rejecting anything unexpected (CL2-04).
+
+        Rejected — with a named error, never silently ignored or coerced:
+        a non-object payload, an unrecognised ``op`` kind or ``phase``, a
+        missing required field, a field of the wrong shape, or any extra
+        key the schema does not declare.
+        """
+        if not isinstance(data, dict):
+            raise ProtocolError("RankOp payload must be a JSON object")
+        known = {"op", "phase", "tags", "token_ids", "release", "done"}
+        extra = set(data.keys()) - known
+        if extra:
+            raise ProtocolError(f"RankOp payload has unknown fields: {sorted(extra)}")
+        op = data.get("op")
+        if op != RANK_OP_FORWARD:
+            raise ProtocolError(f"unknown RankOp kind {op!r}")
+        phase = data.get("phase", PHASE_BATCHED)
+        if phase not in _KNOWN_PHASES:
+            raise ProtocolError(f"unknown RankOp phase {phase!r}")
+        if "tags" not in data or "token_ids" not in data:
+            raise ProtocolError("RankOp payload missing required fields")
+        tags = data["tags"]
+        token_ids = data["token_ids"]
+        if not isinstance(tags, list) or not all(isinstance(t, int) for t in tags):
+            raise ProtocolError("RankOp 'tags' must be a list of integers")
+        if not isinstance(token_ids, list) or not all(
+            isinstance(row, list) and all(isinstance(t, int) for t in row)
+            for row in token_ids
+        ):
+            raise ProtocolError("RankOp 'token_ids' must be a list of int lists")
+        if len(tags) != len(token_ids):
+            raise ProtocolError("RankOp 'tags' and 'token_ids' length mismatch")
+        if phase in (PHASE_STANDALONE, PHASE_ADMIT) and len(tags) != 1:
+            raise ProtocolError(f"RankOp phase {phase!r} must carry exactly one tag")
+        release = data.get("release", [])
+        if not isinstance(release, list) or not all(
+            isinstance(t, int) for t in release
+        ):
+            raise ProtocolError("RankOp 'release' must be a list of integers")
+        return cls(
+            tags=list(tags),
+            token_ids=[list(row) for row in token_ids],
+            release=list(release),
+            done=bool(data.get("done", False)),
+            op=op,
+            phase=phase,
+        )
 
 
 # -- reply frames (rank 0 -> daemon over stdout) -----------------------------
