@@ -15,12 +15,22 @@ Status: **IN PROGRESS** — protocol pinned, rig run pending.
 
 | Item | Value |
 | --- | --- |
-| Head | M4 Max, 128 GB |
+| Head | M5 Max, 128 GB |
 | Worker | M3 Ultra, 96 GB (`Jasons-Mac-Studio.local`) |
-| Link | Thunderbolt 5, static TB IP aliases (S0 recipe) |
-| Commit under test | `4de9fd01` — both machines (E10 enforces commit-level handshake) |
+| Link | Thunderbolt 5, static TB IP aliases (S0 recipe); data plane `10.0.2.1` ↔ `10.0.2.2`, **not** the `192.168.5.x` LAN |
+| Commit under test | `decc52a9` — both machines, verified by `git rev-parse` on each |
 | Model | `MiniMax-M2.7-3bit` (93.23 GB, 3-bit MoE) |
 | Backends | ring, then jaccl — pinned explicitly, `negotiated_backend == requested` asserted per row |
+
+> **The E10 handshake does not check the checkout.** `compare_versions()`
+> (`omlx/cluster/versions.py:126`) compares `omlx.__version__` — a static literal,
+> `0.5.3` — plus the `mlx` version and mlx-lm's version and commit id. The
+> "commit-level" part is *mlx-lm's* commit, read from PEP 610 `direct_url.json`;
+> the omlx repo's own HEAD is never exchanged. A worker sitting on an older omlx
+> commit therefore joins cleanly and then runs mismatched TP protocol code. Both
+> checkouts must be confirmed with `git rev-parse` before forming; the handshake
+> will not do it for you. (Corrects an earlier program note claiming E10 would
+> hard-reject a stale worker.)
 
 ---
 
@@ -99,9 +109,76 @@ can be recomputed from raw data without re-running the rig:
 | --- | --- |
 | `benchmarks/cluster_spike/s3_prompt.txt` | the pinned prompt, verbatim |
 | `benchmarks/cluster_spike/s3_measure.py` | drives SSE, dumps **raw per-token arrival timestamps** to JSON (`single` / `concurrent` / `abort` / `flood`) |
-| `benchmarks/cluster_spike/s3_compute.py` | applies the D7 formula to a raw dump; exit 0 = PASS |
+| `benchmarks/cluster_spike/s3_compute.py` | applies the D7 throughput formula (row 5) to a raw dump; exit 0 = PASS |
+| `benchmarks/cluster_spike/s3_tax.py` | applies the E4 coordination-tax gate (row 6) to a snapshot pair + dump; exit 0 = PASS |
 
 Stdlib only, so it runs from any checkout without a venv.
+
+### Row 6: why the tax reading needs a snapshot pair
+
+`engine_stats.last_tax` from `GET /v1/cluster/models/status` is **cumulative, not
+per-request**. Rank 0's `LeaderModelProxy.tax_samples` is created once per model
+load and never reset (`tp_batch.py:145`, appended `:261`), so `_tax_summary`
+averages every broadcast since load — the baseline run and every prefill
+included. Reading it straight after the concurrent run would not be "tax under
+batch"; it would be a lifetime average.
+
+Since `avg_ms × steps` is an exact sum, snapshotting either side of a run
+recovers the windowed figure with no product-code change:
+
+```
+sum_ms        = avg_after × steps_after - avg_before × steps_before
+steps         = steps_after - steps_before
+per-token tax = sum_ms / completion_tokens_in_window
+```
+
+Per-*token*, not per-step: one broadcast serves the whole batch, so a per-step
+figure is not comparable to a budget expressed per token.
+
+**Gated on both windows — single (batch=1) and concurrent (batch=4) — and both
+must pass.** Batch=1 is the strict case, since the tax amortizes over one token
+rather than four. Gating only the concurrent window would be picking the lenient
+number after the fact, which is precisely what the no-retry rule exists to
+prevent.
+
+Falsifiability checked against synthetic fixtures through the real script before
+the rig session:
+
+| Synthetic case | Windowed per-token tax | Verdict |
+| --- | --- | --- |
+| Healthy window (1024 ms over 512 tokens) | 2.000 ms/token | **PASS** (19.5% of budget) |
+| Over-budget window (6144 ms over 512 tokens) | 12.000 ms/token | **STOP** (116.9%) |
+| Bad window hidden behind 10 000 cheap prior steps | 12.000 ms/token | **STOP** — cumulative avg reads a healthy 1.0016 ms/step and would have passed |
+
+The third row is the reason for the snapshot pair: the naive cumulative read
+hides a window that is 117 % of budget.
+
+---
+
+## Run order (pinned)
+
+Per backend, in this order. Ordering is part of the protocol, not a convenience:
+
+1. Form → assert `negotiated_backend == requested` (**row 1**)
+2. `single` → D7 baseline + batch=1 tax window
+3. `concurrent` → D7 aggregate + batch=4 tax window (**rows 5, 6**)
+4. `abort` (**row 3**)
+5. `flood` (**row 4**) — **last**
+
+`flood` runs last because aborts are deferred (`abort_request()` only records the
+ID; it applies at the next `step()`) and the burst parks 32 requests in `waiting`
+with `max_tokens=4096`. A client disconnect does not guarantee the scheduler has
+drained, and that residue must not land inside a no-retry timing window.
+`num_active_requests` is checked back to zero between runs.
+
+**Row 2 (join mid-generation) is read out of the `concurrent` dump**, not a
+separate run: with the one-admission-per-step throttle, requests 2–4 necessarily
+join a batch that is already decoding, and the interleaved arrival timestamps are
+the evidence. Fewer runs, less residue.
+
+Raw dumps and status snapshots are written to a scratchpad outside the repo —
+command lines carry `--api-key`, and nothing captured is meant for git except the
+numbers transcribed into this document.
 
 ---
 
