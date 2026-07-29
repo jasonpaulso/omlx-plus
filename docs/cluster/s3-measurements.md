@@ -7,9 +7,11 @@ Companion docs: `bringup.md` (rig setup), `s2-measurements.md` (S2 acceptance �
 context only; **no S2 number is the S3 gate**, see "Why S2's throughput figure is
 not the baseline" below).
 
-Status: **ring 5 of 6 rows PASS; row 4 NOT DEMONSTRATED. jaccl pending.**
-Five passing rows are five passing rows — this is not a ring pass as a whole.
-See row 4 for what was and was not established.
+Status: **rows 1, 2, 3, 5, 6 PASS on both backends. Row 4 fails as written on
+both: the queue-full cap does fire at exactly 32, but it reaches the client as
+an in-stream SSE error under HTTP 200, never as a 503.** That is the slice's
+one real defect and its main carry-forward. E4's stop condition did not fire on
+either backend.
 
 ---
 
@@ -190,12 +192,12 @@ Per backend, on MiniMax-M2.7-3bit.
 
 | # | Row | ring | jaccl |
 | --- | --- | --- | --- |
-| 1 | `negotiated_backend == requested` | **PASS** | _pending_ |
-| 2 | Join mid-generation (admit a request into a live batch) | **PASS** | _pending_ |
-| 3 | Abort mid-batch (client disconnect; sibling unaffected) | **PASS** | _pending_ |
-| 4 | Queue-full 503 (`max_num_seqs=8`, 41 concurrent, long `max_tokens`) | **NOT DEMONSTRATED** | _pending_ |
-| 5 | D7 throughput gate (aggregate ≥ baseline) | **PASS** 1.893× | _pending_ |
-| 6 | E4 decode-path tax under batch ≤ 10.268 ms/token | **PASS** 0.995 / 0.330 | _pending_ |
+| 1 | `negotiated_backend == requested` | **PASS** | **PASS** |
+| 2 | Join mid-generation (admit a request into a live batch) | **PASS** | **PASS** |
+| 3 | Abort mid-batch (client disconnect; sibling unaffected) | **PASS** | **PASS** |
+| 4 | Queue-full 503 (`max_num_seqs=8`, 41 concurrent, long `max_tokens`) | see below | **FAIL (letter)** — cap fires, but as an in-stream error with HTTP 200, never a 503 |
+| 5 | D7 throughput gate (aggregate ≥ baseline) | **PASS** 1.893× | **PASS** 1.010× |
+| 6 | E4 decode-path tax under batch ≤ 10.268 ms/token | **PASS** 0.995 / 0.330 | **PASS** 0.471 / 0.283 |
 
 Row 4 recipe is the real hard-floored cap, not a knob: `max_waiting =
 max(max_num_seqs * 4, 32)` with a hard floor of 32 and no config override
@@ -256,27 +258,100 @@ step). All four then completed 128 tokens.
 sibling completed its full 128 (`finish_reason: length`) unaffected, and
 `num_active_requests` returned to 0 afterwards.
 
-**Row 4 — queue-full. NOT DEMONSTRATED.** Not a failure: the condition was never
-reached, so the assertion was never put to the system. Across three burst
-attempts all 41 submissions were accepted, and **no `queue_full` frame was ever
-emitted** — `grep` over the head's `server.log` and stdout for
-`queue_full` / `max_depth` / `current_depth` returns nothing for the whole
-session. (The single `503` in that log is a token count, not a status code.)
+**Row 4 — queue-full. Not established on ring; see the jaccl result below,
+which settles the mechanism.** All 41 submissions were accepted across three
+burst attempts. At the time this was read as "the cap was never reached",
+because a `grep` for `queue_full` / `max_depth` / `current_depth` over the
+head's `server.log` and stdout returned nothing.
 
-The mechanism is wired correctly — rank 0 raises `SchedulerQueueFullError` and
-replies `code="queue_full"` (`rank_worker.py:430`), `build_rank_scheduler_config`
-pins `max_num_seqs=8` giving a waiting cap of 32 (`scheduler.py:6766`) — and it
-is covered by the passing unit test. What is missing is a client-side way to
-*hold* 41 requests resident on the live path: rank 0 admits one request per step,
-and requests terminate on their own (one finished naturally at 503 tokens,
-`finish_reason=stop`, despite `max_tokens=4096`), so slots free at least as fast
-as the queue fills. 40 of 41 streamed at least one token where only 8 can run
-concurrently, which is direct evidence of that churn.
+**That inference was wrong, and the grep was never discriminating.** The jaccl
+run later produced a real queue-full rejection, and the same grep *still*
+returns zero — the head does not log these frames at all. The ring bursts also
+ran before the capture was fixed to record in-stream `error` payloads, so a
+rejection would have been silently dropped (a rejected request would look
+exactly like one that merely never started: status 200, no tokens, no error).
 
-Establishing this row needs a way to pin requests resident — a prompt that
-reliably generates to the `max_tokens` ceiling, or an admission pause — and that
-is a harness question, not an S3 code question. Left open rather than reported
-either way.
+Ring row 4 is therefore **unknown from the runs above**, not "never reached".
+It was re-measured after the jaccl session with the fixed capture; see
+"ring row 4, re-measured" below.
+
+### jaccl — 2026-07-29, commit `1250a804`, fresh daemons
+
+Fresh daemons on both nodes (PD-leak: one jaccl session per process), ghost
+member scrubbed, re-joined. `negotiated_backend: "jaccl"`, `loaded: true`,
+`world_size: 2`, no alarms — **row 1 PASS**. RDMA enabled on both nodes.
+
+**Row 5 — D7 throughput.**
+
+| Quantity | Value |
+| --- | --- |
+| baseline (single) | **23.9013 tok/s** — (128−1) / 5.3135 s |
+| aggregate (4 concurrent) | **24.1512 tok/s** — 512 tokens / 21.1998 s window |
+| ratio | **1.010×** |
+| verdict | **PASS**, but with almost no margin |
+
+Recorded as measured under the no-retry rule. The contrast with ring is the
+interesting part and is not smoothed over: jaccl's *single-stream* baseline is
+faster (23.90 vs 19.40 tok/s), but its batching gain is ~nil (1.010× vs ring's
+1.893×). Per-request decode under load ran 6.2–10.0 tok/s against ring's
+9.4–13.5, and TTFT under load was markedly worse (4.0–12.4 s vs 1.3–5.8 s). So
+on this rig jaccl buys single-stream latency and gives back concurrency
+throughput. One observation, one run — not a trend, and worth a dedicated
+comparison before anyone designs around it.
+
+**Row 6 — E4 coordination tax.** Both windows **PASS**; stop condition did not
+fire.
+
+| Window | Steps | Tokens | tok/step | ms/step | **ms/token** | % of budget |
+| --- | --- | --- | --- | --- | --- | --- |
+| single (batch=1) | 130 | 128 | 0.98 | 0.4633 | **0.4705** | 4.58 % |
+| concurrent (batch=4) | 139 | 512 | 3.68 | 1.0436 | **0.2833** | 2.76 % |
+
+Lower than ring at both batch sizes (0.9946 / 0.3302), consistent with RDMA and
+with S2's ring-vs-jaccl ordering.
+
+**Row 2 — PASS.** TTFTs 4.01 / 6.72 / 9.41 / 12.40 s: requests admitted into an
+already-decoding batch.
+
+**Row 3 — PASS.** Victim disconnected at 8 tokens; sibling completed 128
+(`finish_reason: length`); `num_active_requests` back to 0.
+
+**Row 4 — queue-full. The cap fires, but not as an HTTP 503.**
+
+With the fixed capture, request `f17` received a real rejection:
+
+```
+{"message": "Scheduler waiting queue full: 32 >= 32", "type": "server_error"}
+```
+
+`32 >= 32` is exactly the configured cap — `build_rank_scheduler_config` pins
+`max_num_seqs=8`, giving `max(8*4, 32) = 32` (`scheduler.py:6766`). So the
+backpressure mechanism works end to end on the live cluster path: rank 0 raised
+`SchedulerQueueFullError`, replied `code="queue_full"` (`rank_worker.py:430`),
+and the daemon surfaced it to the client.
+
+**But it arrived with HTTP status 200, as an in-stream SSE error event, not as
+a 503.** The row as written ("at least one submission receives 503") is
+therefore **FAIL on the letter and PASS on the substance**, and the gap is
+structural rather than incidental: the cluster route returns a
+`StreamingResponse` before the generate command reaches rank 0, so by the time
+the rejection comes back the response headers are already sent and
+`server.py:708`'s `SchedulerQueueFullError` → 503 handler can no longer fire.
+
+Consequences worth carrying forward, since a client cannot treat this as a
+normal 503:
+
+- The rejection is invisible to any client that only inspects status codes, and
+  to anything that retries on 503. It is also **not logged on the head at all** —
+  the grep above finds nothing even for this confirmed rejection, so an operator
+  has no server-side record that backpressure occurred.
+- 40 of 41 requests still streamed at least one token although only 8 can run
+  concurrently, so slots do churn during the burst; the queue reaching its cap
+  at all is what makes the rejection meaningful.
+
+Not fixed here — it is a route-layer change (peek the first frame before
+committing to a `StreamingResponse`, or surface queue depth pre-admission), and
+S3's scope is the batching path. Filed as the slice's main carry-forward.
 
 ## Repeats and anomalies
 
