@@ -3295,12 +3295,19 @@ class VLMBatchedEngine(BaseEngine):
         (avoiding the ``StreamingResponse`` 200 commit so HTTP 400
         actually reaches the client).
 
-        Also runs the inherited waiting-queue check, first and
-        unconditionally — same 200-commit reasoning, applied to backpressure.
+        Also runs the inherited waiting-queue check, but LAST — after
+        tokenization and the memory check — so a raise from either leaves no
+        reservation behind. Every exit that lets the caller proceed to the
+        real chat path still claims one, EXCEPT the diffusion branch: a
+        diffusion request never reaches ``add_request``/the scheduler's
+        waiting queue (it runs through its own
+        ``_diffusion_lock``/``_diffusion_active_requests`` gate instead —
+        see ``_stream_diffusion_inputs``), so nothing would ever release a
+        reservation claimed here for it. Claiming nothing for diffusion is
+        correct, not an omission.
         """
         if not self._loaded:
             await self.start()
-        self._preflight_queue()
         if self.is_diffusion_model:
             _, _, audio = extract_images_from_messages(messages)
             self._validate_diffusion_request(
@@ -3346,6 +3353,7 @@ class VLMBatchedEngine(BaseEngine):
                 "surface the error",
                 type(e).__name__,
             )
+            self._preflight_queue()
             return
         # Count images from the ORIGINAL messages (the stripped
         # ``text_messages`` no longer has the image content-parts).
@@ -3359,10 +3367,12 @@ class VLMBatchedEngine(BaseEngine):
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_chat")
+            self._preflight_queue()
             return
         await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
+        self._preflight_queue()
 
     async def preflight_completion(
         self,
@@ -3370,10 +3380,14 @@ class VLMBatchedEngine(BaseEngine):
         request_id: str | None = None,
         **kwargs,
     ) -> None:
-        """Early prefill memory check for plain /v1/completions calls (VLM)."""
+        """Early prefill memory check for plain /v1/completions calls (VLM).
+
+        See ``preflight_chat`` for why the waiting-queue reservation is
+        claimed last rather than first, and why the diffusion branch claims
+        nothing at all.
+        """
         if not self._loaded:
             await self.start()
-        self._preflight_queue()
         if self.is_diffusion_model:
             self._validate_diffusion_request(
                 stop=kwargs.get("stop"),
@@ -3389,14 +3403,17 @@ class VLMBatchedEngine(BaseEngine):
                 "path will surface the error",
                 type(e).__name__,
             )
+            self._preflight_queue()
             return
         scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
         if scheduler is None:
             _warn_scheduler_unreachable_once(self, "preflight_completion")
+            self._preflight_queue()
             return
         await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
+        self._preflight_queue()
 
     async def stream_chat(
         self,
