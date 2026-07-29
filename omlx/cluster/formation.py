@@ -122,11 +122,20 @@ class FormationManager:
         return list(self._alarms)
 
     def snapshot(self) -> dict[str, Any]:
-        return {
+        snap: dict[str, Any] = {
             "active_model": self._active_model,
             "jobs": [job.to_dict() for job in self._jobs[-10:]],
             "alarms": list(self._alarms),
         }
+        # Surface the live engine's stats (D9 coordination-tax summary +
+        # negotiated backend) so the E4 re-measurement is readable through the
+        # operator-tier status endpoint, not only in-process. No credential
+        # material; read-only.
+        if self._active_model is not None:
+            engine = self._engines.get(self._active_model)
+            if engine is not None:
+                snap["engine_stats"] = engine.get_stats()
+        return snap
 
     # ---- worker job updates (CL2-07 attribution, CL2-06 alarm) -----------
 

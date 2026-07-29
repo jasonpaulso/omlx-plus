@@ -215,3 +215,30 @@ def test_torn_down_ack_does_not_alarm(tmp_path):
         member, [{"job_id": "job-x", "step": 1, "status": "torn_down"}]
     )
     assert fm.alarms() == []
+
+
+def test_snapshot_surfaces_engine_stats_when_loaded(tmp_path):
+    # The E4 coordination-tax summary must be readable through the status
+    # endpoint (formation.snapshot), not only in-process (D9).
+    fm = FormationManager.__new__(FormationManager)
+    fm._jobs = []
+    fm._alarms = []
+
+    class _FakeEngine:
+        def get_stats(self):
+            return {
+                "negotiated_backend": "ring",
+                "last_tax": {"steps": 256, "avg_ms": 0.16},
+            }
+
+    # No model loaded: no engine_stats key.
+    fm._active_model = None
+    fm._engines = {}
+    assert "engine_stats" not in fm.snapshot()
+
+    # Model loaded: engine stats surfaced verbatim.
+    fm._active_model = "m"
+    fm._engines = {"m": _FakeEngine()}
+    snap = fm.snapshot()
+    assert snap["engine_stats"]["negotiated_backend"] == "ring"
+    assert snap["engine_stats"]["last_tax"]["steps"] == 256
