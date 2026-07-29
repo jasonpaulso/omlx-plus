@@ -49,11 +49,19 @@ def _post_stream(url, api_key, body, timeout=600):
         return None, f"{type(exc).__name__}: {exc}"
 
 
-def stream_request(url, api_key, body, label, abort_after=None, timeout=600):
+def stream_request(url, api_key, body, label, abort_after=None, timeout=600,
+                   hold=None, arrived=None):
     """Drive one SSE request, recording an arrival timestamp per content token.
 
     abort_after: close the connection after this many content chunks (client
     disconnect), to exercise abort-mid-batch.
+
+    hold/arrived: queue-full support. Releasing a slot as soon as streaming is
+    proven lets the waiting queue drain as fast as it fills (rank 0 admits one
+    request per step), so the cap can never be reached and no 503 is possible.
+    When `hold` is given, a request that has proven itself instead keeps its
+    connection OPEN until every sibling has reported an outcome, holding the
+    queue at depth so the cap is actually exercised.
     """
     rec = {
         "label": label,
@@ -71,6 +79,8 @@ def stream_request(url, api_key, body, label, abort_after=None, timeout=600):
     rec["status"] = status
     if status != 200:
         rec["error"] = resp if isinstance(resp, str) else "non-200"
+        if arrived is not None:
+            arrived()  # a rejection is an outcome; don't deadlock the barrier
         return rec
     try:
         for raw in resp:
@@ -108,6 +118,13 @@ def stream_request(url, api_key, body, label, abort_after=None, timeout=600):
             if piece:
                 rec["arrivals"].append(CLOCK())
                 if abort_after is not None and len(rec["arrivals"]) >= abort_after:
+                    if hold is not None:
+                        # Streaming proven. Report it, then hold the connection
+                        # open until every sibling has an outcome.
+                        if arrived is not None:
+                            arrived()
+                            arrived = None
+                        hold()
                     rec["aborted"] = True
                     break
     except Exception as exc:  # noqa: BLE001 - record whatever the rig throws
@@ -183,7 +200,7 @@ def main():
         "model": args.model,
         "prompt_file": args.prompt_file,
         "prompt_chars": len(prompt),
-        "max_tokens": args.max_tokens,
+        "max_tokens": 4096 if args.mode == "flood" else args.max_tokens,
         "n": args.n,
         "wall_start": time.time(),
     }
@@ -212,8 +229,24 @@ def main():
         )
 
     elif args.mode == "flood":
-        # Queue-full: long max_tokens so nothing completes during the burst.
+        # Queue-full: long max_tokens so nothing completes during the burst,
+        # and every proven request holds its slot until all N have an outcome
+        # (see stream_request's `hold`) so the waiting queue actually fills.
         body = build_body(args, prompt, max_tokens=4096)
+        all_reported = threading.Event()
+        remaining = [args.n]
+        lock = threading.Lock()
+
+        def arrived():
+            with lock:
+                remaining[0] -= 1
+                if remaining[0] <= 0:
+                    all_reported.set()
+
+        def hold():
+            # Generous but bounded: a deadlock must not hang the rig session.
+            all_reported.wait(timeout=180)
+
         records = run_parallel(
             [
                 (
@@ -222,8 +255,10 @@ def main():
                         args.api_key,
                         dict(body),
                         f"f{i}",
-                        abort_after=3,  # stop reading once streaming is proven
+                        abort_after=1,  # one token proves streaming
                         timeout=300,
+                        hold=hold,
+                        arrived=arrived,
                     )
                 )
                 for i in range(args.n)
