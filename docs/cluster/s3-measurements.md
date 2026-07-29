@@ -195,7 +195,7 @@ Per backend, on MiniMax-M2.7-3bit.
 | 1 | `negotiated_backend == requested` | **PASS** | **PASS** |
 | 2 | Join mid-generation (admit a request into a live batch) | **PASS** | **PASS** |
 | 3 | Abort mid-batch (client disconnect; sibling unaffected) | **PASS** | **PASS** |
-| 4 | Queue-full 503 (`max_num_seqs=8`, 41 concurrent, long `max_tokens`) | see below | **FAIL (letter)** — cap fires, but as an in-stream error with HTTP 200, never a 503 |
+| 4 | Queue-full 503 (`max_num_seqs=8`, 41 concurrent, long `max_tokens`) | **FAIL (letter)** | **FAIL (letter)** |
 | 5 | D7 throughput gate (aggregate ≥ baseline) | **PASS** 1.893× | **PASS** 1.010× |
 | 6 | E4 decode-path tax under batch ≤ 10.268 ms/token | **PASS** 0.995 / 0.330 | **PASS** 0.471 / 0.283 |
 
@@ -272,8 +272,19 @@ rejection would have been silently dropped (a rejected request would look
 exactly like one that merely never started: status 200, no tokens, no error).
 
 Ring row 4 is therefore **unknown from the runs above**, not "never reached".
-It was re-measured after the jaccl session with the fixed capture; see
-"ring row 4, re-measured" below.
+
+**Ring row 4, re-measured.** After the jaccl session the rig was torn down,
+switched back to `backend=ring`, re-formed with fresh daemons and a scrubbed
+ghost, and the burst was re-run with the fixed capture. Result identical to
+jaccl: request `f22` received
+
+```
+{"message": "Scheduler waiting queue full: 32 >= 32", "type": "server_error"}
+```
+
+again with HTTP status 200, 40 of 41 streaming, no 503. **Ring row 4 = FAIL on
+the letter, same mechanism as jaccl.** The defect is backend-independent, as a
+route-layer problem should be.
 
 ### jaccl — 2026-07-29, commit `1250a804`, fresh daemons
 
@@ -380,6 +391,13 @@ were never re-run.
    capture silently dropped in-stream `error` payloads (no `choices` key), so a
    late-arriving `queue_full` would have been invisible. Fixed before jaccl so
    the same burst cannot produce a false negative there.
+5. **`flood` on ring, re-measured after jaccl** (row 4 only). The three ring
+   bursts above predate the error-event fix and could not observe a rejection;
+   the jaccl run proved rejections are real and unlogged, so ring was re-formed
+   from scratch and re-run to get symmetric evidence. This is a repeat for a
+   defective instrument, not for an unfavourable number — and it *added* a
+   failing row rather than removing one. Ring's rows 5 and 6 were **not**
+   re-run and remain the originals.
 
 ### Rig facts corrected during the session
 
