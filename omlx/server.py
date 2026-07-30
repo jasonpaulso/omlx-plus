@@ -3066,8 +3066,29 @@ async def create_completion(
         # the client is using on its side.
         upstream_request_id = http_request.headers.get("x-request-id")
         await _raise_if_llm_lease_abort_requested(lease)
-        for prompt in prompts:
-            await engine.preflight_completion(prompt, request_id=upstream_request_id)
+        # stream=true only ever generates prompts[0] (see the
+        # StreamingResponse branch below, pinned to prompts[0] /
+        # prompt_token_ids_by_prompt[0]) -- claim only the reservation that
+        # will actually be consumed. Preflighting prompts[1:] here would
+        # claim queue slots nothing downstream ever releases.
+        preflight_prompts = prompts[:1] if request.stream else prompts
+        claimed_preflights = 0
+        try:
+            for prompt in preflight_prompts:
+                await engine.preflight_completion(
+                    prompt, request_id=upstream_request_id
+                )
+                claimed_preflights += 1
+        except BaseException:
+            # A mid-loop preflight failure (e.g. PrefillMemoryExceededError
+            # on prompt k) must not leak the reservations already claimed
+            # for the earlier prompts in this request -- release one per
+            # prior successful claim before re-raising.
+            release = getattr(engine, "_release_queue_reservation", None)
+            if callable(release):
+                for _released in range(claimed_preflights):
+                    release()
+            raise
         # No lease-abort recheck here: the pre-preflight check above already
         # covers this point, and a check placed after preflight would race a
         # claimed-but-unreleased queue reservation (see
@@ -3137,6 +3158,16 @@ async def create_completion(
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
             # prior generation time as prefill.
+            #
+            # Sequential generation is left as-is here: all prompts were
+            # already preflighted (reservations claimed) above before any
+            # generation started, so a later prompt's reservation can
+            # TTL-expire while an earlier prompt's generation is still
+            # running. Benign relaxation under the counted-not-matched
+            # reservation design (reservations are interchangeable slots,
+            # not tied to a specific request) -- add_request's release
+            # becomes a harmless no-op if the TTL already swept it, not a
+            # stuck or double-released slot.
             first_token_at = None
             for i, prompt in enumerate(prompts):
                 output = await engine.generate(
