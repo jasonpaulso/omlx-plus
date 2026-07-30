@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from .hostfile import ibv_matrix_from_devices, require_link_scope
 from .launcher import DEFAULT_JOIN_TIMEOUT_S, LocalCluster, sweep_orphaned_ranks
 from .manager import ClusterError
+from .placement import PlacementDecision
 from .protocol import (
     PROTOCOL_VERSION,
     Backend,
@@ -67,6 +68,11 @@ class FormationJob:
     negotiated_backend: str = ""
     steps: list[dict[str, Any]] = field(default_factory=list)
     _step_counter: int = 0
+    # S4 D3: the pool-computed PlacementDecision that drove this job, when
+    # one exists (a load job driven through EnginePool.load_cluster_model).
+    # Recorded exactly once by the caller that computed it -- this field
+    # only stores, never recomputes.
+    decision: dict[str, Any] | None = None
 
     def next_step(self) -> int:
         self._step_counter += 1
@@ -87,6 +93,7 @@ class FormationJob:
             "negotiated_backend": self.negotiated_backend,
             "steps": list(self.steps),
             "created_at": self.created_at,
+            "decision": self.decision,
         }
 
 
@@ -173,9 +180,11 @@ class FormationManager:
 
     # ---- formation / teardown jobs (E6 queue) ----------------------------
 
-    async def load(self, model_id: str) -> dict[str, Any]:
+    async def load(
+        self, model_id: str, *, decision: PlacementDecision | None = None
+    ) -> dict[str, Any]:
         return await self._manager._queue.submit(
-            "cluster_load", lambda: self._load(model_id)
+            "cluster_load", lambda: self._load(model_id, decision=decision)
         )
 
     async def unload(self, model_id: str) -> dict[str, Any]:
@@ -183,7 +192,9 @@ class FormationManager:
             "cluster_unload", lambda: self._unload(model_id)
         )
 
-    async def _load(self, model_id: str) -> dict[str, Any]:
+    async def _load(
+        self, model_id: str, *, decision: PlacementDecision | None = None
+    ) -> dict[str, Any]:
         if self._active_model is not None:
             raise ClusterError(
                 409,
@@ -191,6 +202,11 @@ class FormationManager:
                 f"{self._active_model!r}; unload it first",
             )
         job = self._new_job("load", model_id)
+        # S4 D3: recorded once, here, by whichever caller supplied it --
+        # EnginePool.load_cluster_model computes it exactly once per call
+        # and this job is where a reader (GET /v1/cluster/models/status)
+        # finds it.
+        job.decision = decision.to_dict() if decision is not None else None
         try:
             member = self._require_active_member()
             # Step 1: model present on the head's OWN dirs (id-only).
@@ -375,6 +391,13 @@ class FormationManager:
     def _command_timeout(self) -> float:
         interval = float(self._settings.heartbeat_interval_s)
         return max(30.0, interval * 6.0)
+
+    @property
+    def command_timeout(self) -> float:
+        """Public alias (S4 D4): the bound `EnginePool.request_unload`/the
+        cluster unload driver add their own margin to.
+        """
+        return self._command_timeout
 
     def _new_job(self, kind: str, model: str) -> FormationJob:
         job = FormationJob(

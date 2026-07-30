@@ -243,6 +243,9 @@ class _FakePool:
     async def _unload_engine(self, model_id):
         self.unloaded.append(model_id)
 
+    async def request_unload(self, model_id):
+        self.unloaded.append(model_id)
+
     def get_entry(self, model_id):
         return SimpleNamespace(model_context_length=self.native, model_type="llm")
 

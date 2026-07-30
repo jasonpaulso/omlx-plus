@@ -864,25 +864,43 @@ class ClusterManager:
 
     # ---- distributed formation (D8) --------------------------------------
 
-    async def load_distributed(self, model_id: str) -> dict[str, Any]:
-        """Stand a tensor-parallel model up across the pair (head only)."""
+    async def load_distributed(
+        self, model_id: str, *, prefer: str = "distributed"
+    ) -> dict[str, Any]:
+        """Stand a tensor-parallel model up across the pair (head only).
+
+        S4 D4: guard-and-delegate. The pool is the single owner of cluster
+        entry create/bind (it drives formation, not the other way around),
+        so this only validates the request and hands off to
+        `EnginePool.load_cluster_model` rather than calling
+        `FormationManager.load` directly.
+        """
         if self._formation is None:
             raise ClusterError(
                 404, "distributed formation is only available on the head"
             )
         if not model_id:
             raise ClusterError(400, "a model id is required")
-        return await self._formation.load(model_id)
+        pool = get_engine_pool()
+        if pool is None:
+            raise ClusterError(503, "the engine pool is not available")
+        result: dict[str, Any] = await pool.load_cluster_model(model_id, prefer)
+        return result
 
     async def unload_distributed(self, model_id: str) -> dict[str, Any]:
-        """Tear a distributed formation down (head only)."""
+        """Tear a distributed formation down (head only). Guard-and-delegate
+        to `EnginePool.unload_cluster_model` (S4 D4)."""
         if self._formation is None:
             raise ClusterError(
                 404, "distributed formation is only available on the head"
             )
         if not model_id:
             raise ClusterError(400, "a model id is required")
-        return await self._formation.unload(model_id)
+        pool = get_engine_pool()
+        if pool is None:
+            raise ClusterError(503, "the engine pool is not available")
+        result: dict[str, Any] = await pool.unload_cluster_model(model_id)
+        return result
 
     def formation_status(self) -> dict[str, Any]:
         """Read-only formation/job state (head only)."""
@@ -1090,7 +1108,16 @@ class ClusterManager:
             return self._node_state_cache
         present: dict[str, int] = {}
         for model_dir in self.global_settings.get_effective_model_dirs():
-            for model_id, info in discover_models(model_dir).items():
+            try:
+                scanned = discover_models(model_dir)
+            except (OSError, ValueError):
+                # A configured-but-not-yet-created directory (e.g. the
+                # default base_path/models before a model is ever added)
+                # must not abort the whole scan -- other configured dirs
+                # (the HF cache) still need scanning, and this is advisory
+                # inventory, not a hard dependency.
+                continue
+            for model_id, info in scanned.items():
                 present.setdefault(model_id, info.estimated_size)
         self._node_state_cache = present
         self._node_state_cache_at = now

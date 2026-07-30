@@ -2751,7 +2751,7 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
-    await _server_state.engine_pool._unload_engine(model_id)
+    await _server_state.engine_pool.request_unload(model_id)
     return {"status": "ok", "model_id": model_id}
 
 

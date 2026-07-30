@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+import json
+
+from omlx.cluster.manager import set_engine_pool_getter
+from omlx.engine_pool import EnginePool
+
 from .conftest import (
     MAIN_API_KEY,
     SUB_KEY,
@@ -46,20 +51,40 @@ async def test_endpoints_404_on_worker(tmp_path):
 
 
 async def test_load_without_a_worker_is_424(tmp_path):
+    """S4 D4: /v1/cluster/models/load now routes through
+    ``pool.load_cluster_model``, so the pool must be wired (production
+    always injects it via ``init_server``). With no active worker, the
+    reject now comes from ``plan_placement`` itself (no cluster members
+    available) rather than formation's own worker check -- same 424
+    status, a placement reason attached instead of formation's raw
+    message (S4 D3's documented semantics change for this route).
+    """
     settings = make_settings(
         tmp_path / "h",
         role="head",
         data_plane_subnet="10.0.2.0/24",
         data_plane_address="10.0.2.1",
     )
-    async with running_manager(settings):
-        app = build_app()
-        async with http_client(app) as client:
-            resp = await client.post(
-                LOAD, json={"model": "m"}, headers=bearer(MAIN_API_KEY)
-            )
-            assert resp.status_code == 424
-            assert "worker" in resp.json()["detail"]
+    model_dir = tmp_path / "models" / "m"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (model_dir / "model.safetensors").write_bytes(b"0" * 1024)
+
+    pool = EnginePool()
+    pool._get_final_ceiling = lambda: 1  # too small to fit locally
+    pool.discover_models(str(tmp_path / "models"))
+    set_engine_pool_getter(lambda: pool)
+    try:
+        async with running_manager(settings):
+            app = build_app()
+            async with http_client(app) as client:
+                resp = await client.post(
+                    LOAD, json={"model": "m"}, headers=bearer(MAIN_API_KEY)
+                )
+                assert resp.status_code == 424
+                assert "no cluster members" in resp.json()["detail"]
+    finally:
+        set_engine_pool_getter(None)
 
 
 async def test_status_reports_formation(tmp_path):

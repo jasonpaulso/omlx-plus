@@ -18,13 +18,13 @@ import gc
 import json
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from .cluster.placement import NodeCapacity
+    from .cluster.placement import NodeCapacity, PlacementDecision
     from .model_settings import ModelSettingsManager
 
 import mlx.core as mx
@@ -111,25 +111,63 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+    # S4 D4: cluster entries are first-class EngineEntry rows -- `engine` is
+    # the ClusterEngine once formed, `estimated_size` becomes the head's
+    # per-rank share while formed. `kind` is the only signal callers need;
+    # nothing outside engine_pool.py should branch on `is_helper`-style
+    # sentinels for this.
+    kind: Literal["local", "cluster"] = "local"
+    cluster_head_share: int | None = None  # est_size / world_size * headroom
+    # The pre-form estimated_size, stashed at claim time so unform can
+    # restore it exactly rather than re-deriving it from a fresh discovery.
+    cluster_original_estimated_size: int | None = None
+    cluster_teardown_in_progress: bool = False  # claimed by the unload driver
+    # Explicit operator/dashboard unload ignores pin and busy state
+    # (matches _unload_engine's immediate-abort semantics for local
+    # entries); background marks (TTL, admission eviction) do not set this.
+    cluster_unload_force: bool = False
 
 
-def _resolve_cluster_engine(model_id: str):
-    """Return the distributed ClusterEngine for a model, or None.
+# S4 D4: bounded outer retry for get_engine's cluster branches (rev4/5/6).
+_GET_ENGINE_MAX_ATTEMPTS = 3
+# Added to the formation command timeout for a bounded wait on cluster
+# teardown (request_unload, admission eviction of a cluster victim).
+_CLUSTER_UNLOAD_MARGIN_S = 15.0
+_CLUSTER_UNLOAD_FALLBACK_TIMEOUT_S = 30.0
 
-    Flag-gated by cluster role: the local import mirrors admin.routes' pattern
-    (avoids a cluster<->admin import cycle), and a non-head role returns None
-    immediately, so a server with ``cluster.role=off`` behaves exactly as it
-    did before this touchpoint existed.
+
+class PlacementStaleError(Exception):
+    """A precomputed :class:`~omlx.cluster.placement.PlacementDecision`
+    no longer holds at claim time (S4 D4 rev5): another load changed the
+    pool's occupancy between the attempt that computed it and the attempt
+    that tried to act on it. The outer ``get_engine`` retry recomputes a
+    fresh decision on the next attempt rather than acting on a stale one.
     """
-    from omlx.cluster.manager import get_cluster_manager
 
-    manager = get_cluster_manager()
-    if manager is None or manager.role != "head":
-        return None
-    formation = manager.formation
-    if formation is None:
-        return None
-    return formation.active_engine(model_id)
+
+class _ClusterVictimPendingError(Exception):
+    """Internal control-flow signal, not a real error: ``get_engine``'s
+    admission eviction picked a formed cluster entry as its LRU victim.
+    Raised while the pool lock is held so the enclosing ``async with``
+    releases it before the caller awaits the unload driver's completion
+    event -- the binding invariant is no formation await under the lock.
+    """
+
+    def __init__(self, model_id: str, event: asyncio.Event) -> None:
+        super().__init__(model_id)
+        self.model_id = model_id
+        self.event = event
+
+
+class _ClusterLoadPendingError(Exception):
+    """Internal control-flow signal: placement chose ``distributed``.
+    Raised under the lock so it releases before ``load_cluster_model`` runs
+    its own a/b/c lock choreography outside it.
+    """
+
+    def __init__(self, decision: PlacementDecision) -> None:
+        super().__init__(decision.mode)
+        self.decision = decision
 
 
 class EnginePool:
@@ -177,6 +215,12 @@ class EnginePool:
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
         self._lease_release_tasks: set[asyncio.Task[None]] = set()
+        # S4 D4: the one out-of-lock cluster teardown driver, created lazily
+        # on the first cluster mark. `_cluster_unload_events` lets callers
+        # (request_unload, admission eviction) await one entry's teardown.
+        self._cluster_unload_task: asyncio.Task[None] | None = None
+        self._cluster_unload_wake: asyncio.Event | None = None
+        self._cluster_unload_events: dict[str, asyncio.Event] = {}
         self.configure_hot_cache_budget()
 
     @property
@@ -322,6 +366,20 @@ class EnginePool:
         wake = getattr(enforcer, "wake", None) if enforcer is not None else None
         if callable(wake):
             wake(active=active)
+
+    @staticmethod
+    def _invalidate_cluster_node_state_cache() -> None:
+        """S4 D1 residual: force this worker's next heartbeat to re-scan its
+        model dirs after a local load/unload, rather than waiting up to 60s
+        for the cached inventory to expire on its own. A no-op on a head or
+        a node with no cluster role (the manager import/lookup is cheap and
+        already used elsewhere in this module).
+        """
+        from .cluster.manager import get_cluster_manager
+
+        manager = get_cluster_manager()
+        if manager is not None and manager.role == "worker":
+            manager.invalidate_node_state_cache()
 
     @staticmethod
     def _canonical_signature_value(value: object) -> str:
@@ -773,6 +831,12 @@ class EnginePool:
         entry.pending_unload_reason = reason
         if abort_requested:
             entry.abort_requested = True
+        if entry.kind == "cluster":
+            # S4 D4: TTL and enforcer background marks reach here too;
+            # wake the driver so a mark-only cluster entry actually gets
+            # torn down instead of sitting marked until something else
+            # happens to wake it.
+            self._wake_cluster_unload_driver_locked()
         return True
 
     def _find_pending_unload_ready_locked(self) -> str | None:
@@ -784,6 +848,7 @@ class EnginePool:
                 entry.engine is None
                 or entry.is_loading
                 or entry.is_pinned
+                or entry.kind == "cluster"  # S4 D4: the driver handles these
                 or self._entry_is_busy(entry)
             ):
                 continue
@@ -799,14 +864,22 @@ class EnginePool:
         Caller must hold ``self._lock``.
         """
         entry = self._entries.get(model_id)
-        if (
-            entry is None
-            or entry.engine is None
-            or not entry.pending_unload_reason
-            or entry.is_loading
-            or entry.is_pinned
-            or self._entry_is_busy(entry)
-        ):
+        if entry is None or entry.engine is None or not entry.pending_unload_reason:
+            return False
+
+        if entry.kind == "cluster":
+            # S4 D4 rev5: cluster teardown always awaits a formation command
+            # round-trip, which can never happen under this lock (and some
+            # callers here -- _release_engine_lease, the enforcer's
+            # emergency busy-victim path -- reach this directly, bypassing
+            # _find_pending_unload_ready_locked's own cluster exclusion).
+            # Preserve the marker and hand off to the out-of-lock driver
+            # instead of falling into _unload_engine, which raises for
+            # kind="cluster".
+            self._wake_cluster_unload_driver_locked()
+            return False
+
+        if entry.is_loading or entry.is_pinned or self._entry_is_busy(entry):
             return False
 
         reason = entry.pending_unload_reason
@@ -825,6 +898,372 @@ class EnginePool:
             return False
         entry = self._entries.get(model_id)
         return bool(entry and entry.abort_requested)
+
+    # ---- S4 D4: cluster entry coexistence ---------------------------------
+    #
+    # Cluster models are EngineEntry rows like any other (kind="cluster"),
+    # with the pool as the single owner of their create/bind/teardown. The
+    # binding lock-ordering rule: self._lock is never held across an E6
+    # queue submit or any await on a formation job. Load runs as (a) claim
+    # under the lock, (b) submit+await formation outside it, (c) bind under
+    # the lock again. Teardown never runs inline: the only code that
+    # unforms is `_cluster_unload_driver_loop`, an out-of-lock task the
+    # pool owns, woken whenever a cluster entry is marked.
+
+    def _force_mark_cluster_unload_locked(
+        self, entry: EngineEntry, reason: str
+    ) -> None:
+        """Explicit operator/dashboard unload: ignores pin and busy state,
+        matching `_unload_engine`'s documented immediate-abort semantics for
+        local entries. Distinct from `_mark_pending_unload_locked`, whose
+        pin/busy refusal is for background marks (TTL, admission eviction).
+        """
+        entry.pending_unload_reason = reason
+        entry.cluster_unload_force = True
+        self._wake_cluster_unload_driver_locked()
+
+    def _cluster_unload_completion_event_locked(self, model_id: str) -> asyncio.Event:
+        event = self._cluster_unload_events.get(model_id)
+        if event is None:
+            event = asyncio.Event()
+            self._cluster_unload_events[model_id] = event
+        return event
+
+    def _signal_cluster_unload_complete_locked(self, model_id: str) -> None:
+        event = self._cluster_unload_events.pop(model_id, None)
+        if event is not None:
+            event.set()
+
+    def _wake_cluster_unload_driver_locked(self) -> None:
+        """Create the driver task lazily on first cluster mark; wake it."""
+        if self._cluster_unload_wake is None:
+            self._cluster_unload_wake = asyncio.Event()
+        if self._cluster_unload_task is None or self._cluster_unload_task.done():
+            self._cluster_unload_task = asyncio.get_running_loop().create_task(
+                self._cluster_unload_driver_loop(), name="cluster-unload-driver"
+            )
+        self._cluster_unload_wake.set()
+
+    async def _drain_cluster_unload_driver(self) -> None:
+        """Cancel and await the driver task (shutdown, mirrors
+        `_drain_lease_release_tasks`)."""
+        task, self._cluster_unload_task = self._cluster_unload_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    def _claim_cluster_teardown_locked(self) -> str | None:
+        """Caller holds `self._lock`. Pick one marked, idle, unclaimed
+        `kind="cluster"` entry and claim it (`cluster_teardown_in_progress`)
+        so a second driver iteration never double-claims it. Force-marked
+        entries (explicit operator/dashboard unload) are claimed even while
+        busy, matching `_unload_engine`'s immediate-abort semantics.
+        """
+        for mid, entry in self._entries.items():
+            if entry.kind != "cluster" or entry.cluster_teardown_in_progress:
+                continue
+            if not entry.pending_unload_reason or entry.is_loading:
+                continue
+            if not entry.cluster_unload_force and self._entry_is_busy(entry):
+                continue
+            entry.cluster_teardown_in_progress = True
+            return mid
+        return None
+
+    async def _teardown_cluster_entry(self, model_id: str) -> None:
+        """Unform one claimed cluster entry outside the pool lock, then
+        restore it to a plain unloaded `kind="local"` row and signal
+        anything awaiting its completion event.
+        """
+        from .cluster.manager import get_cluster_manager
+
+        try:
+            manager = get_cluster_manager()
+            if manager is not None and manager.formation is not None:
+                await manager.formation.unload(model_id)
+        except Exception:
+            logger.exception("cluster: driver teardown failed for '%s'", model_id)
+        finally:
+            async with self._lock:
+                entry = self._entries.get(model_id)
+                if entry is not None and entry.kind == "cluster":
+                    if entry.engine is not None:
+                        self._current_model_memory = max(
+                            0, self._current_model_memory - entry.estimated_size
+                        )
+                    entry.engine = None
+                    entry.kind = "local"
+                    if entry.cluster_original_estimated_size is not None:
+                        entry.estimated_size = entry.cluster_original_estimated_size
+                    entry.cluster_original_estimated_size = None
+                    entry.cluster_head_share = None
+                    entry.cluster_teardown_in_progress = False
+                    entry.pending_unload_reason = None
+                    entry.cluster_unload_force = False
+                    entry.last_access = 0.0
+                self._signal_cluster_unload_complete_locked(model_id)
+            self._wake_process_memory_enforcer()
+
+    async def _cluster_unload_driver_loop(self) -> None:
+        assert self._cluster_unload_wake is not None
+        while True:
+            await self._cluster_unload_wake.wait()
+            self._cluster_unload_wake.clear()
+            while True:
+                async with self._lock:
+                    model_id = self._claim_cluster_teardown_locked()
+                if model_id is None:
+                    break
+                try:
+                    await self._teardown_cluster_entry(model_id)
+                except Exception:
+                    # A wedged request_unload/get_engine caller is worse
+                    # than a logged failure -- keep the driver alive so a
+                    # later wake can retry.
+                    logger.exception("cluster: unload driver iteration failed")
+
+    def _cluster_unload_bound(self) -> float:
+        """Bound for awaiting a cluster teardown: the formation command
+        timeout plus a margin (S4 D4 rev5), or a conservative fallback when
+        no formation is wired up (should not happen for a real call, but a
+        bound must exist either way).
+        """
+        from .cluster.manager import get_cluster_manager
+
+        manager = get_cluster_manager()
+        formation = manager.formation if manager is not None else None
+        base = (
+            formation.command_timeout
+            if formation is not None
+            else _CLUSTER_UNLOAD_FALLBACK_TIMEOUT_S
+        )
+        return float(base) + _CLUSTER_UNLOAD_MARGIN_S
+
+    async def _await_cluster_teardown(
+        self, model_id: str, event: asyncio.Event
+    ) -> None:
+        from .cluster.manager import ClusterFormationError
+
+        bound = self._cluster_unload_bound()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=bound)
+        except TimeoutError as exc:
+            raise ClusterFormationError(
+                f"cluster teardown of '{model_id}' did not complete within "
+                f"{bound:.0f}s"
+            ) from exc
+
+    def _claim_cluster_entry_locked(
+        self, entry: EngineEntry, decision: PlacementDecision
+    ) -> None:
+        """Caller holds `self._lock`. Step (a) of D4's load choreography:
+        mark the entry as forming. `estimated_size`/`_current_model_memory`
+        are NOT touched here -- discovery's refresh already preserves any
+        entry with `is_loading=True`, so nothing needs the accounting until
+        bind (step c) actually succeeds.
+        """
+        entry.is_loading = True
+        entry.loading_started_at = time.monotonic()
+        entry.kind = "cluster"
+        entry.cluster_original_estimated_size = entry.estimated_size
+        entry.cluster_head_share = decision.per_rank_estimate
+
+    def _revalidate_cluster_decision_locked(
+        self, entry: EngineEntry, decision: PlacementDecision
+    ) -> bool:
+        """Claim-time revalidation of a precomputed decision (S4 D4 rev5):
+        only the volatile predicate -- does the head still have room -- is
+        rechecked, under the lock, with no I/O. Divisibility and worker fit
+        do not change between the attempt that computed the decision and
+        the attempt that acts on it, so they are not re-derived.
+        """
+        head = self.head_capacity()
+        projected = head.current_model_memory + decision.per_rank_estimate
+        return head.capacity_known and projected <= head.memory_ceiling
+
+    def _rollback_cluster_entry_locked(self, model_id: str) -> None:
+        """Caller holds `self._lock`. Undo a claim that never reached bind
+        (formation submit/await raised, or bind found no engine)."""
+        entry = self._entries.get(model_id)
+        if entry is None or entry.kind != "cluster":
+            return
+        if entry.engine is not None:
+            self._current_model_memory = max(
+                0, self._current_model_memory - entry.estimated_size
+            )
+        entry.engine = None
+        entry.kind = "local"
+        if entry.cluster_original_estimated_size is not None:
+            entry.estimated_size = entry.cluster_original_estimated_size
+        entry.cluster_original_estimated_size = None
+        entry.cluster_head_share = None
+        entry.is_loading = False
+        entry.loading_started_at = None
+
+    async def load_cluster_model(
+        self,
+        model_id: str,
+        prefer: Literal["auto", "local", "distributed"],
+        *,
+        decision: PlacementDecision | None = None,
+    ) -> dict[str, Any]:
+        """S4 D4: the ONE owner of cluster entry create/bind.
+
+        Two callers: the routes path (`decision=None`) computes its own
+        single placement decision internally; `get_engine`'s on-demand path
+        supplies the decision it already computed, revalidated (not
+        recomputed) at claim time -- a stale precomputed decision raises
+        `PlacementStaleError` rather than silently acting on outdated occupancy.
+
+        Lock-ordering: (a) claim under the lock, (b) submit+await the
+        formation job outside it, (c) bind under the lock again. Never
+        awaits formation while holding `self._lock`.
+        """
+        from .cluster.manager import ClusterError, get_cluster_manager
+        from .cluster.placement import plan_placement, resolve_placement_inputs
+
+        manager = get_cluster_manager()
+        if manager is None or manager.role != "head" or manager.formation is None:
+            raise ClusterError(
+                404, "distributed formation is only available on the head"
+            )
+
+        if decision is None:
+            async with self._lock:
+                entry = self._entries.get(model_id)
+                if entry is None:
+                    raise ModelNotFoundError(model_id, list(self._entries.keys()))
+                if entry.engine is not None:
+                    entry.last_access = time.time()
+                    return {"model": model_id, "status": "ready", "decision": None}
+                if entry.is_loading:
+                    raise ModelLoadingError(model_id)
+                model_path = entry.model_path
+                model_type = entry.model_type
+                est_size = entry.estimated_size
+
+            # I/O outside the lock (S4 rev5 NB2): a single computation for
+            # this call, driving the job that records it.
+            _unused_est, model_config = resolve_placement_inputs(model_path)
+            workers = self._cluster_worker_capacities(manager)
+
+            async with self._lock:
+                entry = self._entries.get(model_id)
+                if entry is None:
+                    raise ModelNotFoundError(model_id, list(self._entries.keys()))
+                if entry.engine is not None:
+                    entry.last_access = time.time()
+                    return {"model": model_id, "status": "ready", "decision": None}
+                if entry.is_loading:
+                    raise ModelLoadingError(model_id)
+                decision = plan_placement(
+                    model_id=model_id,
+                    model_type=model_type,
+                    est_size=est_size,
+                    model_config=model_config,
+                    head=self.head_capacity(),
+                    workers=workers,
+                    prefer=prefer,
+                )
+                if decision.mode != "distributed":
+                    raise ClusterError(
+                        424,
+                        "; ".join(decision.reasons) or "placement rejected",
+                    )
+                self._claim_cluster_entry_locked(entry, decision)
+        else:
+            async with self._lock:
+                entry = self._entries.get(model_id)
+                if entry is None:
+                    raise ModelNotFoundError(model_id, list(self._entries.keys()))
+                if entry.engine is not None:
+                    entry.last_access = time.time()
+                    return {
+                        "model": model_id,
+                        "status": "ready",
+                        "decision": decision.to_dict(),
+                    }
+                if entry.is_loading:
+                    raise ModelLoadingError(model_id)
+                if not self._revalidate_cluster_decision_locked(entry, decision):
+                    raise PlacementStaleError(model_id)
+                self._claim_cluster_entry_locked(entry, decision)
+
+        # (b) outside the lock: submit + await the formation job.
+        try:
+            result = await manager.formation.load(model_id, decision=decision)
+        except BaseException:
+            async with self._lock:
+                self._rollback_cluster_entry_locked(model_id)
+            raise
+
+        # (c) re-acquire: bind the engine, clear is_loading.
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            engine = manager.formation.active_engine(model_id)
+            if entry is None or engine is None:
+                self._rollback_cluster_entry_locked(model_id)
+                raise ClusterError(
+                    500,
+                    f"formation reported ready but no engine registered for "
+                    f"{model_id!r}",
+                )
+            entry.engine = engine
+            entry.estimated_size = entry.cluster_head_share or entry.estimated_size
+            self._current_model_memory += entry.cluster_head_share or 0
+            entry.is_loading = False
+            entry.loading_started_at = None
+            entry.last_access = time.time()
+
+        result = dict(result)
+        result["decision"] = decision.to_dict()
+        return result
+
+    async def unload_cluster_model(self, model_id: str) -> dict[str, Any]:
+        """S4 D4: explicit distributed unload (`manager.unload_distributed`'s
+        delegate target). Force-marks (ignores pin/busy, matching
+        `_unload_engine`'s immediate-abort semantics) and awaits the
+        driver's completion event, bounded by the formation command timeout
+        + margin.
+        """
+        from .cluster.manager import ClusterError
+
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            if (
+                entry is None
+                or entry.kind != "cluster"
+                or (entry.engine is None and not entry.is_loading)
+            ):
+                raise ClusterError(
+                    404, f"no active distributed formation for {model_id!r}"
+                )
+            if entry.is_loading:
+                raise ClusterError(409, f"model {model_id!r} is still forming")
+            self._force_mark_cluster_unload_locked(entry, "operator unload")
+            event = self._cluster_unload_completion_event_locked(model_id)
+
+        await self._await_cluster_teardown(model_id, event)
+        return {"model": model_id, "status": "unloaded"}
+
+    async def request_unload(self, model_id: str) -> None:
+        """S4 D4: the single out-of-pool unload dispatcher, kind-routed.
+
+        Every caller outside `engine_pool.py` that used to call
+        `_unload_engine` directly now calls this instead, so unloading a
+        formed model gets a real driver-driven teardown (correct accounting
+        restored) instead of `_unload_engine`'s raise.
+        """
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            if entry is None or entry.engine is None:
+                return
+            kind = entry.kind
+        if kind == "cluster":
+            await self.unload_cluster_model(model_id)
+            return
+        await self._unload_engine(model_id)
 
     async def get_engine(
         self,
@@ -850,6 +1289,16 @@ class EnginePool:
         4. Load the model
         5. Return the engine
 
+        S4 D4/D5: this is a bounded outer retry loop (max
+        ``_GET_ENGINE_MAX_ATTEMPTS``) around one attempt's lock scope(s).
+        When a cluster head has ``cluster.auto_placement`` on, an attempt
+        that needs to load may resolve to a distributed placement, or may
+        pick a formed cluster entry as its LRU eviction victim; either way
+        the pool releases its lock before awaiting formation (never holds
+        it across an E6 queue submit or a formation command round-trip),
+        then this loop retries. A retry that finds nothing to do raises
+        the same errors this always raised.
+
         Args:
             model_id: The model ID to get engine for
             force_lm: Force loading as LM (BatchedEngine) even for VLM models.
@@ -868,27 +1317,68 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
-        # E1 cluster touchpoint: when this node is a cluster head with an active
-        # distributed formation for the model, serve it through the pinned
-        # ClusterEngine instead of loading it locally. Flag-gated: the helper
-        # returns None immediately unless the head role is active, so role=off
-        # takes the identical path it always has.
-        cluster_engine = _resolve_cluster_engine(model_id)
-        if cluster_engine is not None:
-            return cluster_engine
+        for _attempt in range(_GET_ENGINE_MAX_ATTEMPTS):
+            try:
+                return await self._get_engine_attempt(
+                    model_id,
+                    force_lm=force_lm,
+                    _lease=_lease,
+                    runtime_settings=runtime_settings,
+                )
+            except _ClusterVictimPendingError as pending:
+                await self._await_cluster_teardown(pending.model_id, pending.event)
+            except _ClusterLoadPendingError as pending:
+                with suppress(PlacementStaleError):
+                    await self.load_cluster_model(
+                        model_id, "auto", decision=pending.decision
+                    )
+        raise ModelLoadingError(
+            model_id,
+            f"Model '{model_id}' did not settle into a loaded state after "
+            f"{_GET_ENGINE_MAX_ATTEMPTS} attempts; retry the request.",
+        )
 
+    async def _get_engine_attempt(
+        self,
+        model_id: str,
+        *,
+        force_lm: bool,
+        _lease: bool,
+        runtime_settings: object | None,
+    ):
+        """One ``get_engine`` attempt. Raises ``_ClusterVictimPendingError`` /
+        ``_ClusterLoadPendingError`` (caught by the outer retry loop in
+        ``get_engine``) when a cluster branch needs an out-of-lock await.
+        """
         async with self._lock:
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
-            expected_signature = self._engine_runtime_signature(
-                model_id,
-                runtime_settings,
-            )
             unloaded_for_admission = False
 
-            # Already loaded - just update access time
+            # Already loaded - just update access time. Cluster entries take
+            # a zero-I/O fast path: the kind guard (S4 D4 rev3) skips the
+            # whole variant/signature block below, since a formed model
+            # never carries a runtime_settings_signature to reconcile.
             if entry.engine is not None:
+                if entry.kind == "cluster":
+                    if runtime_settings is not None:
+                        from .cluster.engine import ClusterNonGoalError
+
+                        raise ClusterNonGoalError(
+                            f"Model '{model_id}' is served by a distributed "
+                            "formation; runtime settings overrides are not "
+                            "supported for a distributed model."
+                        )
+                    entry.last_access = time.time()
+                    if _lease:
+                        entry.in_use += 1
+                    return entry.engine
+
+                expected_signature = self._engine_runtime_signature(
+                    model_id,
+                    runtime_settings,
+                )
                 if (
                     expected_signature is not None
                     and entry.runtime_settings_signature is not None
@@ -932,175 +1422,301 @@ class EnginePool:
 
             self._raise_if_model_path_missing_locked(model_id, entry)
             self._raise_if_load_failed(model_id, entry)
+            if entry.is_loading:
+                raise ModelLoadingError(model_id)
 
-            # Pre-load admission against the memory ceiling from the
-            # process memory enforcer (min of static and dynamic). Try
-            # evicting LRU non-pinned models first; if the model still
-            # cannot fit after evicting everything available, raise.
-            #
-            # Eviction starts at the enforcer's *soft* watermark, not the
-            # ceiling (#2319): the soft..ceiling band is exactly the
-            # hard-pressure zone, and a second model admitted into it kept
-            # both models resident through the load (swapping for minutes)
-            # only to have the first request's prefill guard evict the old
-            # one anyway. Evicting down to the same soft target *before*
-            # the new weights allocate fixes the ordering; refusing a load
-            # still requires exceeding the ceiling.
-            #
-            # ceiling == 0 means the guard is disabled or the enforcer is
-            # not wired up. Eviction on model swap must not die with the
-            # guard (#2290): fall back to the best-effort admission
-            # ceiling (static, guard-independent) and keep evicting, but
-            # never refuse the load under it — with the guard off the
-            # user opted out of hard limits.
-            ceiling = self._current_ceiling()
-            best_effort = False
-            if ceiling <= 0:
-                ceiling = self._fallback_admission_ceiling()
-                best_effort = ceiling > 0
-            if ceiling > 0:
-                soft_target = self._admission_soft_target()
-                evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
-                evicted_any = unloaded_for_admission
-                while True:
-                    # Consult the tracked accumulator alongside live memory:
-                    # after a model settles or idles, mx.get_active_memory() and
-                    # the process footprint can read well below the model's true
-                    # resident size, while _current_model_memory still reflects
-                    # the committed total. Using only live memory lets a second
-                    # large model load without evicting the first, over-
-                    # committing past the ceiling (#1623).
-                    current = max(
-                        mx.get_active_memory(),
-                        get_phys_footprint(),
-                        self._current_model_memory,
+            cluster_manager = self._cluster_placement_gate()
+            if cluster_manager is None:
+                return await self._admit_and_load_locked(
+                    model_id,
+                    entry,
+                    force_lm=force_lm,
+                    runtime_settings=runtime_settings,
+                    unloaded_for_admission=unloaded_for_admission,
+                    allow_cluster_victim=False,
+                    lease=_lease,
+                )
+
+            # Cluster gate active and a load decision is needed. est_size is
+            # free (discovery already computed it); the config.json read
+            # below is I/O and must never run under this lock (S4 rev5 NB2).
+            model_path = entry.model_path
+            model_type = entry.model_type
+            est_size = entry.estimated_size
+
+        from .cluster.placement import plan_placement, resolve_placement_inputs
+
+        _unused_est, model_config = resolve_placement_inputs(model_path)
+        workers = self._cluster_worker_capacities(cluster_manager)
+
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            if entry is None:
+                raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            if entry.engine is not None:
+                # Raced with a concurrent loader while the lock was released
+                # for the config.json read above; the entry is now loaded.
+                entry.last_access = time.time()
+                if _lease:
+                    entry.in_use += 1
+                return entry.engine
+            if entry.is_loading:
+                raise ModelLoadingError(model_id)
+
+            decision = plan_placement(
+                model_id=model_id,
+                model_type=model_type,
+                est_size=est_size,
+                model_config=model_config,
+                head=self.head_capacity(),
+                workers=workers,
+                prefer="auto",
+            )
+            if decision.mode == "reject":
+                raise InsufficientMemoryError(
+                    required=est_size,
+                    current=self._current_model_memory,
+                    message=(
+                        f"Cannot place '{model_id}' locally or distributed: "
+                        f"{'; '.join(decision.reasons) or 'placement rejected'}"
+                    ),
+                )
+            if decision.mode == "distributed":
+                raise _ClusterLoadPendingError(decision)
+
+            # mode == "local": exactly today's admission/eviction/load body,
+            # now allowed to pick a formed cluster entry as its victim.
+            return await self._admit_and_load_locked(
+                model_id,
+                entry,
+                force_lm=force_lm,
+                runtime_settings=runtime_settings,
+                unloaded_for_admission=unloaded_for_admission,
+                allow_cluster_victim=True,
+                lease=_lease,
+            )
+
+    async def _admit_and_load_locked(
+        self,
+        model_id: str,
+        entry: EngineEntry,
+        *,
+        force_lm: bool,
+        runtime_settings: object | None,
+        unloaded_for_admission: bool,
+        allow_cluster_victim: bool,
+        lease: bool,
+    ):
+        """Caller holds ``self._lock``. Today's admission/eviction/load body
+        (unchanged local-only semantics), factored out so both the
+        no-cluster-gate path and the cluster ``mode="local"`` path share it
+        (S4 D4). May raise ``_ClusterVictimPendingError`` when
+        ``allow_cluster_victim`` is True and the LRU victim is a formed
+        cluster entry -- the pool marks it and hands off to the out-of-lock
+        teardown driver instead of calling ``_unload_engine`` on it.
+        """
+        # Pre-load admission against the memory ceiling from the
+        # process memory enforcer (min of static and dynamic). Try
+        # evicting LRU non-pinned models first; if the model still
+        # cannot fit after evicting everything available, raise.
+        #
+        # Eviction starts at the enforcer's *soft* watermark, not the
+        # ceiling (#2319): the soft..ceiling band is exactly the
+        # hard-pressure zone, and a second model admitted into it kept
+        # both models resident through the load (swapping for minutes)
+        # only to have the first request's prefill guard evict the old
+        # one anyway. Evicting down to the same soft target *before*
+        # the new weights allocate fixes the ordering; refusing a load
+        # still requires exceeding the ceiling.
+        #
+        # ceiling == 0 means the guard is disabled or the enforcer is
+        # not wired up. Eviction on model swap must not die with the
+        # guard (#2290): fall back to the best-effort admission
+        # ceiling (static, guard-independent) and keep evicting, but
+        # never refuse the load under it — with the guard off the
+        # user opted out of hard limits.
+        ceiling = self._current_ceiling()
+        best_effort = False
+        if ceiling <= 0:
+            ceiling = self._fallback_admission_ceiling()
+            best_effort = ceiling > 0
+        if ceiling > 0:
+            soft_target = self._admission_soft_target()
+            evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
+            evicted_any = unloaded_for_admission
+            while True:
+                # Consult the tracked accumulator alongside live memory:
+                # after a model settles or idles, mx.get_active_memory() and
+                # the process footprint can read well below the model's true
+                # resident size, while _current_model_memory still reflects
+                # the committed total. Using only live memory lets a second
+                # large model load without evicting the first, over-
+                # committing past the ceiling (#1623).
+                current = max(
+                    mx.get_active_memory(),
+                    get_phys_footprint(),
+                    self._current_model_memory,
+                )
+                projected = current + entry.estimated_size
+                if projected <= evict_target:
+                    break
+                victim = self._find_lru_victim(include_cluster=allow_cluster_victim)
+                if victim is not None:
+                    victim_entry = self._entries[victim]
+                    if victim_entry.kind == "cluster":
+                        self._mark_pending_unload_locked(victim, "admission eviction")
+                        event = self._cluster_unload_completion_event_locked(victim)
+                        self._wake_cluster_unload_driver_locked()
+                        raise _ClusterVictimPendingError(victim, event)
+                    logger.info(
+                        f"Evicting '{victim}' to fit '{model_id}' "
+                        f"under the admission soft target "
+                        f"({format_size(projected)} > "
+                        f"{format_size(evict_target)})"
                     )
-                    projected = current + entry.estimated_size
-                    if projected <= evict_target:
-                        break
-                    victim = self._find_lru_victim()
-                    if victim is not None:
+                    await self._unload_engine(victim)
+                    evicted_any = True
+                    continue
+                if projected <= ceiling:
+                    # Above the soft target with nothing left to
+                    # evict, but still under the ceiling: admit. The
+                    # soft target only decides when eviction starts
+                    # (#2319); refusal keeps the ceiling-only
+                    # contract.
+                    if evict_target < ceiling:
                         logger.info(
-                            f"Evicting '{victim}' to fit '{model_id}' "
-                            f"under the admission soft target "
+                            f"Admitting '{model_id}' above the "
+                            f"admission soft target with no idle "
+                            f"model left to evict "
                             f"({format_size(projected)} > "
-                            f"{format_size(evict_target)})"
+                            f"{format_size(evict_target)}, ceiling "
+                            f"{format_size(ceiling)})"
                         )
-                        await self._unload_engine(victim)
-                        evicted_any = True
-                        continue
-                    if projected <= ceiling:
-                        # Above the soft target with nothing left to
-                        # evict, but still under the ceiling: admit. The
-                        # soft target only decides when eviction starts
-                        # (#2319); refusal keeps the ceiling-only
-                        # contract.
-                        if evict_target < ceiling:
-                            logger.info(
-                                f"Admitting '{model_id}' above the "
-                                f"admission soft target with no idle "
-                                f"model left to evict "
-                                f"({format_size(projected)} > "
-                                f"{format_size(evict_target)}, ceiling "
-                                f"{format_size(ceiling)})"
-                            )
-                        break
-                    failure_current = current
-                    failure_projected = projected
-                    failure_label = "current"
+                    break
+                failure_current = current
+                failure_projected = projected
+                failure_label = "current"
 
-                    if evicted_any:
-                        # Nothing else to evict after unloading at least one
-                        # model in this get_engine() call. Before failing,
-                        # re-test against the *tracked committed* baseline.
-                        # The phys_footprint term folded into `current` is the
-                        # macOS kernel ledger, which can still count
-                        # reclaimable residue from models we just evicted.
-                        # Pinned/in-use models that could not be evicted remain
-                        # counted in _current_model_memory, preserving the
-                        # #1623 undercount guard. Without a local eviction,
-                        # keep trusting phys_footprint because it may be
-                        # unrelated process pressure rather than model residue.
-                        committed = max(
-                            mx.get_active_memory(), self._current_model_memory
-                        )
-                        committed_projected = committed + entry.estimated_size
-                        if committed_projected <= ceiling:
-                            logger.info(
-                                f"Admitting '{model_id}': committed baseline "
-                                f"{format_size(committed_projected)} fits ceiling "
-                                f"{format_size(ceiling)} "
-                                f"(live footprint {format_size(projected)} included "
-                                "reclaimable residue from evicted models)"
-                            )
-                            break
-                        failure_current = committed
-                        failure_projected = committed_projected
-                        failure_label = "committed"
-
-                    if best_effort:
-                        # Memory guard is off: evicting was all we could
-                        # do. Admit over the static ceiling instead of
-                        # refusing, matching the unguarded no-hard-limit
-                        # contract.
-                        logger.warning(
-                            f"Loading '{model_id}' past the static memory "
-                            f"ceiling with the memory guard disabled "
-                            f"(projected {format_size(failure_projected)} > "
-                            f"ceiling {format_size(ceiling)}, "
-                            f"{failure_label} baseline) and nothing left to "
-                            f"evict; the system may swap heavily."
+                if evicted_any:
+                    # Nothing else to evict after unloading at least one
+                    # model in this get_engine() call. Before failing,
+                    # re-test against the *tracked committed* baseline.
+                    # The phys_footprint term folded into `current` is the
+                    # macOS kernel ledger, which can still count
+                    # reclaimable residue from models we just evicted.
+                    # Pinned/in-use models that could not be evicted remain
+                    # counted in _current_model_memory, preserving the
+                    # #1623 undercount guard. Without a local eviction,
+                    # keep trusting phys_footprint because it may be
+                    # unrelated process pressure rather than model residue.
+                    committed = max(mx.get_active_memory(), self._current_model_memory)
+                    committed_projected = committed + entry.estimated_size
+                    if committed_projected <= ceiling:
+                        logger.info(
+                            f"Admitting '{model_id}': committed baseline "
+                            f"{format_size(committed_projected)} fits ceiling "
+                            f"{format_size(ceiling)} "
+                            f"(live footprint {format_size(projected)} included "
+                            "reclaimable residue from evicted models)"
                         )
                         break
+                    failure_current = committed
+                    failure_projected = committed_projected
+                    failure_label = "committed"
 
-                    # Still over budget under the applicable baseline. Use
-                    # ModelTooLargeError when the model alone exceeds the
-                    # ceiling (no chance of fitting), InsufficientMemoryError
-                    # when current usage leaves no room.
-                    if entry.estimated_size > ceiling:
-                        binding, advice = self._ceiling_binding_and_advice(
-                            ceiling=ceiling,
-                            current=failure_current,
-                            tail="use a smaller model",
-                        )
-                        raise ModelTooLargeError(
-                            model_id,
-                            entry.estimated_size,
-                            ceiling,
-                            binding=binding,
-                            advice=advice,
-                        )
+                if best_effort:
+                    # Memory guard is off: evicting was all we could
+                    # do. Admit over the static ceiling instead of
+                    # refusing, matching the unguarded no-hard-limit
+                    # contract.
+                    logger.warning(
+                        f"Loading '{model_id}' past the static memory "
+                        f"ceiling with the memory guard disabled "
+                        f"(projected {format_size(failure_projected)} > "
+                        f"ceiling {format_size(ceiling)}, "
+                        f"{failure_label} baseline) and nothing left to "
+                        f"evict; the system may swap heavily."
+                    )
+                    break
+
+                # Still over budget under the applicable baseline. Use
+                # ModelTooLargeError when the model alone exceeds the
+                # ceiling (no chance of fitting), InsufficientMemoryError
+                # when current usage leaves no room.
+                if entry.estimated_size > ceiling:
                     binding, advice = self._ceiling_binding_and_advice(
                         ceiling=ceiling,
                         current=failure_current,
-                        tail="unload another model",
+                        tail="use a smaller model",
                     )
-                    label = f"{binding} memory ceiling" if binding else "memory ceiling"
-                    raise InsufficientMemoryError(
-                        required=entry.estimated_size,
-                        current=failure_current,
-                        message=(
-                            f"Cannot load {model_id}: projected memory "
-                            f"{format_size(failure_projected)} would exceed "
-                            f"the {label} {format_size(ceiling)} "
-                            f"({failure_label}: {format_size(failure_current)}, "
-                            f"model: {format_size(entry.estimated_size)}). "
-                            f"{advice or DEFAULT_CEILING_ADVICE}."
-                        ),
+                    raise ModelTooLargeError(
+                        model_id,
+                        entry.estimated_size,
+                        ceiling,
+                        binding=binding,
+                        advice=advice,
                     )
+                binding, advice = self._ceiling_binding_and_advice(
+                    ceiling=ceiling,
+                    current=failure_current,
+                    tail="unload another model",
+                )
+                label = f"{binding} memory ceiling" if binding else "memory ceiling"
+                raise InsufficientMemoryError(
+                    required=entry.estimated_size,
+                    current=failure_current,
+                    message=(
+                        f"Cannot load {model_id}: projected memory "
+                        f"{format_size(failure_projected)} would exceed "
+                        f"the {label} {format_size(ceiling)} "
+                        f"({failure_label}: {format_size(failure_current)}, "
+                        f"model: {format_size(entry.estimated_size)}). "
+                        f"{advice or DEFAULT_CEILING_ADVICE}."
+                    ),
+                )
 
-            # Now load the model
-            await self._load_engine(
-                model_id,
-                force_lm=force_lm,
-                runtime_settings=runtime_settings,
-            )
+        # Now load the model
+        await self._load_engine(
+            model_id,
+            force_lm=force_lm,
+            runtime_settings=runtime_settings,
+        )
 
-            loaded = self._entries[model_id]
-            self._validate_llm_engine_ready(model_id, loaded.engine)
-            if _lease:
-                loaded.in_use += 1
-            return loaded.engine
+        loaded = self._entries[model_id]
+        self._validate_llm_engine_ready(model_id, loaded.engine)
+        if lease:
+            loaded.in_use += 1
+        return loaded.engine
+
+    def _cluster_placement_gate(self) -> Any | None:
+        """The active ``ClusterManager`` when auto-placement should run for
+        this ``get_engine`` call (S4 D5): head role + ``cluster.auto_placement``
+        + an initialized formation. ``None`` otherwise, so the caller takes
+        exactly today's local-only path (``role=off``/worker/flag-off are
+        byte-for-byte unchanged).
+        """
+        from .cluster.manager import get_cluster_manager
+
+        manager = get_cluster_manager()
+        if manager is None or manager.role != "head":
+            return None
+        if not bool(getattr(manager.settings, "auto_placement", True)):
+            return None
+        if manager.formation is None:
+            return None
+        return manager
+
+    @staticmethod
+    def _cluster_worker_capacities(manager: Any) -> list[NodeCapacity]:
+        from .cluster.placement import worker_node_capacity
+
+        workers = []
+        for candidate in manager.state.members:
+            live = manager.liveness(candidate.id)
+            node_state = manager.node_state(candidate.id)
+            if live is not None and live.status == "active" and node_state is not None:
+                workers.append(worker_node_capacity(candidate.id, node_state))
+        return workers
 
     async def _release_engine_lease(self, model_id: str) -> None:
         async with self._lock:
@@ -1155,6 +1771,14 @@ class EnginePool:
                 entry.last_access = time.time()
                 return False
 
+            if entry.kind == "cluster":
+                # S4 D4: fire-and-forget mark -- the entry is confirmed idle
+                # and unpinned above, so the mark always installs. The driver
+                # does the actual (out-of-lock) teardown; this call site
+                # (api/markitdown_pdf_fallback.py) doesn't need to await it.
+                self._mark_pending_unload_locked(model_id, "unload_if_idle_unpinned")
+                return True
+
             await self._unload_engine(model_id)
             return True
 
@@ -1172,12 +1796,16 @@ class EnginePool:
         finally:
             await self.release_engine(model_id)
 
-    def _find_lru_victim(self) -> str | None:
+    def _find_lru_victim(self, *, include_cluster: bool = False) -> str | None:
         """
         Find the least recently used non-pinned loaded model.
 
         Skips models with active inference requests to avoid interrupting
-        in-flight generation.
+        in-flight generation. ``include_cluster`` (S4 D4) defaults to False
+        so every existing caller -- the enforcer's pressure loop included --
+        is unchanged; only ``get_engine``'s admission eviction opts in,
+        since a formed cluster entry needs the out-of-lock teardown driver
+        rather than ``_unload_engine``.
 
         Returns:
             Model ID of the LRU victim, or None if no evictable model found
@@ -1185,6 +1813,8 @@ class EnginePool:
         candidates = []
         for mid, e in self._entries.items():
             if e.engine is None or e.is_pinned:
+                continue
+            if not include_cluster and e.kind == "cluster":
                 continue
             if e.in_use > 0:
                 continue
@@ -1254,6 +1884,10 @@ class EnginePool:
     def _is_idle_for_prefill_eviction(self, entry: EngineEntry) -> bool:
         engine = entry.engine
         if engine is None or entry.is_pinned or entry.is_loading or entry.in_use > 0:
+            return False
+        if entry.kind == "cluster":
+            # S4 D4: ineligible -- unforming a live formation for transient
+            # prefill headroom is disproportionate.
             return False
         if self._entry_has_active_requests(entry):
             return False
@@ -1477,6 +2111,20 @@ class EnginePool:
         entry = self._entries.get(model_id)
         if not entry or entry.engine is None:
             return
+        if entry.kind == "cluster":
+            # S4 D4 rev4: assert-unreachable, never a silent no-op. Every
+            # caller of this method is guarded by kind dispositions
+            # (request_unload's dispatch, _find_lru_victim's default
+            # include_cluster=False, the prefill/enforcer selection filters,
+            # the variant-branch kind guard) -- reaching here with a cluster
+            # entry is a bug, and it must be loud rather than silently
+            # skipping teardown.
+            raise RuntimeError(
+                f"_unload_engine() reached a cluster entry ('{model_id}'); "
+                "cluster teardown must go through request_unload() / "
+                "unload_cluster_model() / the unload driver (S4 D4), never "
+                "this method directly"
+            )
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         pre_unload_active = mx.get_active_memory()
@@ -1638,6 +2286,7 @@ class EnginePool:
                 )
 
         self._wake_process_memory_enforcer()
+        self._invalidate_cluster_node_state_cache()
 
     def _schedule_failed_load_reclaim(
         self, model_id: str, pre_load_memory: int
@@ -2172,6 +2821,7 @@ class EnginePool:
             entry.loading_started_at = None
             entry.abort_loading = False
             self._wake_process_memory_enforcer()
+            self._invalidate_cluster_node_state_cache()
 
     async def preload_pinned_models(self) -> None:
         """
@@ -2193,10 +2843,20 @@ class EnginePool:
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
         await self._drain_lease_release_tasks()
+        # S4 D4: drain the cluster unload driver FIRST, mirroring
+        # _drain_lease_release_tasks above -- server.py's shutdown sequence
+        # already runs cluster_manager.stop() (-> formation.stop()) before
+        # engine_pool.shutdown(), so any formation is down by the time we
+        # get here; a still-running driver task would just be racing a
+        # teardown against one that already happened.
+        await self._drain_cluster_unload_driver()
         async with self._lock:
             for model_id in list(self._entries.keys()):
                 entry = self._entries.get(model_id)
                 if entry and entry.engine is not None:
+                    if entry.kind == "cluster":
+                        entry.engine = None
+                        continue
                     try:
                         await self._unload_engine(model_id)
                     except Exception as e:
@@ -2295,7 +2955,12 @@ class EnginePool:
                     f"TTL expired for model '{model_id}' "
                     f"(idle {idle_time:.0f}s > ttl {effective_ttl}s)"
                 )
-                await self._unload_engine(model_id)
+                if entry.kind == "cluster":
+                    # S4 D4: eligible via mark-only -- the out-of-lock driver
+                    # does the actual teardown.
+                    self._mark_pending_unload_locked(model_id, "ttl expired")
+                else:
+                    await self._unload_engine(model_id)
                 expired.append(model_id)
 
         return expired

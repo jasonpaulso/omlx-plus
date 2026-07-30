@@ -70,6 +70,10 @@ class LocalJoinRequest(BaseModel):
 
 class DistributedModelRequest(BaseModel):
     model: str
+    # S4 D3: /v1/cluster/models/load becomes prefer=distributed placement +
+    # formation; exposing the knob lets a caller force `local`/`auto` too
+    # rather than only ever attempting distributed.
+    prefer: Literal["auto", "local", "distributed"] = "distributed"
 
 
 def _manager() -> ClusterManager:
@@ -148,7 +152,7 @@ async def remove_member(member_id: str) -> dict[str, Any]:
 async def load_distributed_model(body: DistributedModelRequest) -> dict[str, Any]:
     """Stand a tensor-parallel model up across the pair (head, operator tier)."""
     try:
-        return await _manager().load_distributed(body.model)
+        return await _manager().load_distributed(body.model, prefer=body.prefer)
     except ClusterError as exc:
         raise _http_error(exc) from exc
 
@@ -171,12 +175,16 @@ async def distributed_status() -> dict[str, Any]:
         raise _http_error(exc) from exc
 
 
-@_operator_router.get("/placement")
-async def preview_placement(
-    model: str, prefer: Literal["auto", "local", "distributed"] = "auto"
+def compute_placement_preview(
+    manager: ClusterManager,
+    model: str,
+    prefer: Literal["auto", "local", "distributed"],
 ) -> dict[str, Any]:
-    """Dry-run placement preview (S4 D3): zero side effects, no formation."""
-    manager = _manager()
+    """Dry-run placement preview (S4 D3): zero side effects, no formation.
+
+    Shared by ``GET /v1/cluster/placement`` and the admin dashboard's
+    ``GET /admin/api/cluster/placement`` proxy (D6) so the two never drift.
+    """
     pool = get_engine_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="Engine pool is not available")
@@ -201,6 +209,14 @@ async def preview_placement(
         prefer=prefer,
     )
     return decision.to_dict()
+
+
+@_operator_router.get("/placement")
+async def preview_placement(
+    model: str, prefer: Literal["auto", "local", "distributed"] = "auto"
+) -> dict[str, Any]:
+    """Dry-run placement preview (S4 D3): zero side effects, no formation."""
+    return compute_placement_preview(_manager(), model, prefer)
 
 
 @_join_router.post("/join")

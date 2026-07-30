@@ -2293,6 +2293,8 @@ class TestClusterSettings:
         assert cluster.heartbeat_interval_s == 5.0
         assert cluster.member_timeout_s == 20.0
         assert cluster.bootstrap_token_ttl_s == 900.0
+        # S4 D5: on by default -- meaningful only when role="head".
+        assert cluster.auto_placement is True
 
     def test_round_trip_preserves_every_field(self):
         """The lifespan re-saves settings.json, so a dropped field would
@@ -2304,6 +2306,7 @@ class TestClusterSettings:
             bootstrap_token_ttl_s=60.0,
             allow_loopback=True,
             node_name="studio",
+            auto_placement=False,
         )
         assert ClusterSettings.from_dict(original.to_dict()) == original
 
@@ -2337,6 +2340,7 @@ class TestClusterSettings:
                 "OMLX_CLUSTER_BOOTSTRAP_TOKEN_TTL_S": "30",
                 "OMLX_CLUSTER_ALLOW_LOOPBACK": "true",
                 "OMLX_CLUSTER_NODE_NAME": "node-a",
+                "OMLX_CLUSTER_AUTO_PLACEMENT": "false",
             }
             with patch.dict(os.environ, env):
                 settings = GlobalSettings.load(base_path=tmpdir)
@@ -2346,6 +2350,13 @@ class TestClusterSettings:
             assert settings.cluster.bootstrap_token_ttl_s == 30.0
             assert settings.cluster.allow_loopback is True
             assert settings.cluster.node_name == "node-a"
+            assert settings.cluster.auto_placement is False
+
+    def test_auto_placement_env_override_true(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"OMLX_CLUSTER_AUTO_PLACEMENT": "1"}):
+                settings = GlobalSettings.load(base_path=tmpdir)
+            assert settings.cluster.auto_placement is True
 
     def test_invalid_numeric_env_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmpdir:

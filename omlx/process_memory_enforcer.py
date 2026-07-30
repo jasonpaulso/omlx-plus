@@ -1295,6 +1295,11 @@ class ProcessMemoryEnforcer:
                 getattr(entry, "engine", None) is None
                 or getattr(entry, "is_pinned", False)
                 or getattr(entry, "is_loading", False)
+                # S4 D4: ineligible -- the enforcer cannot see rank-process
+                # memory, so aborting requests here would not relieve any
+                # pressure it can measure. Selection-filtered like
+                # `_find_lru_victim`'s default.
+                or getattr(entry, "kind", "local") == "cluster"
             ):
                 continue
 

@@ -538,6 +538,12 @@ class ClusterSettings:
     # (any management-LAN address, private or not). Dangerous — see
     # docs/cluster/s2-security-notes.md; default-deny keeps CL-09 intact.
     allow_routable_data_plane: bool = False
+    # S4 D5: meaningful only when role="head". A plain model load (POST
+    # /v1/models/{id}/load, or the on-demand get_engine path) runs
+    # plan_placement(prefer="auto") when this is True; when False, or when
+    # role != "head", the placement call is never reached and the pool
+    # behaves exactly as it did before S4.
+    auto_placement: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -561,6 +567,7 @@ class ClusterSettings:
             allow_routable_data_plane=bool(
                 data.get("allow_routable_data_plane", False)
             ),
+            auto_placement=bool(data.get("auto_placement", True)),
         )
 
 
@@ -1107,6 +1114,13 @@ class GlobalSettings:
             self.cluster.rdma_device = rdma_device
         if allow_routable := os.getenv("OMLX_CLUSTER_ALLOW_ROUTABLE_DATA_PLANE"):
             self.cluster.allow_routable_data_plane = allow_routable.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if auto_placement := os.getenv("OMLX_CLUSTER_AUTO_PLACEMENT"):
+            self.cluster.auto_placement = auto_placement.strip().lower() in {
                 "1",
                 "true",
                 "yes",

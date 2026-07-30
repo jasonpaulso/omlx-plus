@@ -107,6 +107,91 @@
                 </div>
             </div>
         </template>
+
+        <!-- S4 D6: placement preview + load/unload. Thin proxies to the
+             same handlers the /v1/cluster/* API calls -- POST-only
+             mutations (CL-12). -->
+        <div class="mt-6">
+            <h3 class="text-sm font-bold text-neutral-700 mb-2">Placement</h3>
+            <div class="bg-white rounded-2xl border border-neutral-200 p-4">
+                <div class="flex flex-wrap items-end gap-3">
+                    <div>
+                        <label class="block text-xs font-medium text-neutral-500 mb-1">Model</label>
+                        <select x-model="placementModel"
+                                class="text-sm border border-neutral-200 rounded-lg px-2 py-1.5">
+                            <option value="">Select a model…</option>
+                            <template x-for="mid in modelIds" :key="mid">
+                                <option :value="mid" x-text="mid"></option>
+                            </template>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-neutral-500 mb-1">Prefer</label>
+                        <select x-model="placementPrefer"
+                                class="text-sm border border-neutral-200 rounded-lg px-2 py-1.5">
+                            <option value="auto">auto</option>
+                            <option value="local">local</option>
+                            <option value="distributed">distributed</option>
+                        </select>
+                    </div>
+                    <button type="button" @click="previewPlacement()"
+                            :disabled="!placementModel"
+                            class="px-3 py-1.5 text-xs font-semibold rounded-lg bg-neutral-100 text-neutral-700 hover:bg-neutral-200 disabled:opacity-40">
+                        Preview
+                    </button>
+                    <button type="button" @click="loadDistributed()"
+                            :disabled="!placementModel"
+                            class="px-3 py-1.5 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40">
+                        Load
+                    </button>
+                    <button type="button" @click="unloadDistributed()"
+                            :disabled="!(cluster && cluster.formation && cluster.formation.active_model)"
+                            class="px-3 py-1.5 text-xs font-semibold rounded-lg bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-40">
+                        Unload active
+                    </button>
+                </div>
+
+                <p x-show="placementError" x-text="placementError"
+                   class="mt-3 text-xs text-red-700 font-medium"></p>
+
+                <div x-show="placementDecision" x-cloak class="mt-4 text-sm">
+                    <p>
+                        <span class="font-mono px-2 py-0.5 rounded-md text-xs font-semibold"
+                              :class="placementDecision && placementDecision.mode === 'distributed' ? 'bg-green-100 text-green-700' : (placementDecision && placementDecision.mode === 'reject' ? 'bg-red-100 text-red-700' : 'bg-neutral-100 text-neutral-600')"
+                              x-text="placementDecision ? placementDecision.mode : ''"></span>
+                        <span class="text-xs text-neutral-500 ml-2"
+                              x-text="placementDecision ? `world_size=${placementDecision.world_size}, per_rank_estimate=${placementDecision.per_rank_estimate}` : ''"></span>
+                    </p>
+                    <ul class="mt-2" x-show="placementDecision && placementDecision.reasons && placementDecision.reasons.length">
+                        <template x-for="r in (placementDecision ? placementDecision.reasons : [])" :key="r">
+                            <li class="text-xs text-neutral-500" x-text="`· ${r}`"></li>
+                        </template>
+                    </ul>
+                    <div class="overflow-x-auto mt-3" x-show="placementDecision && placementDecision.fits">
+                        <table class="w-full text-xs">
+                            <thead class="text-neutral-400 uppercase tracking-widest">
+                                <tr>
+                                    <th class="text-left font-bold py-1">Node</th>
+                                    <th class="text-left font-bold py-1">Ceiling</th>
+                                    <th class="text-left font-bold py-1">Projected</th>
+                                    <th class="text-left font-bold py-1">Fits</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <template x-for="node in Object.keys(placementDecision ? placementDecision.fits : {})" :key="node">
+                                    <tr class="border-t border-neutral-100">
+                                        <td class="py-1 font-mono" x-text="node"></td>
+                                        <td class="py-1" x-text="placementDecision.fits[node].ceiling"></td>
+                                        <td class="py-1" x-text="placementDecision.fits[node].projected"></td>
+                                        <td class="py-1" x-text="placementDecision.fits[node].ok ? 'yes' : 'no'"></td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -115,6 +200,11 @@
         return {
             cluster: null,
             timer: null,
+            modelIds: [],
+            placementModel: '',
+            placementPrefer: 'auto',
+            placementDecision: null,
+            placementError: '',
             async init() {
                 // Poll only once the endpoint has answered. With no cluster
                 // role the endpoint 404s, and a standing interval would write
@@ -122,6 +212,7 @@
                 // default install.
                 if (await this.refresh()) {
                     this.timer = setInterval(() => this.refresh(), 5000);
+                    await this.loadModelIds();
                 }
             },
             stop() {
@@ -144,6 +235,73 @@
                     this.cluster = null;
                     this.stop();
                     return false;
+                }
+            },
+            async loadModelIds() {
+                // The head's own discovered models (S4 D6 model picker).
+                try {
+                    const resp = await fetch('/admin/api/models');
+                    if (!resp.ok) return;
+                    const models = await resp.json();
+                    this.modelIds = (models || []).map((m) => m.id).sort();
+                } catch (e) {
+                    // Best-effort: the picker just stays empty.
+                }
+            },
+            async previewPlacement() {
+                this.placementError = '';
+                this.placementDecision = null;
+                if (!this.placementModel) return;
+                try {
+                    const url = `/admin/api/cluster/placement?model=${encodeURIComponent(this.placementModel)}&prefer=${encodeURIComponent(this.placementPrefer)}`;
+                    const resp = await fetch(url);
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        this.placementError = data.detail || 'Preview failed';
+                        return;
+                    }
+                    this.placementDecision = data;
+                } catch (e) {
+                    this.placementError = String(e);
+                }
+            },
+            async loadDistributed() {
+                this.placementError = '';
+                if (!this.placementModel) return;
+                try {
+                    const resp = await fetch('/admin/api/cluster/models/load', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ model: this.placementModel, prefer: this.placementPrefer === 'auto' ? 'distributed' : this.placementPrefer }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        this.placementError = data.detail || 'Load failed';
+                        return;
+                    }
+                    await this.refresh();
+                } catch (e) {
+                    this.placementError = String(e);
+                }
+            },
+            async unloadDistributed() {
+                this.placementError = '';
+                const active = this.cluster && this.cluster.formation ? this.cluster.formation.active_model : null;
+                if (!active) return;
+                try {
+                    const resp = await fetch('/admin/api/cluster/models/unload', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ model: active }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        this.placementError = data.detail || 'Unload failed';
+                        return;
+                    }
+                    await this.refresh();
+                } catch (e) {
+                    this.placementError = String(e);
                 }
             },
             formatHeartbeat(ts) {

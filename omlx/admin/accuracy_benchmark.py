@@ -414,7 +414,7 @@ async def run_accuracy_benchmark(
                 })
                 for model_id in loaded_ids:
                     try:
-                        await engine_pool._unload_engine(model_id)
+                        await engine_pool.request_unload(model_id)
                     except Exception as e:
                         logger.warning(f"Failed to unload {model_id}: {e}")
 
@@ -646,7 +646,7 @@ async def run_accuracy_benchmark(
         run.phase = "unloading"
         if request.external is None:
             try:
-                await engine_pool._unload_engine(request.model_id)
+                await engine_pool.request_unload(request.model_id)
             except Exception:
                 pass
 

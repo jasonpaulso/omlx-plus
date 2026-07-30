@@ -756,7 +756,7 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     loaded_models = pool.get_loaded_model_ids()
     for model_id in loaded_models:
         try:
-            await pool._unload_engine(model_id)
+            await pool.request_unload(model_id)
         except Exception as e:
             logger.warning(f"Error unloading {model_id}: {e}")
 
@@ -964,7 +964,7 @@ async def _apply_cache_settings_runtime(
     loaded_models = pool.get_loaded_model_ids()
     for model_id in loaded_models:
         try:
-            await pool._unload_engine(model_id)
+            await pool.request_unload(model_id)
         except Exception as e:
             logger.warning(f"Error unloading {model_id}: {e}")
 
@@ -1981,7 +1981,7 @@ async def unload_model(
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
-    await engine_pool._unload_engine(model_id)
+    await engine_pool.request_unload(model_id)
     logger.info(f"Manually unloaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
@@ -2559,7 +2559,7 @@ async def update_model_settings(
             logger.info(
                 f"Settings changed for loaded model {model_id}, auto-unloading."
             )
-            await engine_pool._unload_engine(model_id)
+            await engine_pool.request_unload(model_id)
             auto_unloaded = True
         except Exception as e:
             logger.warning(f"Auto-unload failed for {model_id}: {e}")
@@ -3092,6 +3092,70 @@ async def get_cluster(is_operator: bool = Depends(_require_cluster_operator)):
         # The operator dependency already 404s when no role is active.
         raise HTTPException(status_code=404, detail="Not Found")
     return manager.snapshot()
+
+
+class ClusterModelLoadBody(BaseModel):
+    model: str
+    prefer: Literal["auto", "local", "distributed"] = "distributed"
+
+
+class ClusterModelUnloadBody(BaseModel):
+    model: str
+
+
+@router.post("/api/cluster/models/load")
+async def admin_cluster_models_load(
+    body: ClusterModelLoadBody,
+    is_operator: bool = Depends(_require_cluster_operator),
+):
+    """Thin operator-gated proxy (S4 D6): delegates to the same handler
+    ``POST /v1/cluster/models/load`` calls -- not an HTTP self-call.
+    """
+    from ..cluster.manager import ClusterError, get_cluster_manager
+
+    manager = get_cluster_manager()
+    if manager is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    try:
+        return await manager.load_distributed(body.model, prefer=body.prefer)
+    except ClusterError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@router.post("/api/cluster/models/unload")
+async def admin_cluster_models_unload(
+    body: ClusterModelUnloadBody,
+    is_operator: bool = Depends(_require_cluster_operator),
+):
+    """Thin operator-gated proxy (S4 D6) for ``POST /v1/cluster/models/unload``."""
+    from ..cluster.manager import ClusterError, get_cluster_manager
+
+    manager = get_cluster_manager()
+    if manager is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    try:
+        return await manager.unload_distributed(body.model)
+    except ClusterError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@router.get("/api/cluster/placement")
+async def admin_cluster_placement(
+    model: str,
+    prefer: Literal["auto", "local", "distributed"] = "auto",
+    is_operator: bool = Depends(_require_cluster_operator),
+):
+    """Thin operator-gated proxy (S4 D6) for ``GET /v1/cluster/placement``:
+    zero side effects, no formation."""
+    from ..cluster.manager import get_cluster_manager
+    from ..cluster.routes import compute_placement_preview
+
+    manager = get_cluster_manager()
+    if manager is None or manager.role != "head":
+        # Placement is a head-only concept, same gate the /v1/cluster/*
+        # operator tier applies via require_head_role.
+        raise HTTPException(status_code=404, detail="Not Found")
+    return compute_placement_preview(manager, model, prefer)
 
 
 def _schedule_self_terminate(delay: float = 0.5) -> None:
@@ -5555,7 +5619,7 @@ async def delete_hf_model(
         loaded_ids = engine_pool.get_loaded_model_ids()
         if model_name in loaded_ids:
             try:
-                await engine_pool._unload_engine(model_name)
+                await engine_pool.request_unload(model_name)
                 logger.info(f"Unloaded model '{model_name}' before deletion")
             except Exception as e:
                 logger.warning(f"Failed to unload model '{model_name}': {e}")
