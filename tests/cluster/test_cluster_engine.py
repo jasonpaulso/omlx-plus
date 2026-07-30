@@ -342,6 +342,47 @@ async def test_reply_pipe_eof_fails_every_pending_stream(make_engine):
         await asyncio.gather(collect("x"), collect("y"))
 
 
+async def test_reply_pipe_eof_fires_the_on_rank_death_callback():
+    """S6 D1: the head-side signal that lets FormationManager degrade a
+    SERVING formation, not only fail in-flight requests."""
+    calls: list[str] = []
+    engine = ClusterEngine(
+        "m",
+        cluster=MockCluster([], eof=True),
+        resolved_path="/x",
+        on_rank_death=lambda reason: calls.append(reason),
+    )
+    engine._loaded = True
+    engine._tokenizer = StubTokenizer()
+    try:
+        with pytest.raises(RuntimeError):
+            async for _ in engine.stream_generate("hi", max_tokens=8, request_id="r"):
+                pass
+        deadline = asyncio.get_event_loop().time() + 1.0
+        while not calls and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.005)
+        assert calls == ["rank 0 closed its reply channel"]
+    finally:
+        await engine.stop()
+
+
+async def test_a_raising_on_rank_death_callback_never_breaks_the_reader():
+    engine = ClusterEngine(
+        "m",
+        cluster=MockCluster([], eof=True),
+        resolved_path="/x",
+        on_rank_death=lambda reason: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    engine._loaded = True
+    engine._tokenizer = StubTokenizer()
+    try:
+        with pytest.raises(RuntimeError):
+            async for _ in engine.stream_generate("hi", max_tokens=8, request_id="r"):
+                pass
+    finally:
+        await engine.stop()
+
+
 # -- S3 non-goals: VLM / SpecPrefill rejected with a clear error -------------
 
 

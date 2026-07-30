@@ -195,7 +195,15 @@ def plan_placement(
     presence = {
         node.node_id: model_id in node.models_present for node in [head, *workers]
     }
-    eligible = model_type in _ELIGIBLE_MODEL_TYPES
+    # S6 D0: a `language_model_only: true` checkpoint (vision tower shipped
+    # off) is text-eligible for distributed placement even though discovery
+    # classifies it "vlm" (it still carries a vision_config) -- PLACEMENT
+    # layer only; model_discovery's classification and single-node serving
+    # are untouched. A plain vlm config (no language_model_only) stays
+    # refused.
+    eligible = model_type in _ELIGIBLE_MODEL_TYPES or bool(
+        model_config and model_config.get("language_model_only")
+    )
 
     def local_decision(reasons: list[str]) -> PlacementDecision:
         fits = _local_fit(head, est_size)

@@ -126,15 +126,28 @@ def check_divisibility(config: dict[str, Any], world_size: int) -> None:
     ``Model.shard`` does ``n_heads //= world_size`` with no guard; an
     indivisible head count yields a wrong-shaped attention on every rank and a
     corrupt forward pass. Surfaced here as a clear load-time error instead.
+
+    S6 D0: a ``language_model_only`` multimodal wrapper config (the vision
+    tower shipped off) carries its head counts under a nested ``text_config``
+    rather than top-level -- without this fallback the top-level lookup comes
+    back ``None`` and this lenient-passes a config it never actually checked.
+    Only consulted when the top-level key is absent, per field.
     """
     if world_size <= 1:
         return
+    nested = config.get("text_config")
+    nested = nested if isinstance(nested, dict) else None
+
     heads = _first_present(config, _HEAD_KEYS)
+    if heads is None and nested is not None:
+        heads = _first_present(nested, _HEAD_KEYS)
     if heads is not None and heads % world_size != 0:
         raise TPDivisibilityError(
             f"attention heads ({heads}) not divisible by world size ({world_size})"
         )
     kv_heads = _first_present(config, _KV_HEAD_KEYS)
+    if kv_heads is None and nested is not None:
+        kv_heads = _first_present(nested, _KV_HEAD_KEYS)
     if kv_heads is not None and kv_heads % world_size != 0:
         raise TPDivisibilityError(
             f"key/value heads ({kv_heads}) not divisible by world size "

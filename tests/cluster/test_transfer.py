@@ -1303,6 +1303,159 @@ async def test_round_cap_gives_up_after_no_progress(tmp_path, monkeypatch):
             await driver
 
 
+# -- S6 rider: round-retry backoff exceeds the session kill grace ------------
+
+
+async def test_round_retry_after_spawn_bound_waits_out_the_stop_grace(tmp_path):
+    """The head's own spawn-bound refusal (a lingering session on this
+    machine) must wait out `LocalCluster.stop()`'s own grace (10s) before
+    respawning -- the S5 rig lost 3 join-timeout rounds in ~60s to a
+    respawn racing the still-closing predecessor for the same port. The old
+    hardcoded 1.0s sleep never reached that grace.
+    """
+    from unittest.mock import patch
+
+    from omlx.cluster import transfer as transfer_mod
+    from omlx.cluster.launcher import TransferSpawnBoundError
+
+    async with running_manager(_head_settings(tmp_path)) as manager:
+        member = await _activate_member(manager)
+
+        source_dir = tmp_path / "source" / "target-model"
+        source_dir.mkdir(parents=True)
+        (source_dir / "config.json").write_bytes(b"{}")
+
+        worker_settings = _worker_settings(tmp_path)
+        worker_root = worker_settings.get_effective_model_dirs()[0]
+        worker_root.mkdir(parents=True, exist_ok=True)
+        launcher = _fake_session_launcher({"config.json": b"{}"})
+        worker = TransferWorkerExecutor(worker_settings, session_launcher=launcher)
+
+        attempts = {"n": 0}
+        base_head_launcher = _fake_head_session_launcher()
+
+        def flaky_head_launcher(**kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise TransferSpawnBoundError("test: port still held")
+            return base_head_launcher(**kwargs)
+
+        tm = TransferManager(manager, session_launcher=flaky_head_launcher)
+        manager._transfer = tm
+
+        real_sleep = asyncio.sleep
+        sleep_calls: list[float] = []
+
+        async def record_sleep(duration, *args, **kwargs):
+            sleep_calls.append(duration)
+            # Only short-circuit the long retry-backoff sleep under test --
+            # a genuinely tight loop here would starve the scrub loop
+            # (member_timeout_s=0.2) and spin it submitting queue ops.
+            await real_sleep(duration if duration < 1.0 else 0)
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(tm, worker, member, stop))
+        try:
+            with patch("asyncio.sleep", side_effect=record_sleep):
+                job = await tm.start_transfer(
+                    "target-model",
+                    member=member,
+                    local_path=str(source_dir),
+                    source="peer",
+                )
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    current = tm.job(job.id)
+                    if current is not None and current.status in ("done", "error"):
+                        break
+                    await real_sleep(0.01)
+        finally:
+            stop.set()
+            await driver
+
+        final_job = tm.job(job.id)
+        assert final_job is not None
+        assert final_job.status == "done", final_job.error
+        assert attempts["n"] == 2  # one bounced, one succeeded
+        assert transfer_mod.ROUND_RETRY_BACKOFF_S in sleep_calls
+        # The whole point: the retry sleep genuinely exceeds the stop grace.
+        assert transfer_mod.ROUND_RETRY_BACKOFF_S > 10.0
+
+
+async def test_round_retry_after_round_error_waits_out_the_stop_grace(tmp_path):
+    """Same shape as the spawn-bound row above, but for the OTHER
+    round-retry path: a worker-reported `round_error` (its own rank-1 spawn
+    bounced) had NO backoff at all before this fix -- the retry respawned
+    immediately, racing the same port collision.
+    """
+    from unittest.mock import patch
+
+    from omlx.cluster import transfer as transfer_mod
+    from omlx.cluster.launcher import TransferSpawnBoundError
+
+    async with running_manager(_head_settings(tmp_path)) as manager:
+        member = await _activate_member(manager)
+
+        source_dir = tmp_path / "source" / "target-model"
+        source_dir.mkdir(parents=True)
+        (source_dir / "config.json").write_bytes(b"{}")
+
+        worker_settings = _worker_settings(tmp_path)
+        worker_root = worker_settings.get_effective_model_dirs()[0]
+        worker_root.mkdir(parents=True, exist_ok=True)
+
+        attempts = {"n": 0}
+        base_worker_launcher = _fake_session_launcher({"config.json": b"{}"})
+
+        def flaky_worker_launcher(**kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise TransferSpawnBoundError("test: worker rank still held")
+            return base_worker_launcher(**kwargs)
+
+        worker = TransferWorkerExecutor(
+            worker_settings, session_launcher=flaky_worker_launcher
+        )
+        tm = TransferManager(manager, session_launcher=_fake_head_session_launcher())
+        manager._transfer = tm
+
+        real_sleep = asyncio.sleep
+        sleep_calls: list[float] = []
+
+        async def record_sleep(duration, *args, **kwargs):
+            sleep_calls.append(duration)
+            # Only short-circuit the long retry-backoff sleep under test --
+            # a genuinely tight loop here would starve the scrub loop
+            # (member_timeout_s=0.2) and spin it submitting queue ops.
+            await real_sleep(duration if duration < 1.0 else 0)
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(tm, worker, member, stop))
+        try:
+            with patch("asyncio.sleep", side_effect=record_sleep):
+                job = await tm.start_transfer(
+                    "target-model",
+                    member=member,
+                    local_path=str(source_dir),
+                    source="peer",
+                )
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    current = tm.job(job.id)
+                    if current is not None and current.status in ("done", "error"):
+                        break
+                    await real_sleep(0.01)
+        finally:
+            stop.set()
+            await driver
+
+        final_job = tm.job(job.id)
+        assert final_job is not None
+        assert final_job.status == "done", final_job.error
+        assert attempts["n"] == 2
+        assert transfer_mod.ROUND_RETRY_BACKOFF_S in sleep_calls
+
+
 async def test_round_drive_spawns_head_src_session(tmp_path):
     """The head must run rank 0 (``--role src``) of every round session.
 

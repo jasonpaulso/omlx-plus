@@ -22,6 +22,7 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from ..exceptions import ModelLoadingError
 from .auth import (
     require_bootstrap_token,
     require_cluster_enabled,
@@ -66,6 +67,12 @@ class HeartbeatRequest(BaseModel):
     # (CL5-04), not by this model, so an oversized batch is a clean drop
     # rather than a validation error.
     transfer_updates: list[dict[str, Any]] = Field(default_factory=list)
+    # S6 D1: worker-reported rank aliveness. Typed leniently (`Any`, not a
+    # sub-model) for the same reason as `node_state` -- bounds/shape are
+    # enforced in `ClusterManager._parse_ranks_status`, not by rejecting the
+    # request here, so a malformed value never fails the heartbeat's
+    # liveness path.
+    ranks: Any = None
 
 
 class LocalJoinRequest(BaseModel):
@@ -172,6 +179,11 @@ async def load_distributed_model(body: DistributedModelRequest) -> dict[str, Any
         )
     except ClusterError as exc:
         raise _http_error(exc) from exc
+    except ModelLoadingError as exc:
+        # S6 rider: the S5 rig observed this reach an unhandled 500 -- map it
+        # to the same 409 the local /v1/models/load surface uses for the
+        # same condition.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @_operator_router.post("/models/unload")
@@ -267,6 +279,7 @@ async def heartbeat(
             job_updates=body.job_updates,
             node_state=body.node_state,
             transfer_updates=body.transfer_updates,
+            ranks=body.ranks,
         )
     except ClusterError as exc:
         raise _http_error(exc) from exc

@@ -27,7 +27,7 @@ import logging
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -137,11 +137,16 @@ class ClusterEngine(BatchedEngine):
         cluster: LocalCluster,
         resolved_path: str | None = None,
         trust_remote_code: bool = False,
+        on_rank_death: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(model_name, trust_remote_code=trust_remote_code)
         self._cluster = cluster
         self._resolved_path = resolved_path or model_name
         self._model_type_value: str | None = None
+        # S6 D1: fired (sync, fire-and-forget) when the reply-pipe reader
+        # dies -- the head-side signal that lets FormationManager degrade a
+        # SERVING formation instead of only failing in-flight requests.
+        self._on_rank_death = on_rank_death
         # D5 multiplexing: one demux reader task fans rank 0's single reply
         # pipe out to a per-request queue by request_id; the writer side
         # serialises on LocalCluster's own stdin lock (write() takes it).
@@ -502,6 +507,15 @@ class ClusterEngine(BatchedEngine):
                 logger.warning("cluster: reply pipe reader stopped: %s", exc)
                 self._reader_error = exc
                 self._fail_all_pending(exc)
+                if self._on_rank_death is not None:
+                    # Fire-and-forget (never awaited inline): the callback's
+                    # own teardown may call this engine's `stop()`, which
+                    # cancels `self._reader_task` -- that IS this task, so
+                    # awaiting here would be cancelling ourselves mid-chain.
+                    try:
+                        self._on_rank_death(str(exc))
+                    except Exception:  # noqa: BLE001 - never break the reader
+                        logger.exception("cluster: on_rank_death callback failed")
                 return
             if frame is None:
                 # Idle timeout with the pipe still open: nothing to route,

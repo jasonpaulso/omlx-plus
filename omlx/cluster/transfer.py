@@ -57,6 +57,14 @@ logger = logging.getLogger(__name__)
 
 # D2: give up after this many consecutive failed/no-progress rounds.
 ROUND_CAP = 3
+# S6 rider: a killed/wedged round's session is stopped with
+# `LocalCluster.stop()`'s own default grace (launcher.py, 10s) before it
+# escalates to SIGKILL and the OS actually releases the round's ring port. A
+# respawn sleep shorter than that grace races the still-closing predecessor
+# for the same port -- the S5 rig lost 3 join-timeout rounds in ~60s to
+# exactly this collision. The retry sleep must exceed it.
+_ROUND_STOP_GRACE_S = 10.0  # LocalCluster.stop()'s own default `timeout`
+ROUND_RETRY_BACKOFF_S = _ROUND_STOP_GRACE_S + 2.0
 # CL5-04/05: head-side unbounded-growth bounds. `pending_results` buffers a
 # RESULT that arrived before `_await_round_result` registered a future for
 # its step (S5 P2 completion, see `_JobRuntime`); a flood of updates for
@@ -827,7 +835,7 @@ class TransferManager:
                         error=f"{ROUND_CAP} consecutive failed/no-progress rounds",
                     )
                     return
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(ROUND_RETRY_BACKOFF_S)
                 continue
             try:
                 wire = command_to_wire(
@@ -851,8 +859,10 @@ class TransferManager:
                 src_session.stop()
                 shutil.rmtree(src_tmp, ignore_errors=True)
             if result is None or result.get("status") == "round_error":
+                failed_round = True
                 stalled += 1
             else:
+                failed_round = False
                 new_have = set(result.get("have") or [])
                 stalled = 0 if new_have - have else stalled + 1
                 have = new_have
@@ -869,6 +879,12 @@ class TransferManager:
                     error=f"{ROUND_CAP} consecutive failed/no-progress rounds",
                 )
                 return
+            if failed_round:
+                # S6 rider: the round's (possibly just-killed) session needs
+                # the same stop-grace margin before a respawn, or the retry
+                # races the same port collision the SpawnBoundError branch
+                # above guards against.
+                await asyncio.sleep(ROUND_RETRY_BACKOFF_S)
         self._finish(job_id, "done")
 
     async def _drive_hf(self, job_id: str, member: Member, start_step: int) -> None:

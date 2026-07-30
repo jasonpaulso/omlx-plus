@@ -310,6 +310,22 @@ class WorkerCommandExecutor:
         (S5 D1b) -- a SIBLING channel to job updates, not the same list."""
         return self._transfer.pending_transfer_updates()
 
+    def ranks_status(self) -> dict[str, Any] | None:
+        """S6 D1: this worker's own rank aliveness, riding every heartbeat.
+
+        None when this node has no active local formation (S1 heartbeat
+        shape: the field is simply omitted). The worker deathwatch already
+        notices a dead rank in seconds (`launcher.py`'s `DeathWatch`); this
+        is what carries that fact to the head, which otherwise learns
+        nothing until its own rank 0 idle-times out.
+        """
+        cluster = self._cluster
+        if cluster is None:
+            return None
+        alive = [rank.rank for rank in cluster.ranks if rank.alive]
+        dead = [rank.rank for rank in cluster.ranks if not rank.alive]
+        return {"alive": alive, "dead": dead}
+
     def _channel_for_raw(self, raw: dict[str, Any]) -> str:
         kind = raw.get("kind")
         if kind in ("transfer_start", "transfer_round", "transfer_abort"):
@@ -919,6 +935,7 @@ class ClusterManager:
         job_updates: list[dict[str, Any]] | None = None,
         node_state: Any = None,
         transfer_updates: list[dict[str, Any]] | None = None,
+        ranks: Any = None,
     ) -> dict[str, Any]:
         """Record liveness for a heartbeat. Touches no persisted state.
 
@@ -972,6 +989,25 @@ class ClusterManager:
                 logger.debug(
                     "cluster: dropping malformed node_state from member %s", member.id
                 )
+
+        if ranks is not None:
+            parsed_ranks = _parse_ranks_status(ranks)
+            if parsed_ranks is None:
+                logger.debug(
+                    "cluster: dropping malformed ranks status from member %s",
+                    member.id,
+                )
+            else:
+                _alive, dead = parsed_ranks
+                # S6 D1: react immediately and directly (never through the
+                # E6 queue) -- a formation blocked inside `wait_ready` holds
+                # the queue across the await, so a queued reaction here would
+                # deadlock (rev3/B1). `handle_dead_rank` itself decides
+                # in-progress (direct kill) vs serving (queued teardown).
+                if dead and self._formation is not None:
+                    self._formation.handle_dead_rank(
+                        member.id, f"worker reported dead rank(s) {dead}"
+                    )
 
         if job_updates and self._formation is not None:
             self._formation.record_job_updates(member, job_updates)
@@ -1359,6 +1395,7 @@ class ClusterManager:
                 executor.pending_transfer_updates if executor is not None else None
             ),
             node_state_provider=self._collect_node_state,
+            ranks_provider=(executor.ranks_status if executor is not None else None),
         )
         if executor is not None:
             # CL5-10: a transfer job is bound to the epoch live when it
@@ -1414,6 +1451,31 @@ def _bound_transfer_updates(
                 ):
                     return None
     return raw
+
+
+def _parse_ranks_status(raw: Any) -> tuple[list[int], list[int]] | None:
+    """S6 D1: parse a worker's bounded ``ranks`` heartbeat field.
+
+    Leniently rejects (returns ``None`` for the whole field) anything
+    malformed or oversized -- mirrors ``_bound_transfer_updates``'s
+    whole-batch rejection posture rather than partially trusting a shape it
+    cannot bound. World size is already capped at ``MAX_WORLD_SIZE``, so
+    that is this field's bound too.
+    """
+    if not isinstance(raw, dict):
+        return None
+    alive_raw = raw.get("alive")
+    dead_raw = raw.get("dead")
+    if not isinstance(alive_raw, list) or not isinstance(dead_raw, list):
+        return None
+    if len(alive_raw) > MAX_WORLD_SIZE or len(dead_raw) > MAX_WORLD_SIZE:
+        return None
+    try:
+        alive = [int(x) for x in alive_raw]
+        dead = [int(x) for x in dead_raw]
+    except (TypeError, ValueError):
+        return None
+    return alive, dead
 
 
 # S5 P2: a status-surface summary of one TransferJob. Deliberately drops the

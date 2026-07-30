@@ -51,9 +51,15 @@ class HeartbeatSender:
         job_updates_provider: Callable[[], list[dict[str, Any]]] | None = None,
         transfer_updates_provider: Callable[[], list[dict[str, Any]]] | None = None,
         node_state_provider: Callable[[], dict[str, Any] | None] | None = None,
+        ranks_provider: Callable[[], dict[str, Any] | None] | None = None,
     ) -> None:
         self.identity = identity
         self.interval_s = max(0.1, interval_s)
+        # S6 D2: the join-negotiated interval, fixed at construction and never
+        # mutated again -- the backoff arithmetic (and its cap invariant) is
+        # pinned to THIS value, not whatever the loop happens to be sleeping.
+        self._base_interval_s = self.interval_s
+        self._consecutive_failures = 0
         self.epoch = generate_epoch()
         self.seq = 0
         self.last_success_at: float | None = None
@@ -70,6 +76,9 @@ class HeartbeatSender:
         # provider is best-effort — returning None (or raising, caught below)
         # simply omits the field, exactly S1's heartbeat shape.
         self._node_state_provider = node_state_provider
+        # S6 D1: this worker's own rank aliveness (bounded, per-formation),
+        # same best-effort/omit-on-None contract as node_state_provider.
+        self._ranks_provider = ranks_provider
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -107,6 +116,14 @@ class HeartbeatSender:
                 logger.debug("cluster: node_state provider failed: %s", exc)
             if node_state is not None:
                 payload["node_state"] = node_state
+        if self._ranks_provider is not None:
+            try:
+                ranks = self._ranks_provider()
+            except Exception as exc:  # noqa: BLE001 - advisory, never blocks the beat
+                ranks = None
+                logger.debug("cluster: ranks provider failed: %s", exc)
+            if ranks is not None:
+                payload["ranks"] = ranks
         # CL2-11: the head address was pinned into WorkerIdentity at join and
         # is never changed by a command, so a heartbeat only ever reaches the
         # join-resolved head.
@@ -161,13 +178,32 @@ class HeartbeatSender:
     async def _loop(self) -> None:
         while True:
             try:
-                await self.send_once()
+                reply = await self.send_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - the loop must survive
                 self.last_error = str(exc)
                 logger.warning("Heartbeat loop error: %s", exc)
-            await asyncio.sleep(self.interval_s)
+                reply = None
+            self._consecutive_failures = (
+                0 if reply is not None else self._consecutive_failures + 1
+            )
+            await asyncio.sleep(self._next_delay())
+
+    def _next_delay(self) -> float:
+        """S6 D2: failure backoff, pinned to the join-negotiated interval.
+
+        Healthy (or just-recovered) -> the base interval. Each consecutive
+        failure since doubles the delay, capped at ``4 * base`` -- ``5, 10,
+        20, 20, ...`` at the 5s default. rev4's cap invariant
+        (``4i < max(30, 6i)`` for any interval ``i``) means a backed-off
+        worker can never miss a formation command window because of its own
+        backoff, at any configured interval.
+        """
+        if self._consecutive_failures <= 0:
+            return self._base_interval_s
+        delay = self._base_interval_s * (2.0 ** (self._consecutive_failures - 1))
+        return min(delay, self._base_interval_s * 4.0)
 
     def status(self) -> dict[str, Any]:
         return {

@@ -238,6 +238,37 @@ def test_local_env_drops_wire_shaped_keys():
     assert env["PATH"] == "/usr/bin"
 
 
+# -- S6 D1: ranks_status() -- the heartbeat's rank-aliveness field -----------
+
+
+class _FakeRank:
+    def __init__(self, rank: int, alive: bool) -> None:
+        self.rank = rank
+        self.alive = alive
+
+
+class _FakeFormedCluster:
+    def __init__(self, ranks: list[_FakeRank]) -> None:
+        self.ranks = ranks
+
+
+def test_ranks_status_is_none_with_no_active_cluster(tmp_path):
+    executor = _executor(tmp_path, [])
+    assert executor.ranks_status() is None
+
+
+def test_ranks_status_reports_a_live_rank(tmp_path):
+    executor = _executor(tmp_path, [])
+    executor._cluster = _FakeFormedCluster([_FakeRank(1, True)])
+    assert executor.ranks_status() == {"alive": [1], "dead": []}
+
+
+def test_ranks_status_reports_a_dead_rank(tmp_path):
+    executor = _executor(tmp_path, [])
+    executor._cluster = _FakeFormedCluster([_FakeRank(1, False)])
+    assert executor.ranks_status() == {"alive": [], "dead": [1]}
+
+
 # -- CL2-09: one live formation per worker ------------------------------------
 
 

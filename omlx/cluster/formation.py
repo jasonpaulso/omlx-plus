@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from .hostfile import ibv_matrix_from_devices, require_link_scope
 from .launcher import DEFAULT_JOIN_TIMEOUT_S, LocalCluster, sweep_orphaned_ranks
-from .manager import ClusterError
+from .manager import ClusterError, get_engine_pool
 from .placement import PlacementDecision
 from .protocol import (
     PROTOCOL_VERSION,
@@ -120,6 +120,22 @@ class FormationManager:
         self._jobs: list[FormationJob] = []
         self._torn_down_jobs: set[str] = set()
         self._alarms: list[str] = []
+        # S6 D1: the job a SERVING formation is currently recorded under
+        # (set on success in `_load`, cleared in `_abort_formation`) -- what
+        # `_degrade_and_teardown` marks "degraded", distinct from the fresh
+        # job `_unload` creates for the teardown itself.
+        self._active_job: FormationJob | None = None
+        # S6 D1: model ids currently being auto-torn-down after a dead-rank
+        # signal -- a heartbeat report and an engine EOF can both fire for
+        # the same model; this makes the teardown idempotent.
+        self._degrading: set[str] = set()
+        # S6 D1: strong references for the fire-and-forget degrade/teardown
+        # tasks `handle_dead_rank`/`_make_rank_death_handler` schedule --
+        # asyncio only holds a WEAK reference to a task, so a bare
+        # `create_task` with nothing else keeping it alive can be
+        # garbage-collected mid-run (exactly the silent-vanish failure D1
+        # exists to prevent). Self-discards via `add_done_callback`.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     # ---- read side (heartbeat + dashboard) -------------------------------
 
@@ -177,6 +193,99 @@ class FormationManager:
     def _raise_alarm(self, message: str) -> None:
         logger.error("cluster: FORMATION ALARM: %s", message)
         self._alarms.append(message)
+
+    # ---- S6 D1: rank-death propagation + degrade -------------------------
+
+    def handle_dead_rank(self, member_id: str, reason: str) -> None:
+        """Synchronous, direct reaction to a dead-rank signal (rev2/D1).
+
+        Called from the heartbeat handler (`ClusterManager.record_heartbeat`,
+        itself synchronous) -- this method must never await. Two cases:
+
+        * IN PROGRESS (`_local` set, `_active_model` still None: a formation
+          is mid-``_load``, most likely blocked inside ``wait_ready``). The
+          E6 queue is unavailable -- it holds the very op that's blocked
+          (rev3/B1) -- so this kills the in-flight ``LocalCluster`` DIRECTLY.
+          Closing rank 0's channel makes ``wait_ready`` raise into ``_load``'s
+          ``except BaseException`` -> ``_abort_formation`` -> the pool's
+          existing rollback guard (`engine_pool.load_cluster_model`). A
+          queued abort here would deadlock behind the very op it's trying to
+          unblock.
+        * SERVING (`_active_model` set): torn down through the EXISTING S4
+          unload driver (`EnginePool.request_unload`), scheduled as a
+          background task since this method cannot await it.
+        """
+        if self._local is not None and self._active_model is None:
+            logger.error(
+                "cluster: FORMATION ALARM: dead rank reported by %s (%s) while "
+                "forming; killing the in-progress formation directly",
+                member_id,
+                reason,
+            )
+            self._local.kill()
+            return
+        if self._active_model is not None:
+            self._spawn_background(
+                self._degrade_and_teardown(self._active_model, reason)
+            )
+
+    def _make_rank_death_handler(self, model_id: str) -> Callable[[str], None]:
+        """The callback wired into a SERVING model's `ClusterEngine` (D1b):
+        the engine's reply-pipe reader fans an EOF/read failure out here.
+        Sync and fire-and-forget, mirroring `handle_dead_rank`'s SERVING
+        branch -- never awaited inline from the reader loop (which would be
+        cancelling its own task mid-teardown, see `ClusterEngine.stop`).
+        """
+
+        def _handler(reason: str) -> None:
+            self._spawn_background(self._degrade_and_teardown(model_id, reason))
+
+        return _handler
+
+    def _spawn_background(self, coro: Any) -> None:
+        """`create_task` with a held strong reference (see
+        `_background_tasks`'s docstring) -- otherwise nothing keeps a
+        fire-and-forget degrade/teardown task alive."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _degrade_and_teardown(self, model_id: str, reason: str) -> None:
+        """Mark the active job degraded + alarm, then tear the formation
+        down through the EXISTING S4 unload driver -- entry rollback and
+        accounting restore are `EnginePool`'s machinery, not reimplemented
+        here. Idempotent: a heartbeat dead-rank report and an engine EOF can
+        both fire for the same SERVING model; the second is a no-op.
+        """
+        if model_id in self._degrading:
+            return
+        self._degrading.add(model_id)
+        try:
+            job = self._active_job
+            if job is not None and job.model == model_id and job.status == "ready":
+                job.status = "degraded"
+                job.mark("degraded", "dead_rank", reason)
+            self._raise_alarm(
+                f"formation for {model_id!r} degraded ({reason}); tearing down"
+            )
+            pool = get_engine_pool()
+            if pool is None:
+                logger.warning(
+                    "cluster: cannot auto-teardown %r after degrade -- engine "
+                    "pool unavailable",
+                    model_id,
+                )
+                return
+            try:
+                await pool.request_unload(model_id)
+            except Exception as exc:  # noqa: BLE001 - best-effort auto-teardown
+                logger.warning(
+                    "cluster: auto-teardown after degrade failed for %r: %s",
+                    model_id,
+                    exc,
+                )
+        finally:
+            self._degrading.discard(model_id)
 
     # ---- formation / teardown jobs (E6 queue) ----------------------------
 
@@ -247,13 +356,17 @@ class FormationManager:
             # _form_with_fallback leaves self._local set to the formed cluster.
             assert self._local is not None
             engine = self._engine_factory(
-                model_id=model_id, cluster=self._local, resolved_path=local_path
+                model_id=model_id,
+                cluster=self._local,
+                resolved_path=local_path,
+                on_rank_death=self._make_rank_death_handler(model_id),
             )
             await engine.start()
             self._engines[model_id] = engine
             self._active_model = model_id
             job.status = "ready"
             job.mark("register_engine", "ready")
+            self._active_job = job
             return {
                 "model": model_id,
                 "status": "ready",
@@ -607,6 +720,7 @@ class FormationManager:
     async def _abort_formation(self) -> None:
         local, self._local = self._local, None
         self._active_model = None
+        self._active_job = None
         if local is not None:
             await self._run_blocking(local.stop)
 
@@ -650,11 +764,21 @@ class FormationManager:
         return cluster
 
     def _default_engine(
-        self, *, model_id: str, cluster: LocalCluster, resolved_path: str
+        self,
+        *,
+        model_id: str,
+        cluster: LocalCluster,
+        resolved_path: str,
+        on_rank_death: Callable[[str], None] | None = None,
     ) -> ClusterEngine:
         from .engine import ClusterEngine
 
-        return ClusterEngine(model_id, cluster=cluster, resolved_path=resolved_path)
+        return ClusterEngine(
+            model_id,
+            cluster=cluster,
+            resolved_path=resolved_path,
+            on_rank_death=on_rank_death,
+        )
 
     def _default_resolve_model(self, model_id: str) -> str | None:
         from ..model_discovery import discover_models_from_dirs

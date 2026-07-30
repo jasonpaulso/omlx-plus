@@ -219,6 +219,59 @@ class TestEligibility:
         assert decision.mode == "reject"
 
 
+class TestLanguageModelOnlyEligibility:
+    """S6 D0: a `language_model_only: true` checkpoint (vision tower shipped
+    off) is text-eligible for distributed placement even though discovery
+    classifies it "vlm" -- placement-layer only, single-node classification
+    untouched (this module never touches model_discovery.py).
+    """
+
+    LANGUAGE_MODEL_ONLY_CONFIG = {
+        "vision_config": {"some": "tower"},
+        "language_model_only": True,
+        "text_config": {"num_attention_heads": 24, "num_key_value_heads": 4},
+    }
+    PLAIN_VLM_CONFIG = {
+        "vision_config": {"some": "tower"},
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+    }
+
+    def test_language_model_only_vlm_is_distributed_eligible(self):
+        decision = _plan(
+            est_size=150,
+            model_type="vlm",
+            model_config=self.LANGUAGE_MODEL_ONLY_CONFIG,
+        )
+        assert decision.mode == "distributed"
+
+    def test_plain_vlm_without_language_model_only_stays_refused(self):
+        decision = _plan(
+            est_size=150, model_type="vlm", model_config=self.PLAIN_VLM_CONFIG
+        )
+        assert decision.mode == "local"
+        assert any("not eligible" in r for r in decision.reasons)
+
+    def test_plain_vlm_rejects_under_distributed(self):
+        decision = _plan(
+            est_size=150,
+            model_type="vlm",
+            model_config=self.PLAIN_VLM_CONFIG,
+            prefer="distributed",
+        )
+        assert decision.mode == "reject"
+
+    def test_single_node_prefer_local_is_untouched_by_the_eligibility_change(self):
+        # prefer=local short-circuits before eligibility is even consulted --
+        # single-node serving of a language_model_only OR a plain vlm config
+        # is unaffected by this change either way.
+        for config in (self.LANGUAGE_MODEL_ONLY_CONFIG, self.PLAIN_VLM_CONFIG):
+            decision = _plan(
+                est_size=1000, model_type="vlm", model_config=config, prefer="local"
+            )
+            assert decision.mode == "local"
+
+
 class TestDecisionRoundTrip:
     def test_to_dict_from_dict_round_trips(self):
         decision = _plan(est_size=150)

@@ -74,6 +74,38 @@ def test_divisibility_noop_when_config_silent():
     check_divisibility({}, 4)
 
 
+# -- S6 D0: text_config fallback (language_model_only checkpoints) -----------
+
+
+def test_divisibility_falls_back_to_nested_text_config():
+    # No top-level heads (a language_model_only wrapper carries them nested)
+    # -- the divisible nested count must still pass, not lenient-pass on
+    # top-level absence.
+    config = {"text_config": {"num_attention_heads": 24, "num_key_value_heads": 4}}
+    check_divisibility(config, 2)
+
+
+def test_divisibility_rejects_a_nested_indivisible_config():
+    # Pre-fix this lenient-passed (top-level heads=None); it must now FAIL.
+    config = {"text_config": {"num_attention_heads": 25, "num_key_value_heads": 5}}
+    with pytest.raises(TPDivisibilityError):
+        check_divisibility(config, 2)
+
+
+def test_divisibility_prefers_top_level_over_nested():
+    config = {
+        "num_attention_heads": 8,
+        "text_config": {"num_attention_heads": 7},
+    }
+    # Top-level 8 is divisible by 2; the (differing) nested value must not
+    # be consulted once the top-level key is present.
+    check_divisibility(config, 2)
+
+
+def test_divisibility_ignores_a_non_dict_text_config():
+    check_divisibility({"text_config": "not-a-dict"}, 4)
+
+
 # -- D9 tax accumulator math -------------------------------------------------
 
 

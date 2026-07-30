@@ -87,6 +87,39 @@ async def test_load_without_a_worker_is_424(tmp_path):
         set_engine_pool_getter(None)
 
 
+async def test_load_maps_model_loading_error_to_409_not_500(tmp_path):
+    """S6 rider: the S5 rig observed a bare, unhandled `ModelLoadingError`
+    (already-being-loaded) reach the client as a 500. It must map to the
+    same 409 the local /v1/models/load surface uses for the same condition.
+    """
+    settings = make_settings(
+        tmp_path / "h",
+        role="head",
+        data_plane_subnet="10.0.2.0/24",
+        data_plane_address="10.0.2.1",
+    )
+    model_dir = tmp_path / "models" / "m"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (model_dir / "model.safetensors").write_bytes(b"0" * 1024)
+
+    pool = EnginePool()
+    pool.discover_models(str(tmp_path / "models"))
+    pool.get_entry("m").is_loading = True  # a concurrent load already claimed it
+    set_engine_pool_getter(lambda: pool)
+    try:
+        async with running_manager(settings):
+            app = build_app()
+            async with http_client(app) as client:
+                resp = await client.post(
+                    LOAD, json={"model": "m"}, headers=bearer(MAIN_API_KEY)
+                )
+                assert resp.status_code == 409
+                assert "already being loaded" in resp.json()["detail"]
+    finally:
+        set_engine_pool_getter(None)
+
+
 async def test_status_reports_formation(tmp_path):
     settings = make_settings(tmp_path / "h", role="head")
     async with running_manager(settings):

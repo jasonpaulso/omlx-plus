@@ -284,6 +284,99 @@ class TestNodeState:
             assert manager.node_state(member.id) is None
 
 
+class _FakeFormationForRanks:
+    """Stands in for `manager._formation`: `record_heartbeat` also calls
+    `commands_for` (building its reply's `commands`), and `manager.stop()`
+    calls `stop()` -- a bare `handle_dead_rank`-only stub breaks both."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def handle_dead_rank(self, member_id: str, reason: str) -> None:
+        self.calls.append((member_id, reason))
+
+    def commands_for(self, member_id: str) -> list:
+        return []
+
+    async def stop(self) -> None:
+        return None
+
+
+class TestRanksStatus:
+    """S6 D1: worker-reported rank aliveness dispatches to the formation
+    manager's dead-rank handler; a malformed value is a fail-soft drop."""
+
+    async def test_well_formed_ranks_with_no_dead_entries_does_not_dispatch(
+        self, head_settings
+    ):
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+            fake_formation = _FakeFormationForRanks()
+            manager._formation = fake_formation
+
+            manager.record_heartbeat(
+                member, seq=1, epoch="e1", ranks={"alive": [1], "dead": []}
+            )
+
+            assert fake_formation.calls == []
+            assert manager.liveness(member.id).status == "active"
+
+    async def test_a_dead_rank_dispatches_to_the_formation_manager(self, head_settings):
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+            fake_formation = _FakeFormationForRanks()
+            manager._formation = fake_formation
+
+            manager.record_heartbeat(
+                member, seq=1, epoch="e1", ranks={"alive": [], "dead": [1]}
+            )
+
+            assert len(fake_formation.calls) == 1
+            assert fake_formation.calls[0][0] == member.id
+            assert "1" in fake_formation.calls[0][1]
+
+    async def test_malformed_ranks_is_dropped_but_liveness_still_records(
+        self, head_settings
+    ):
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+            fake_formation = _FakeFormationForRanks()
+            manager._formation = fake_formation
+
+            garbage_values = (
+                "a string",
+                ["a", "list"],
+                {"alive": "nope", "dead": []},
+                {},
+            )
+            for i, garbage in enumerate(garbage_values):
+                manager.record_heartbeat(member, seq=1, epoch=f"e{i}", ranks=garbage)
+
+            assert fake_formation.calls == []
+            assert manager.liveness(member.id).status == "active"
+
+    async def test_oversized_ranks_list_is_dropped(self, head_settings):
+        from omlx.cluster.manager import MAX_WORLD_SIZE
+
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+            fake_formation = _FakeFormationForRanks()
+            manager._formation = fake_formation
+
+            manager.record_heartbeat(
+                member,
+                seq=1,
+                epoch="e1",
+                ranks={"alive": [], "dead": list(range(MAX_WORLD_SIZE + 1))},
+            )
+
+            assert fake_formation.calls == []
+
+
 class TestRevocation:
     async def test_leave_revokes_only_the_caller(self, head_settings):
         async with running_manager(head_settings) as manager:

@@ -228,6 +228,70 @@ async def test_rank_death_surfaces_clean_error(tmp_path):
                         entry.process.kill()
 
 
+async def test_worker_rank_death_propagates_degrades_and_re_forms(tmp_path):
+    """S6 D1 rev2: the measured ~385s hang, closed.
+
+    Killing the WORKER's own rank (not the head's rank 0, above) leaves the
+    head's rank 0 blocked in the collective with NOTHING locally to notice
+    -- only the worker's next heartbeat (`ranks_status()`) tells the head.
+    Before this fix nothing ever told it; the formation job stayed
+    "running" forever and the request only failed at the 600s
+    generate-idle timeout. This must degrade + tear the formation down
+    within a couple of heartbeat intervals instead, and a re-issued load
+    must re-form cleanly.
+
+    `_degrade_and_teardown` delegates the actual entry rollback/accounting
+    to the S4 unload driver (`EnginePool.request_unload`); this stub
+    mirrors exactly what that driver does (`_teardown_cluster_entry`
+    calling `manager.formation.unload`) without pulling in the whole
+    EnginePool, which this in-process harness never wires.
+    """
+    from omlx.cluster.manager import set_engine_pool_getter
+
+    async with two_node(tmp_path) as (head, worker):
+        teardown_calls: list[str] = []
+
+        class _StubPool:
+            async def request_unload(self, model_id: str) -> None:
+                teardown_calls.append(model_id)
+                await head.formation.unload(model_id)
+
+        set_engine_pool_getter(lambda: _StubPool())
+        try:
+            await asyncio.wait_for(head.formation.load(MODEL), LOAD_TIMEOUT_S)
+            engine = head.formation.active_engine(MODEL)
+            assert engine is not None
+            assert worker.executor is not None
+            worker_cluster = worker.executor.cluster
+            assert worker_cluster is not None
+
+            for entry in worker_cluster.ranks:
+                entry.process.kill()
+
+            # Degrade + teardown from heartbeat propagation alone, bounded
+            # well under the 600s generate-idle timeout that used to be the
+            # only thing that ever noticed.
+            await _wait_for(lambda: head.formation.active_engine(MODEL) is None, 30.0)
+            assert teardown_calls == [MODEL]
+            assert any(job.status == "degraded" for job in head.formation._jobs)
+            assert any("degraded" in alarm for alarm in head.formation.alarms())
+
+            reformed = await asyncio.wait_for(
+                head.formation.load(MODEL), LOAD_TIMEOUT_S
+            )
+            assert reformed["status"] == "ready"
+            again = await asyncio.wait_for(
+                head.formation.active_engine(MODEL).generate(
+                    "Hi", max_tokens=4, temperature=0.0
+                ),
+                GEN_TIMEOUT_S,
+            )
+            assert again.completion_tokens > 0
+            await asyncio.wait_for(head.formation.unload(MODEL), LOAD_TIMEOUT_S)
+        finally:
+            set_engine_pool_getter(None)
+
+
 # -- S3 P2: real scheduler-driven concurrent batching -------------------------
 #
 # Every test below drives ``engine.stream_generate``/``stream_chat`` directly
