@@ -97,3 +97,59 @@ async def test_status_reports_formation(tmp_path):
             body = resp.json()
             assert body["active_model"] is None
             assert body["jobs"] == []
+
+
+async def test_status_carries_a_sibling_transfer_jobs_field(tmp_path):
+    """S5 P2: `/v1/cluster/models/status` surfaces TransferJob rows (summarized
+    -- no manifest/have payload) as a sibling of formation's own `jobs`."""
+    settings = make_settings(tmp_path / "h", role="head")
+    async with running_manager(settings):
+        app = build_app()
+        async with http_client(app) as client:
+            resp = await client.get(STATUS, headers=bearer(MAIN_API_KEY))
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["transfer"] == {"jobs": []}
+
+
+async def test_load_body_accepts_an_explicit_source(tmp_path):
+    """S5 D6: `source` on the load body reaches `load_distributed` -- with
+    no active worker the call still 424s (same as the sourceless case), but
+    the body must be ACCEPTED (not a 422 validation error) and the reject
+    reason must be placement's, not a `source`-shaped complaint.
+    """
+    settings = make_settings(
+        tmp_path / "h",
+        role="head",
+        data_plane_subnet="10.0.2.0/24",
+        data_plane_address="10.0.2.1",
+    )
+    model_dir = tmp_path / "models" / "m"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (model_dir / "model.safetensors").write_bytes(b"0" * 1024)
+
+    pool = EnginePool()
+    pool._get_final_ceiling = lambda: 1
+    pool.discover_models(str(tmp_path / "models"))
+    set_engine_pool_getter(lambda: pool)
+    try:
+        async with running_manager(settings):
+            app = build_app()
+            async with http_client(app) as client:
+                resp = await client.post(
+                    LOAD,
+                    json={"model": "m", "source": "peer"},
+                    headers=bearer(MAIN_API_KEY),
+                )
+                assert resp.status_code == 424
+                assert "no cluster members" in resp.json()["detail"]
+
+                bad = await client.post(
+                    LOAD,
+                    json={"model": "m", "source": "not-a-real-source"},
+                    headers=bearer(MAIN_API_KEY),
+                )
+                assert bad.status_code == 422
+    finally:
+        set_engine_pool_getter(None)

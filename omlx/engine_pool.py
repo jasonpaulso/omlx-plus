@@ -17,6 +17,7 @@ import asyncio
 import gc
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -151,6 +152,19 @@ _CLUSTER_TEARDOWN_MAX_FAILURES = 3
 # the outer get_engine retry re-reads the admission ceiling.
 _CLUSTER_TEARDOWN_SETTLE_TIMEOUT_S = 20.0
 _CLUSTER_TEARDOWN_SETTLE_INTERVAL_S = 0.5
+# S5 D5: the presence-resolution pre-step's transfer-job poll.
+_TRANSFER_JOB_POLL_INTERVAL_S = 0.5
+# Generous outer backstop only -- each round is bounded internally by
+# transfer.ROUND_DEADLINE_S (1800s) x transfer.ROUND_CAP (3) (D4/CL5-16),
+# and the HF path by 4x that; this just prevents an unbounded poll if a
+# BaseException ever escapes TransferManager._drive without the job
+# reaching a terminal status.
+_TRANSFER_JOB_POLL_TIMEOUT_S = 4 * 1800.0 + 900.0
+# D6/CL5-03: mirrors cluster.transfer._COMMIT_SHA_RE -- a hub-cache
+# snapshot dir is named exactly the commit sha it was resolved to
+# (model_discovery.py's _resolve_hf_cache_entry), so the snapshot dir's own
+# name IS the revision an HF fan-out transfer would pin.
+_HF_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class PlacementStaleError(Exception):
@@ -1373,6 +1387,8 @@ class EnginePool:
         prefer: Literal["auto", "local", "distributed"],
         *,
         decision: PlacementDecision | None = None,
+        source: Literal["peer", "hf"] | None = None,
+        allow_source_choice: bool = False,
     ) -> dict[str, Any]:
         """S4 D4: the ONE owner of cluster entry create/bind.
 
@@ -1385,6 +1401,17 @@ class EnginePool:
         Lock-ordering: (a) claim under the lock, (b) submit+await the
         formation job outside it, (c) bind under the lock again. Never
         awaits formation while holding `self._lock`.
+
+        S5 D5: when the decision is distributed and the worker lacks the
+        model, a presence-resolution pre-step (transfer, D6 source
+        selection) runs INSIDE the same rollback guard as the formation
+        await, between (a) and (b), so a failed/aborted transfer rolls the
+        claimed entry back exactly like a failed formation would.
+        `allow_source_choice` gates D6's `choice_required` reply: only an
+        explicit operator surface (`manager.load_distributed`) sets it --
+        `get_engine`'s implicit on-demand path never does, so it always
+        auto-picks (peer, deterministically) rather than ever blocking on a
+        choice no one is there to make (E5).
         """
         from .cluster.manager import ClusterError, get_cluster_manager
         from .cluster.placement import plan_placement, resolve_placement_inputs
@@ -1458,11 +1485,30 @@ class EnginePool:
                     raise ModelLoadingError(model_id)
                 if not self._revalidate_cluster_decision_locked(entry, decision):
                     raise PlacementStaleError(model_id)
+                model_path = entry.model_path
                 self._claim_cluster_entry_locked(entry, decision)
                 await self._evict_for_cluster_claim_locked(decision)
 
-        # (b) outside the lock: submit + await the formation job.
+        # (b) outside the lock: presence pre-step (S5 D5), then submit +
+        # await the formation job. Both live inside this one guard so a
+        # failed/aborted transfer rolls the claim back exactly like a
+        # failed formation would.
         try:
+            if decision.mode == "distributed":
+                worker = self._absent_transfer_worker(manager, decision)
+                if worker is not None:
+                    choice = await self._resolve_cluster_presence(
+                        manager,
+                        model_id,
+                        model_path=model_path,
+                        worker=worker,
+                        source=source,
+                        allow_source_choice=allow_source_choice,
+                    )
+                    if choice is not None:
+                        async with self._lock:
+                            self._rollback_cluster_entry_locked(model_id)
+                        return choice
             result = await manager.formation.load(model_id, decision=decision)
         except BaseException:
             async with self._lock:
@@ -1490,6 +1536,129 @@ class EnginePool:
         result = dict(result)
         result["decision"] = decision.to_dict()
         return result
+
+    @staticmethod
+    def _absent_transfer_worker(
+        manager: Any, decision: PlacementDecision
+    ) -> Any | None:
+        """The single active member the decision reports absent, or None
+        (S5 D5). Mirrors `_cluster_worker_capacities`'s own active-member
+        iteration rather than assuming a fixed head node id string."""
+        for candidate in manager.state.members:
+            live = manager.liveness(candidate.id)
+            if live is None or live.status != "active":
+                continue
+            if not decision.presence.get(candidate.id, True):
+                return candidate
+        return None
+
+    def _transfer_source_viability(
+        self, entry: EngineEntry
+    ) -> tuple[bool, str | None, str | None]:
+        """D6: is an HF fan-out transfer viable for `entry`? Peer is always
+        viable in this codepath -- the pre-step only ever runs for a model
+        already present in `self._entries` (the head's own local
+        discovery), so the head is resident by construction. HF is viable
+        only for a hub-cache-sourced entry (`source_repo_id` set) whose
+        resolved model dir -- the snapshot dir, D3's manifest root -- is
+        named a real 40-hex commit sha; a bare local model folder has no
+        `source_repo_id` and is peer-only.
+        """
+        if entry.source_repo_id is None:
+            return False, None, None
+        revision = Path(entry.model_path).name
+        if not _HF_REVISION_RE.match(revision):
+            return False, None, None
+        return True, entry.source_repo_id, revision
+
+    async def _resolve_cluster_presence(
+        self,
+        manager: Any,
+        model_id: str,
+        *,
+        model_path: str,
+        worker: Any,
+        source: Literal["peer", "hf"] | None,
+        allow_source_choice: bool,
+    ) -> dict[str, Any] | None:
+        """S5 D5/D6: the worker lacks `model_id` -- resolve it via a
+        transfer job before formation runs. Returns a `choice_required`
+        dict (formation is NOT attempted; the caller rolls the claim back)
+        only when both sources are viable, the caller didn't pick one, AND
+        `allow_source_choice` opted in; otherwise runs the transfer job to
+        completion (raising on failure/abort, caught by the caller's
+        existing rollback guard) and returns None.
+        """
+        from .cluster.manager import ClusterError
+
+        entry = self._entries.get(model_id)
+        hf_viable, hf_repo_id, hf_revision = (
+            self._transfer_source_viability(entry)
+            if entry is not None
+            else (False, None, None)
+        )
+        chosen = source
+        if chosen is None:
+            if hf_viable and allow_source_choice:
+                return {
+                    "model": model_id,
+                    "status": "choice_required",
+                    "peer_viable": True,
+                    "hf_viable": True,
+                }
+            # D6 auto-pick: peer is always viable and needs no external
+            # network, so it is the deterministic default whenever a
+            # caller either didn't opt into a choice (E5's implicit path)
+            # or HF simply isn't an option.
+            chosen = "peer"
+        elif chosen == "hf" and not hf_viable:
+            raise ClusterError(
+                424, f"model {model_id!r} has no viable HF source for transfer"
+            )
+
+        cache_dir = (
+            Path(manager.global_settings.base_path) / "cluster" / "manifest_cache"
+        )
+        job = await manager.transfer.start_transfer(
+            model_id,
+            member=worker,
+            local_path=model_path,
+            source=chosen,
+            hf_repo_id=hf_repo_id if chosen == "hf" else None,
+            hf_revision=hf_revision if chosen == "hf" else None,
+            cache_dir=cache_dir,
+        )
+        await self._await_transfer_job(manager, job.id)
+        return None
+
+    @staticmethod
+    async def _await_transfer_job(manager: Any, job_id: str) -> None:
+        """Poll the head's transfer job to a terminal status (S5 D5). The
+        transfer runs as TransferManager's own owned task (D4) -- this
+        just waits for it, bounded by a generous backstop so a failure to
+        reach a terminal status can never wedge `load_cluster_model`
+        (and, via its rollback guard, the claimed entry) forever.
+        """
+        from .cluster.manager import ClusterError
+
+        deadline = time.monotonic() + _TRANSFER_JOB_POLL_TIMEOUT_S
+        while True:
+            job = manager.transfer.job(job_id)
+            if job is None:
+                raise ClusterError(500, f"transfer job {job_id!r} vanished")
+            if job.status == "done":
+                return
+            if job.status in ("error", "aborted"):
+                raise ClusterError(
+                    424,
+                    f"transfer job {job_id!r} {job.status}: {job.error or 'no detail'}",
+                )
+            if time.monotonic() >= deadline:
+                raise ClusterError(
+                    500,
+                    f"transfer job {job_id!r} did not reach a terminal status in time",
+                )
+            await asyncio.sleep(_TRANSFER_JOB_POLL_INTERVAL_S)
 
     async def unload_cluster_model(self, model_id: str) -> dict[str, Any]:
         """S4 D4: explicit distributed unload (`manager.unload_distributed`'s

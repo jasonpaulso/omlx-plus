@@ -893,12 +893,39 @@ def cluster_command(args):
         if not args.model:
             print(f"A model id is required: omlx cluster {action} <model>")
             sys.exit(1)
+        body = {"model": args.model}
+        source = getattr(args, "source", None)
+        if action == "load" and source:
+            body["source"] = source
         result = _cluster_request(
-            "POST",
-            f"{base_url}/v1/cluster/models/{action}",
-            headers,
-            {"model": args.model},
+            "POST", f"{base_url}/v1/cluster/models/{action}", headers, body
         )
+        # S5 D6: both a peer transfer and an HF fan-out are viable and no
+        # --source was given -- ask, if we can; otherwise tell the caller
+        # how to pick non-interactively.
+        if action == "load" and result.get("status") == "choice_required":
+            if not sys.stdin.isatty():
+                print(
+                    f"Model {args.model} is viable via both a peer transfer "
+                    "and an HF fan-out; re-run with --source peer|hf "
+                    "(not an interactive terminal)."
+                )
+                sys.exit(1)
+            choice = (
+                input(
+                    f"Model {args.model} exists both on a peer and on HF. "
+                    "Choose a source [peer/hf]: "
+                )
+                .strip()
+                .lower()
+            )
+            if choice not in ("peer", "hf"):
+                print(f"Invalid source {choice!r}; aborting.")
+                sys.exit(1)
+            body["source"] = choice
+            result = _cluster_request(
+                "POST", f"{base_url}/v1/cluster/models/{action}", headers, body
+            )
         print(
             f"{action.capitalize()} {result.get('model')}: "
             f"{result.get('status')} (job {result.get('job_id')})"
@@ -962,6 +989,16 @@ def cluster_command(args):
         print(f"Distributed model: {formation.get('active_model') or '(none)'}")
         for alarm in formation.get("alarms") or []:
             print(f"  ALARM: {alarm}")
+    transfer = result.get("transfer")
+    jobs = (transfer or {}).get("jobs") or []
+    if jobs:
+        print("Transfers:")
+        for job in jobs:
+            print(
+                f"  {job.get('id')}  {job.get('model_id')}  "
+                f"source={job.get('source')}  {job.get('status')}  "
+                f"files={job.get('files_verified')}/{job.get('files_total')}"
+            )
 
 
 def main():
@@ -1371,6 +1408,15 @@ Example directory structure:
         choices=["auto", "local", "distributed"],
         default="auto",
         help="With 'placement': steer the preview (default: auto)",
+    )
+    cluster_parser.add_argument(
+        "--source",
+        type=str,
+        choices=["peer", "hf"],
+        default=None,
+        help="With 'load': which source resolves a worker absent the model "
+        "(default: auto-pick, or prompt if both a peer transfer and an HF "
+        "fan-out are viable and this is an interactive terminal)",
     )
 
     for cluster_client_parser in (join_parser, cluster_parser):

@@ -22,6 +22,7 @@ from omlx.cluster.manifest import ManifestError
 from omlx.cluster.protocol import parse_command
 from omlx.cluster.state import Member
 from omlx.cluster.transfer import (
+    TransferError,
     TransferManager,
     TransferWorkerExecutor,
     resolve_transfer_destination,
@@ -734,3 +735,54 @@ async def test_round_cap_gives_up_after_no_progress(tmp_path, monkeypatch):
         finally:
             stop.set()
             await driver
+
+
+# =============================================================================
+# TransferManager.abort_transfer (S5 P2: completes D4's abort mechanism --
+# P1 wired TRANSFER_ABORT's worker-side handling but never a head-side
+# caller that publishes it)
+# =============================================================================
+
+
+async def test_abort_transfer_marks_head_and_worker_job_aborted(tmp_path):
+    async with running_manager(_head_settings(tmp_path)) as manager:
+        member = await _activate_member(manager)
+
+        source_dir = tmp_path / "source" / "target-model"
+        source_dir.mkdir(parents=True)
+        (source_dir / "config.json").write_bytes(b"{}")
+
+        worker_settings = _worker_settings(tmp_path)
+        worker_root = worker_settings.get_effective_model_dirs()[0]
+        worker_root.mkdir(parents=True, exist_ok=True)
+        launcher = _fake_session_launcher({"config.json": b"{}"})
+        worker = TransferWorkerExecutor(worker_settings, session_launcher=launcher)
+
+        tm = TransferManager(manager)
+        manager._transfer = tm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(tm, worker, member, stop))
+        try:
+            job = await tm.start_transfer(
+                "target-model", member=member, local_path=str(source_dir), source="peer"
+            )
+            aborted = await tm.abort_transfer(job.id)
+            assert aborted.status == "aborted"
+            assert tm.job(job.id).status == "aborted"
+
+            # The single-active gate must be released -- a fresh operation
+            # can proceed immediately, not wedged behind the aborted job.
+            manager.acquire_operation_gate("formation", "f1")
+            manager.release_operation_gate("formation", "f1")
+
+            # Idempotent: aborting an already-terminal job is a safe no-op.
+            again = await tm.abort_transfer(job.id)
+            assert again.status == "aborted"
+        finally:
+            stop.set()
+            await driver
+
+        with pytest.raises(TransferError) as excinfo:
+            await tm.abort_transfer("no-such-job")
+        assert excinfo.value.status_code == 404

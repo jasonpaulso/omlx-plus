@@ -57,6 +57,13 @@ logger = logging.getLogger(__name__)
 
 # D2: give up after this many consecutive failed/no-progress rounds.
 ROUND_CAP = 3
+# S5 P2/D4: the step number a head-initiated TRANSFER_ABORT always uses.
+# `WorkerCommandExecutor.MAX_STEPS_PER_JOB` (manager.py) is 4096; this sits
+# right at that ceiling (still accepted -- the worker only rejects a step
+# strictly greater) and no round or start command will ever reach it, so it
+# never collides with -- and is never treated as a replay of -- a real
+# round step.
+ABORT_STEP = 4096
 # D1b/CL5-16: wall-clock deadline for one round + the daemon-side watchdog
 # that kills a session past it, releasing the gate in `finally`.
 ROUND_DEADLINE_S = 1800.0
@@ -168,6 +175,13 @@ class _JobRuntime:
     # (`_build_ips`), since a round session must ring-connect over the data
     # plane, never the join/heartbeat address.
     worker_data_plane_address: str = ""
+    # S5 P2 completion: a RESULT (have/round_done/round_error/done/error)
+    # that arrives before `_await_round_result` has registered a future for
+    # its step -- an owned round task on the worker can complete faster
+    # than the head's own coroutine resumes past its ack await -- is
+    # buffered here instead of being dropped. `_await_round_result` checks
+    # this first.
+    pending_results: dict[int, dict[str, Any]] = field(default_factory=dict)
 
 
 class TransferManager:
@@ -212,7 +226,55 @@ class TransferManager:
                 with contextlib.suppress(asyncio.CancelledError):
                     await runtime.task
 
+    # ---- abort (D4/P2: completes the abort mechanism P1 left unwired) -----
+
+    async def abort_transfer(self, job_id: str) -> TransferJob:
+        """Cancel an in-flight job: stop the head's own owned task first
+        (so nothing else races a fresh command onto the single-occupancy
+        member slot -- D1b), THEN publish `TRANSFER_ABORT` so the worker
+        cancels its owned task and discards staging. Idempotent: a job
+        already terminal is a no-op that just returns its current record.
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise TransferError(404, f"unknown transfer job {job_id!r}")
+        if job.status in ("done", "error", "aborted"):
+            return job
+        runtime = self._runtime.get(job_id)
+        if runtime is not None and runtime.task is not None and not runtime.task.done():
+            runtime.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await runtime.task
+        # `_drive`'s own CancelledError handler already finished the job and
+        # released the gate (above); still tell the worker so its owned
+        # task/staging are cleaned up -- a head-side cancel is purely local.
+        member = self._manager.state.member(job.member_id)
+        if member is not None:
+            wire = command_to_wire(
+                TransferAbortCommand(
+                    schema_version=PROTOCOL_VERSION, job_id=job_id, step=ABORT_STEP
+                )
+            )
+            with contextlib.suppress(Exception):
+                await self._send_and_ack(member, wire, timeout=10.0)
+        self._finish(job_id, "aborted")
+        self._manager.release_operation_gate("transfer", job_id)
+        return self._jobs[job_id]
+
     # ---- worker transfer updates (D1b) -------------------------------------
+
+    # S5 P2 completion (P1 routing defect, fixed here): the ONLY statuses a
+    # command's own direct ack ever carries -- everything else is a RESULT
+    # (an asynchronous report from the owned task, possibly sharing its
+    # step number with the command that started it -- `_scan_have`'s
+    # "have" report rides the TRANSFER_START step). The split has to be on
+    # STATUS, never on step: a redelivered/stale "accepted" ack for a round
+    # step (CL2-06 idempotent redelivery, re-emitted after the head already
+    # popped its ack future) must never fall through and be mistaken for
+    # that round's real "have"/"round_done" result -- that misroute is what
+    # produced a bogus empty `have` and an extra, rejected round in
+    # practice.
+    _ACK_STATUSES = frozenset({"accepted", "rejected", "aborted"})
 
     def record_transfer_updates(
         self, member: Member, updates: list[dict[str, Any]]
@@ -220,8 +282,11 @@ class TransferManager:
         """Resolve acks and accumulate progress from a member's
         AUTHENTICATED transfer updates. NOT the same as an ack future
         resolving alone -- ``have``/``round_done``/``error`` reports are
-        routed to whichever round future is awaiting them, and every update
-        is also folded into the job's accumulated ``updates``.
+        routed to whichever round future is awaiting them (or buffered on
+        the runtime if none is registered yet -- a fast owned task can
+        report before the head's own coroutine resumes far enough to
+        register one), and every update also refreshes the job's
+        ``updated_at``.
         """
         for update in updates:
             if not isinstance(update, dict):
@@ -232,16 +297,23 @@ class TransferManager:
             job = self._jobs.get(job_id)
             if job is not None:
                 self._jobs[job_id] = replace(job, updated_at=time.time())
+            status = str(update.get("status") or "")
             key = (job_id, step)
-            ack_future = self._acks.get(key)
-            if ack_future is not None and not ack_future.done():
-                ack_future.set_result(update)
+            if status in self._ACK_STATUSES:
+                ack_future = self._acks.get(key)
+                if ack_future is not None and not ack_future.done():
+                    ack_future.set_result(update)
+                # A stale/redelivered ack with no live future is correctly
+                # dropped -- it must NEVER be treated as a round result.
                 continue
             runtime = self._runtime.get(job_id)
-            if runtime is not None:
-                round_future = runtime.round_updates.get(step)
-                if round_future is not None and not round_future.done():
-                    round_future.set_result(update)
+            if runtime is None:
+                continue
+            round_future = runtime.round_updates.get(step)
+            if round_future is not None and not round_future.done():
+                round_future.set_result(update)
+            else:
+                runtime.pending_results[step] = update
 
     # ---- job creation (E6 queue, D4 gate) ----------------------------------
 
@@ -347,7 +419,16 @@ class TransferManager:
             if source == "hf":
                 await self._drive_hf(job_id, member)
             else:
-                await self._drive_rounds(job_id, member)
+                # D2: the START step's own worker-side have-scan (`_scan_have`)
+                # IS the diff authority's starting point -- seed round 1 from
+                # it rather than always requesting the full manifest (which
+                # would silently defeat resume: a re-issued job's already-
+                # digest-verified files would be re-requested and re-written
+                # every time). Bounded + falls back to an empty seed on
+                # timeout/failure -- that degrades to today's (correct, just
+                # wasteful) behavior rather than blocking the job.
+                initial_have = await self._await_initial_have(job_id)
+                await self._drive_rounds(job_id, member, initial_have=initial_have)
         except asyncio.CancelledError:
             self._finish(job_id, "aborted")
             raise
@@ -408,6 +489,13 @@ class TransferManager:
         self, job_id: str, step: int, *, timeout: float
     ) -> dict[str, Any] | None:
         runtime = self._runtime[job_id]
+        # A fast owned task can report before this coroutine even gets here
+        # (e.g. a round that completes between the ack resolving and this
+        # call) -- `record_transfer_updates` buffers that case rather than
+        # dropping it; check for it before waiting on a fresh future.
+        buffered = runtime.pending_results.pop(step, None)
+        if buffered is not None:
+            return buffered
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         runtime.round_updates[step] = future
@@ -418,7 +506,22 @@ class TransferManager:
         finally:
             runtime.round_updates.pop(step, None)
 
-    async def _drive_rounds(self, job_id: str, member: Member) -> None:
+    async def _await_initial_have(self, job_id: str) -> set[str]:
+        """D2: await the START step's own "have" report (`_scan_have`,
+        step=1) -- the worker's fresh digest-verified scan of its final
+        dir, and the diff authority's actual starting point. Falls back to
+        an empty seed (today's pre-fix behavior: correct, just wasteful --
+        round 1 requests the full manifest) on timeout or any non-"have"
+        result, never blocking or failing the job over this.
+        """
+        result = await self._await_round_result(job_id, 1, timeout=300.0)
+        if result is None or result.get("status") != "have":
+            return set()
+        return set(result.get("have") or [])
+
+    async def _drive_rounds(
+        self, job_id: str, member: Member, *, initial_have: set[str] | None = None
+    ) -> None:
         job = self._jobs[job_id]
         manifest_by_path = {entry.relative_path: entry for entry in job.manifest}
         peers = self._round_peers(job_id)
@@ -430,7 +533,11 @@ class TransferManager:
                 "a round session",
             )
             return
-        have: set[str] = set()
+        have: set[str] = set(initial_have or ()) & set(manifest_by_path)
+        if have:
+            self._jobs[job_id] = replace(
+                self._jobs[job_id], have=tuple(sorted(have)), updated_at=time.time()
+            )
         step = 1
         stalled = 0
         while have != set(manifest_by_path):

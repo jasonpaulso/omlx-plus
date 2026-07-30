@@ -3097,6 +3097,8 @@ async def get_cluster(is_operator: bool = Depends(_require_cluster_operator)):
 class ClusterModelLoadBody(BaseModel):
     model: str
     prefer: Literal["auto", "local", "distributed"] = "distributed"
+    # S5 D6: mirrors DistributedModelRequest.source (cluster/routes.py).
+    source: Literal["peer", "hf"] | None = None
 
 
 class ClusterModelUnloadBody(BaseModel):
@@ -3117,7 +3119,9 @@ async def admin_cluster_models_load(
     if manager is None:
         raise HTTPException(status_code=404, detail="Not Found")
     try:
-        return await manager.load_distributed(body.model, prefer=body.prefer)
+        return await manager.load_distributed(
+            body.model, prefer=body.prefer, source=body.source
+        )
     except ClusterError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 

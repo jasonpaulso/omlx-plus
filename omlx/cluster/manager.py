@@ -25,7 +25,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from .formation import FormationManager
@@ -1013,7 +1013,11 @@ class ClusterManager:
     # ---- distributed formation (D8) --------------------------------------
 
     async def load_distributed(
-        self, model_id: str, *, prefer: str = "distributed"
+        self,
+        model_id: str,
+        *,
+        prefer: str = "distributed",
+        source: Literal["peer", "hf"] | None = None,
     ) -> dict[str, Any]:
         """Stand a tensor-parallel model up across the pair (head only).
 
@@ -1022,6 +1026,13 @@ class ClusterManager:
         so this only validates the request and hands off to
         `EnginePool.load_cluster_model` rather than calling
         `FormationManager.load` directly.
+
+        S5 D6: `source` ("peer"/"hf") is this explicit operator surface's
+        own choice when the worker lacks the model and a presence-
+        resolution transfer is needed; `allow_source_choice=True` here (and
+        only here -- never from `get_engine`'s implicit on-demand path)
+        lets an ambiguous case (both sources viable, no `source` given)
+        answer with a `choice_required` reply instead of guessing.
         """
         if self._formation is None:
             raise ClusterError(
@@ -1032,7 +1043,9 @@ class ClusterManager:
         pool = get_engine_pool()
         if pool is None:
             raise ClusterError(503, "the engine pool is not available")
-        result: dict[str, Any] = await pool.load_cluster_model(model_id, prefer)
+        result: dict[str, Any] = await pool.load_cluster_model(
+            model_id, prefer, source=source, allow_source_choice=True
+        )
         return result
 
     async def unload_distributed(self, model_id: str) -> dict[str, Any]:
@@ -1051,12 +1064,26 @@ class ClusterManager:
         return result
 
     def formation_status(self) -> dict[str, Any]:
-        """Read-only formation/job state (head only)."""
+        """Read-only formation/job state (head only).
+
+        S5 P2: carries a sibling `transfer` field (summarized TransferJob
+        rows -- D5's presence-resolution pre-step and any operator-driven
+        transfer) alongside formation's own `jobs`, so a caller reads both
+        surfaces from the one status endpoint.
+        """
         if self._formation is None:
             raise ClusterError(
                 404, "distributed formation is only available on the head"
             )
-        return self._formation.snapshot()
+        snap = self._formation.snapshot()
+        if self._transfer is not None:
+            snap["transfer"] = {
+                "jobs": [
+                    _transfer_job_summary(job)
+                    for job in self._transfer.snapshot()["jobs"]
+                ]
+            }
+        return snap
 
     async def scrub(self) -> list[str]:
         """Mark members past the timeout as lost. Never revokes a credential.
@@ -1209,6 +1236,15 @@ class ClusterManager:
             snapshot["local"] = self.local_status()
         if self._formation is not None:
             snapshot["formation"] = self._formation.snapshot()
+        if self._transfer is not None:
+            # S5 P2: sibling of "formation" (dashboard/CLI read both from
+            # this one snapshot poll -- D6's compose-not-duplicate letter).
+            snapshot["transfer"] = {
+                "jobs": [
+                    _transfer_job_summary(job)
+                    for job in self._transfer.snapshot()["jobs"]
+                ]
+            }
         return snapshot
 
     # ---- internals -------------------------------------------------------
@@ -1364,6 +1400,30 @@ def _bound_transfer_updates(
                 ):
                     return None
     return raw
+
+
+# S5 P2: a status-surface summary of one TransferJob. Deliberately drops the
+# full `manifest`/`have` arrays (those can be tens of thousands of entries
+# for a large model) down to counts -- both `/v1/cluster/models/status` and
+# the admin dashboard's 5s snapshot poll only need progress, not the whole
+# file-list payload.
+def _transfer_job_summary(job_dict: dict[str, Any]) -> dict[str, Any]:
+    manifest = job_dict.get("manifest") or []
+    have = job_dict.get("have") or []
+    return {
+        "id": job_dict.get("id"),
+        "kind": job_dict.get("kind"),
+        "status": job_dict.get("status"),
+        "model_id": job_dict.get("model_id"),
+        "member_id": job_dict.get("member_id"),
+        "source": job_dict.get("source"),
+        "created_at": job_dict.get("created_at"),
+        "updated_at": job_dict.get("updated_at"),
+        "rounds_completed": job_dict.get("rounds_completed"),
+        "error": job_dict.get("error"),
+        "files_total": len(manifest),
+        "files_verified": len(have),
+    }
 
 
 def _bounded_interval(value: Any, *, default: float) -> float:

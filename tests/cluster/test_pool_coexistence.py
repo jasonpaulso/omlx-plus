@@ -97,7 +97,12 @@ def _formation(manager, spawns=None, *, load_delay: float = 0.0):
     return fm
 
 
-async def _activate_member(manager, *, memory_ceiling: int = _WORKER_CEILING):
+async def _activate_member(
+    manager,
+    *,
+    memory_ceiling: int = _WORKER_CEILING,
+    models_present: dict[str, int] | None = None,
+):
     reply = await manager.join(
         peer_host="10.1.2.3",
         port=40404,
@@ -113,7 +118,15 @@ async def _activate_member(manager, *, memory_ceiling: int = _WORKER_CEILING):
         node_state={
             "total_memory": memory_ceiling * 2,
             "memory_ceiling": memory_ceiling,
-            "models_present": {},
+            # S5 D5: `PlacementDecision.presence` (advisory node_state,
+            # S4 D1) now GATES the pre-step -- an absent-per-inventory
+            # worker triggers a transfer job. This file's fake worker
+            # answers formation's own (authoritative) PresenceCommand
+            # check with `present=True`, so it genuinely "has" the target
+            # model; report that here too, or every formation-only test
+            # in this file spuriously trips S5's transfer path against a
+            # TransferManager nothing here drives (P2 finding).
+            "models_present": models_present or {"target": _MODEL_BYTES},
         },
     )
     return member

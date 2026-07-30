@@ -79,6 +79,10 @@ class DistributedModelRequest(BaseModel):
     # formation; exposing the knob lets a caller force `local`/`auto` too
     # rather than only ever attempting distributed.
     prefer: Literal["auto", "local", "distributed"] = "distributed"
+    # S5 D6: only meaningful for `load` -- which source resolves a worker
+    # absent the model. None lets the pool auto-pick (or, when both peer
+    # and HF are viable, answer with `choice_required`).
+    source: Literal["peer", "hf"] | None = None
 
 
 def _manager() -> ClusterManager:
@@ -155,9 +159,17 @@ async def remove_member(member_id: str) -> dict[str, Any]:
 
 @_operator_router.post("/models/load")
 async def load_distributed_model(body: DistributedModelRequest) -> dict[str, Any]:
-    """Stand a tensor-parallel model up across the pair (head, operator tier)."""
+    """Stand a tensor-parallel model up across the pair (head, operator tier).
+
+    S5 D6: when the worker lacks the model and both a peer transfer and an
+    HF fan-out are viable, an omitted `source` gets a typed
+    `choice_required` reply (still HTTP 200 -- it is a normal, expected
+    outcome, not an error) instead of the load silently guessing.
+    """
     try:
-        return await _manager().load_distributed(body.model, prefer=body.prefer)
+        return await _manager().load_distributed(
+            body.model, prefer=body.prefer, source=body.source
+        )
     except ClusterError as exc:
         raise _http_error(exc) from exc
 

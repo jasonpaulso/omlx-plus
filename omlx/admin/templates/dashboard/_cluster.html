@@ -108,6 +108,45 @@
             </div>
         </template>
 
+        <!-- S5 P2: transfer progress rows -- a sibling of the formation
+             jobs table above, composed from the same 5s snapshot poll. -->
+        <template x-if="cluster && cluster.transfer && cluster.transfer.jobs && cluster.transfer.jobs.length">
+            <div class="mt-6">
+                <h3 class="text-sm font-bold text-neutral-700 mb-2">Model transfers</h3>
+                <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="bg-neutral-50 text-xs uppercase tracking-widest text-neutral-400">
+                                <tr>
+                                    <th class="text-left font-bold px-5 py-3">Job</th>
+                                    <th class="text-left font-bold px-5 py-3">Model</th>
+                                    <th class="text-left font-bold px-5 py-3">Source</th>
+                                    <th class="text-left font-bold px-5 py-3">Status</th>
+                                    <th class="text-left font-bold px-5 py-3">Files</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <template x-for="t in cluster.transfer.jobs" :key="t.id">
+                                    <tr class="border-t border-neutral-100">
+                                        <td class="px-5 py-3 font-mono text-xs text-neutral-500" x-text="t.id"></td>
+                                        <td class="px-5 py-3 font-mono text-xs text-neutral-600" x-text="t.model_id"></td>
+                                        <td class="px-5 py-3 text-neutral-600" x-text="t.source"></td>
+                                        <td class="px-5 py-3">
+                                            <span class="px-2 py-0.5 text-xs font-medium rounded-md"
+                                                  :class="t.status === 'done' ? 'bg-green-100 text-green-700' : (t.status === 'error' || t.status === 'aborted' ? 'bg-red-100 text-red-700' : 'bg-neutral-100 text-neutral-600')"
+                                                  x-text="t.status"></span>
+                                        </td>
+                                        <td class="px-5 py-3 text-xs text-neutral-500"
+                                            x-text="`${t.files_verified}/${t.files_total}`"></td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </template>
+
         <!-- S4 D6: placement preview + load/unload. Thin proxies to the
              same handlers the /v1/cluster/* API calls -- POST-only
              mutations (CL-12). -->
@@ -132,6 +171,15 @@
                             <option value="auto">auto</option>
                             <option value="local">local</option>
                             <option value="distributed">distributed</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-neutral-500 mb-1">Source</label>
+                        <select x-model="loadSource"
+                                class="text-sm border border-neutral-200 rounded-lg px-2 py-1.5">
+                            <option value="">auto</option>
+                            <option value="peer">peer</option>
+                            <option value="hf">hf</option>
                         </select>
                     </div>
                     <button type="button" @click="previewPlacement()"
@@ -205,6 +253,7 @@
             placementPrefer: 'auto',
             placementDecision: null,
             placementError: '',
+            loadSource: '',
             async init() {
                 // Poll only once the endpoint has answered. With no cluster
                 // role the endpoint 404s, and a standing interval would write
@@ -269,14 +318,22 @@
                 this.placementError = '';
                 if (!this.placementModel) return;
                 try {
+                    const body = { model: this.placementModel, prefer: this.placementPrefer === 'auto' ? 'distributed' : this.placementPrefer };
+                    if (this.loadSource) body.source = this.loadSource;
                     const resp = await fetch('/admin/api/cluster/models/load', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ model: this.placementModel, prefer: this.placementPrefer === 'auto' ? 'distributed' : this.placementPrefer }),
+                        body: JSON.stringify(body),
                     });
                     const data = await resp.json();
                     if (!resp.ok) {
                         this.placementError = data.detail || 'Load failed';
+                        return;
+                    }
+                    if (data.status === 'choice_required') {
+                        // S5 D6: both a peer transfer and an HF fan-out are
+                        // viable -- pick a Source above and click Load again.
+                        this.placementError = `Model ${this.placementModel} is viable via both a peer transfer and an HF fan-out -- pick a Source above and click Load again.`;
                         return;
                     }
                     await this.refresh();
