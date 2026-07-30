@@ -53,6 +53,11 @@ class NodeCapacity:
     memory_ceiling: int
     current_model_memory: int
     models_present: dict[str, int] = field(default_factory=dict)
+    # S4 P3 rig defect #3: bytes of currently-loaded, non-pinned, not-in-use
+    # local entries that eviction could reclaim before this node's fit is
+    # judged -- the same eligibility `EnginePool._find_lru_victim` uses.
+    # Workers stay 0 (their inventory isn't pool-tracked).
+    evictable_memory: int = 0
 
     @property
     def capacity_known(self) -> bool:
@@ -65,19 +70,33 @@ class NodeCapacity:
             "memory_ceiling": self.memory_ceiling,
             "current_model_memory": self.current_model_memory,
             "models_present": dict(self.models_present),
+            "evictable_memory": self.evictable_memory,
         }
 
 
 @dataclass(frozen=True)
 class NodeFit:
-    """Whether one node can hold its share of a candidate placement."""
+    """Whether one node can hold its share of a candidate placement.
+
+    ``ok`` credits ``evictable_memory`` against ``projected`` (S4 P3 rig
+    defect #3); ``requires_eviction`` is True whenever the *raw* projected
+    total (before that credit) exceeds ``ceiling`` -- "this node only fits
+    via eviction", regardless of whether enough was actually evictable to
+    make ``ok`` True.
+    """
 
     ceiling: int
     projected: int
     ok: bool
+    requires_eviction: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {"ceiling": self.ceiling, "projected": self.projected, "ok": self.ok}
+        return {
+            "ceiling": self.ceiling,
+            "projected": self.projected,
+            "ok": self.ok,
+            "requires_eviction": self.requires_eviction,
+        }
 
 
 @dataclass(frozen=True)
@@ -117,6 +136,7 @@ class PlacementDecision:
                     ceiling=int(fit["ceiling"]),
                     projected=int(fit["projected"]),
                     ok=bool(fit["ok"]),
+                    requires_eviction=bool(fit.get("requires_eviction", False)),
                 )
                 for node_id, fit in (data.get("fits") or {}).items()
             },
@@ -131,9 +151,17 @@ class PlacementDecision:
 
 def _local_fit(head: NodeCapacity, est_size: int) -> dict[str, NodeFit]:
     projected = head.current_model_memory + est_size
-    ok = head.capacity_known and projected <= head.memory_ceiling
+    ok = head.capacity_known and (
+        projected - head.evictable_memory <= head.memory_ceiling
+    )
+    requires_eviction = projected > head.memory_ceiling
     return {
-        head.node_id: NodeFit(ceiling=head.memory_ceiling, projected=projected, ok=ok)
+        head.node_id: NodeFit(
+            ceiling=head.memory_ceiling,
+            projected=projected,
+            ok=ok,
+            requires_eviction=requires_eviction,
+        )
     }
 
 
@@ -170,16 +198,16 @@ def plan_placement(
     eligible = model_type in _ELIGIBLE_MODEL_TYPES
 
     def local_decision(reasons: list[str]) -> PlacementDecision:
-        requires_eviction = head.current_model_memory + est_size > head.memory_ceiling
+        fits = _local_fit(head, est_size)
         return PlacementDecision(
             mode="local",
             world_size=1,
             per_rank_estimate=est_size,
             reasons=tuple(reasons),
-            fits=_local_fit(head, est_size),
+            fits=fits,
             presence=presence,
             divisible=True,
-            requires_eviction=requires_eviction,
+            requires_eviction=fits[head.node_id].requires_eviction,
         )
 
     if prefer == "local":
@@ -258,9 +286,17 @@ def plan_placement(
     all_fit = True
     for node in nodes:
         projected = node.current_model_memory + per_rank_estimate
-        ok = node.capacity_known and projected <= node.memory_ceiling
+        # S4 P3 rig defect #3: the head-side per-rank fit gets the same
+        # eviction credit as the local rule-1 fit (`_local_fit`) -- workers'
+        # `evictable_memory` is always 0, so this is a no-op for them.
+        ok = node.capacity_known and (
+            projected - node.evictable_memory <= node.memory_ceiling
+        )
         fits[node.node_id] = NodeFit(
-            ceiling=node.memory_ceiling, projected=projected, ok=ok
+            ceiling=node.memory_ceiling,
+            projected=projected,
+            ok=ok,
+            requires_eviction=projected > node.memory_ceiling,
         )
         if not ok:
             all_fit = False
@@ -280,7 +316,11 @@ def plan_placement(
             fits=fits,
             presence=presence,
             divisible=True,
-            requires_eviction=False,
+            # S4 P3 rig defect #3: this decision only fits because the
+            # head's per-rank fit above credited evictable local memory --
+            # the caller (EnginePool) must actually free it before
+            # submitting formation.
+            requires_eviction=fits[head.node_id].requires_eviction,
         )
 
     return PlacementDecision(

@@ -62,6 +62,26 @@ class TestLocalRule:
         decision = _plan(est_size=50, head=head)
         assert decision.mode == "local"
         assert decision.requires_eviction is True
+        # Nothing evictable on this head (e.g. the resident memory is
+        # pinned) -- the fit itself stays not-ok even though eviction
+        # would be needed to fix it.
+        assert decision.fits["head"].ok is False
+
+    def test_fits_local_with_eviction_credits_evictable_memory(self):
+        """S4 P3 rig defect #3: an evictable (non-pinned, idle, local)
+        resident on the head makes the fit `ok` once credited, even though
+        the raw projected total still exceeds the ceiling."""
+        head = NodeCapacity(
+            node_id="head",
+            memory_ceiling=100,
+            current_model_memory=60,
+            evictable_memory=60,
+            models_present={},
+        )
+        decision = _plan(est_size=50, head=head, prefer="local")
+        assert decision.mode == "local"
+        assert decision.requires_eviction is True
+        assert decision.fits["head"].ok is True
 
     def test_prefer_local_short_circuits_even_when_it_does_not_fit(self):
         decision = _plan(est_size=1000, prefer="local")
@@ -103,6 +123,46 @@ class TestDistributedRule:
         assert decision.mode == "distributed"
         assert decision.presence["w1"] is False
         assert any("absent on w1" in r for r in decision.reasons)
+
+    def test_distributed_fit_with_evictable_local_resident_needs_eviction(self):
+        """S4 P3 rig defect #3: the head-side per-rank fit in the
+        distributed branch gets the same eviction credit as the local
+        rule-1 fit. Without it, a distributed reload that only needs the
+        pool to LRU-evict a non-pinned local model reads as a flat reject.
+        """
+        head = NodeCapacity(
+            node_id="head",
+            memory_ceiling=100,
+            current_model_memory=90,
+            evictable_memory=90,
+            models_present={"m": 100},
+        )
+        decision = _plan(est_size=150, head=head)
+        assert decision.mode == "distributed"
+        assert decision.requires_eviction is True
+        head_fit = decision.fits["head"]
+        assert head_fit.ok is True
+        assert head_fit.requires_eviction is True
+        # Uncredited: the worker side is untouched by the head's eviction.
+        assert decision.fits["w1"].requires_eviction is False
+
+    def test_distributed_rejects_when_head_resident_is_pinned_not_evictable(self):
+        """Same shape as above, but the head's resident memory isn't
+        evictable (e.g. pinned) -- still a genuine reject, not silently
+        admitted."""
+        head = NodeCapacity(
+            node_id="head",
+            memory_ceiling=100,
+            current_model_memory=90,
+            evictable_memory=0,
+            models_present={"m": 100},
+        )
+        decision = _plan(est_size=150, head=head)
+        assert decision.mode == "reject"
+        head_fit = decision.fits["head"]
+        assert head_fit.ok is False
+        assert head_fit.requires_eviction is True
+        assert any("fit" in r for r in decision.reasons)
 
 
 class TestNoMembers:
@@ -170,7 +230,12 @@ class TestDecisionRoundTrip:
 
     def test_node_fit_and_decision_to_dict_shape(self):
         fit = NodeFit(ceiling=10, projected=5, ok=True)
-        assert fit.to_dict() == {"ceiling": 10, "projected": 5, "ok": True}
+        assert fit.to_dict() == {
+            "ceiling": 10,
+            "projected": 5,
+            "ok": True,
+            "requires_eviction": False,
+        }
 
 
 class TestResolvePlacementInputs:

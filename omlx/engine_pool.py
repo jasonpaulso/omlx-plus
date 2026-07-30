@@ -343,7 +343,30 @@ class EnginePool:
             memory_ceiling=max(0, ceiling),
             current_model_memory=self._current_model_memory,
             models_present=models_present,
+            evictable_memory=self._evictable_local_memory(),
         )
+
+    def _evictable_local_memory(self) -> int:
+        """Bytes `plan_placement` may credit toward a head fit (S4 P3 rig
+        defect #3): sum of `estimated_size` over entries `_find_lru_victim`
+        would consider (`include_cluster=False`) -- loaded, non-pinned, not
+        in use, no active requests, `kind == "local"`. Same filter, kept in
+        sync deliberately rather than deriving one from the other, since
+        `_find_lru_victim` needs the single oldest candidate and this needs
+        the total.
+        """
+        total = 0
+        for e in self._entries.values():
+            if e.engine is None or e.is_pinned:
+                continue
+            if e.kind == "cluster":
+                continue
+            if e.in_use > 0:
+                continue
+            if self._entry_has_active_requests(e):
+                continue
+            total += e.estimated_size
+        return total
 
     def _admission_soft_target(self) -> int:
         """Soft watermark that pre-load eviction targets (#2319).
@@ -1256,10 +1279,56 @@ class EnginePool:
         rechecked, under the lock, with no I/O. Divisibility and worker fit
         do not change between the attempt that computed the decision and
         the attempt that acts on it, so they are not re-derived.
+
+        S4 P3 rig defect #3: eviction-aware, matching `plan_placement`'s own
+        head-fit formula -- a decision that was `ok` only via
+        `evictable_memory` must not read as stale here just because that
+        memory hasn't actually been freed yet (`_evict_for_cluster_claim_
+        locked` does that next, before formation submit).
         """
         head = self.head_capacity()
         projected = head.current_model_memory + decision.per_rank_estimate
-        return head.capacity_known and projected <= head.memory_ceiling
+        return head.capacity_known and (
+            projected - head.evictable_memory <= head.memory_ceiling
+        )
+
+    async def _evict_for_cluster_claim_locked(
+        self, decision: PlacementDecision
+    ) -> None:
+        """Caller holds `self._lock`, called immediately after claiming a
+        distributed entry (S4 P3 rig defect #3). `requires_eviction` means
+        the decision's head-side fit only holds after crediting
+        `head_capacity().evictable_memory` -- that credit is informational
+        until the local victim(s) it counted are actually unloaded, so free
+        that memory for real before formation submit allocates the rank-0
+        shard.
+
+        Local victims only: S4 D5's single-active-formation invariant means
+        no other formation can be resident while this claim is in flight,
+        so `_find_lru_victim(include_cluster=False)` should never surface a
+        cluster entry here -- asserted rather than silently trusted. Uses
+        the existing admission-eviction primitives (`_find_lru_victim` +
+        `_unload_engine`), the same synchronous-under-lock path admission
+        eviction already uses for local victims.
+        """
+        if not decision.requires_eviction:
+            return
+        ceiling = self.head_capacity().memory_ceiling
+        while self._current_model_memory + decision.per_rank_estimate > ceiling:
+            victim = self._find_lru_victim(include_cluster=False)
+            if victim is None:
+                # Nothing left to evict; formation submit proceeds anyway --
+                # the same best-effort posture the pre-fix distributed path
+                # always had, just no longer skipping eviction altogether.
+                return
+            assert self._entries[victim].kind == "local"
+            logger.info(
+                "Evicting '%s' to free head share for a distributed claim "
+                "needing eviction (per-rank %s)",
+                victim,
+                format_size(decision.per_rank_estimate),
+            )
+            await self._unload_engine(victim)
 
     def _rollback_cluster_entry_locked(self, model_id: str) -> None:
         """Caller holds `self._lock`. Undo a claim that never reached bind
@@ -1371,6 +1440,7 @@ class EnginePool:
                         "; ".join(decision.reasons) or "placement rejected",
                     )
                 self._claim_cluster_entry_locked(entry, decision)
+                await self._evict_for_cluster_claim_locked(decision)
         else:
             async with self._lock:
                 entry = self._entries.get(model_id)
@@ -1389,6 +1459,7 @@ class EnginePool:
                 if not self._revalidate_cluster_decision_locked(entry, decision):
                     raise PlacementStaleError(model_id)
                 self._claim_cluster_entry_locked(entry, decision)
+                await self._evict_for_cluster_claim_locked(decision)
 
         # (b) outside the lock: submit + await the formation job.
         try:

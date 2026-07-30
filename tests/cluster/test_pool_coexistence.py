@@ -1212,6 +1212,101 @@ async def test_fallback_admission_ceiling_also_credits_resident_head_share(
         assert target.engine is not None
 
 
+# ---- S4 P3 rig defect #3: eviction-unaware distributed head fit ------------
+#
+# `plan_placement`'s distributed branch compared the head's per-rank
+# projection against the raw ceiling with no eviction awareness, while the
+# local branch already had `requires_eviction` semantics. A distributed
+# reload that only needs the pool to LRU-evict a non-pinned local model was
+# rejected outright, and `get_engine` treats `mode="reject"` as terminal
+# (rig: 57.4GB non-pinned Qwen + 0.73GB pinned Llama resident, `MiniMax`
+# distributed preview came back `reject, requires_eviction=False` even
+# though evicting Qwen made it fit trivially). `placement.py`'s fix makes
+# both the local rule-1 fit and the distributed rule-2 head-side fit credit
+# `NodeCapacity.evictable_memory`; these rows exercise the pool actually
+# acting on that credit -- freeing the memory for real before formation
+# submit, not just reporting `ok=True` on paper.
+
+
+async def test_plain_load_evicts_resident_local_model_to_fit_distributed(
+    tmp_path, monkeypatch
+):
+    """The rig repro. A non-pinned local model resident on the head pushes
+    "target"'s per-rank projection over the head ceiling; evicting it makes
+    the distributed fit succeed. Must FAIL against 80725884 (recorded
+    pre-fix): the eviction-unaware per-rank fit reads this as a flat
+    reject and `get_engine` raises `InsufficientMemoryError` instead of
+    forming "target" -- in one plain `get_engine` call, no explicit
+    `load_cluster_model` needed.
+    """
+    _pin_live_memory_readings_to_zero(monkeypatch)
+    async with harness(tmp_path) as h:
+        _add_small_local_model(
+            tmp_path, h.pool, model_id="small", model_bytes=2_000_000
+        )
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await h.pool.get_engine("small")
+        assert h.pool.get_entry("small").engine is mock_engine
+
+        # "small"'s estimated size (2_100_000) plus target's per-rank
+        # estimate (_PER_RANK_ESTIMATE == 6_037_500) is 8_137_500, over the
+        # 7_000_000 head ceiling -- fits only once "small" is credited as
+        # evictable and then actually evicted.
+        engine = await h.pool.get_engine("target")
+
+        assert engine is not None
+        target = h.pool.get_entry("target")
+        assert target.kind == "cluster"
+        assert target.engine is not None
+        assert target.cluster_head_share == _PER_RANK_ESTIMATE
+        # The evictable local resident was actually freed, not just
+        # credited on paper.
+        assert h.pool.get_entry("small").engine is None
+
+
+async def test_pinned_local_resident_over_ceiling_stays_a_clean_reject(
+    tmp_path, monkeypatch
+):
+    """Sibling row: the fix must not paper over a genuine shortage. A
+    pinned local resident is never evictable (`_evictable_local_memory`
+    excludes it, same as `_find_lru_victim`), so the same "too big even
+    with the resident credited" shape stays a clean reject -- the pinned
+    model survives untouched and nothing is evicted.
+    """
+    _pin_live_memory_readings_to_zero(monkeypatch)
+    async with harness(tmp_path) as h:
+        _add_small_local_model(
+            tmp_path, h.pool, model_id="small", model_bytes=2_000_000
+        )
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            await h.pool.get_engine("small")
+        h.pool.get_entry("small").is_pinned = True
+
+        real_unload_engine = h.pool._unload_engine
+        unload_calls: list[str] = []
+
+        async def _spy_unload_engine(model_id):
+            unload_calls.append(model_id)
+            return await real_unload_engine(model_id)
+
+        monkeypatch.setattr(h.pool, "_unload_engine", _spy_unload_engine)
+
+        with pytest.raises(InsufficientMemoryError):
+            await h.pool.get_engine("target")
+
+        assert unload_calls == []  # zero evictions attempted
+        small = h.pool.get_entry("small")
+        assert small.engine is mock_engine
+        assert small.is_pinned is True
+        assert h.pool.get_entry("target").kind == "local"  # never claimed
+
+
 # ---- S4 P3 rig defect #2: post-teardown settle wait -------------------------
 #
 # A formed cluster entry's rank-0 shard is wired in the rank *child* process,
