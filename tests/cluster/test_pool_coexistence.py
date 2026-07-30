@@ -31,7 +31,7 @@ from omlx.engine_pool import (
     EnginePool,
     PlacementStaleError,
 )
-from omlx.exceptions import ModelTooLargeError
+from omlx.exceptions import InsufficientMemoryError, ModelTooLargeError
 
 from .conftest import make_settings, running_manager
 
@@ -1210,3 +1210,198 @@ async def test_fallback_admission_ceiling_also_credits_resident_head_share(
         target = h.pool.get_entry("target")
         assert target.kind == "cluster"
         assert target.engine is not None
+
+
+# ---- S4 P3 rig defect #2: post-teardown settle wait -------------------------
+#
+# A formed cluster entry's rank-0 shard is wired in the rank *child* process,
+# not this one, so once the teardown driver kills it the shard's memory can
+# take real wall-clock seconds to become OS-reclaimable -- but the pool's own
+# `_current_model_memory` / head-share accounting already drops to zero the
+# instant `_teardown_cluster_entry` signals completion, under the lock.
+# Without a settle wait, `get_engine`'s very next retry re-reads the raw
+# admission ceiling immediately and can burn its bounded attempts inside that
+# un-settled window (rig: teardown completed cleanly, then the retry failed
+# with "only 45.96GB reclaimable" against a 46.85GB ceiling, while ~15s later
+# the same ceiling read 99.6GB). These rows use a controllable ceiling
+# (rather than the purely-resident-driven `_dynamic_ceiling` above) so the
+# "still collapsed after teardown" window can be held open deterministically
+# instead of racing real wall-clock recovery.
+
+
+def _controllable_ceiling(pool, *, full: int):
+    """A ceiling callback that collapses like `_dynamic_ceiling` while a
+    cluster entry is resident, but -- unlike `_dynamic_ceiling` -- stays
+    collapsed at that same value after the entry unforms until the test
+    explicitly calls `.recover()`. Models the OS-reclaim lag `_dynamic_
+    ceiling` doesn't: real teardown drops the pool's own accounting
+    synchronously, but the raw ceiling (derived from another process's
+    memory) lags behind.
+    """
+    state = {"last_resident": 0, "recovered": False}
+
+    def _cb() -> int:
+        resident = sum(
+            e.cluster_head_share or 0
+            for e in pool._entries.values()
+            if e.kind == "cluster" and e.engine is not None
+        )
+        if resident > 0:
+            state["last_resident"] = resident
+            state["recovered"] = False
+            return full - resident
+        if not state["recovered"]:
+            return full - state["last_resident"]
+        return full
+
+    _cb.recover = lambda: state.update(recovered=True)
+    return _cb
+
+
+async def test_cluster_victim_teardown_settle_wait_lets_retry_succeed(
+    tmp_path, monkeypatch
+):
+    """The rig repro: without the settle wait, the retry right after
+    teardown sees the still-collapsed ceiling and fails before the freed
+    memory would have become reclaimable. Must FAIL against c0be9205
+    (recorded pre-fix); passes once `_settle_after_cluster_teardown` polls
+    for the real recovery instead of retrying immediately.
+
+    The retry rejects via `plan_placement`'s own head-fit check (rule 1:
+    ``est_size <= head.memory_ceiling``) rather than
+    `_admit_and_load_locked`'s ceiling-refusal message the rig actually
+    hit -- both read the same corrected ceiling
+    (`head_capacity()`/`_admission_ceiling_fits` both add back
+    `_cluster_head_share_total()`), and `_settle_after_cluster_teardown`
+    runs upstream of `_get_engine_attempt` entirely, so the fix closes the
+    un-settled window for both call sites. This row pins the deterministic
+    one: once the ceiling fully recovers, `est_size` fits the head
+    directly and local admission is picked regardless of worker liveness.
+    """
+    _pin_live_memory_readings_to_zero(monkeypatch)
+    monkeypatch.setattr(
+        "omlx.engine_pool._CLUSTER_TEARDOWN_SETTLE_INTERVAL_S", 0.02, raising=False
+    )
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+
+        small_dir = tmp_path / "models" / "small"
+        small_dir.mkdir()
+        (small_dir / "config.json").write_text(json.dumps(_CONFIG))
+        (small_dir / "model.safetensors").write_bytes(b"0" * 1_000_000)
+        h.pool.discover_models(str(tmp_path / "models"))
+
+        ceiling_cb = _controllable_ceiling(h.pool, full=6_500_000)
+        h.pool._get_final_ceiling = ceiling_cb
+
+        async def _recover_after_delay():
+            await asyncio.sleep(0.08)
+            ceiling_cb.recover()
+
+        recover_task = asyncio.create_task(_recover_after_delay())
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            engine = await h.pool.get_engine("small")
+
+        await recover_task
+        assert engine is mock_engine
+        assert h.pool.get_entry("small").engine is not None
+        assert h.pool.get_entry("target").kind == "local"  # actually evicted
+
+
+async def test_cluster_victim_teardown_settle_wait_gives_up_on_no_recovery(
+    tmp_path, monkeypatch
+):
+    """A ceiling that never recovers must not hang the settle wait --
+    it gives up after its bounded timeout and the retry fails with today's
+    existing clear ceiling error instead of blocking forever.
+
+    Which of `_admit_and_load_locked`'s `ModelTooLargeError` or
+    `plan_placement`'s reject-branch `InsufficientMemoryError` actually
+    fires depends on whether the harness's worker heartbeat is still live
+    at retry time (`plan_placement` only reaches the per-rank-ceiling
+    reject path with a known worker; an expired heartbeat falls back to
+    the local-only decision instead) -- wall-clock-dependent and not the
+    thing this row is testing, so both are accepted.
+    """
+    _pin_live_memory_readings_to_zero(monkeypatch)
+    monkeypatch.setattr(
+        "omlx.engine_pool._CLUSTER_TEARDOWN_SETTLE_INTERVAL_S", 0.02, raising=False
+    )
+    monkeypatch.setattr(
+        "omlx.engine_pool._CLUSTER_TEARDOWN_SETTLE_TIMEOUT_S", 0.15, raising=False
+    )
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+
+        small_dir = tmp_path / "models" / "small"
+        small_dir.mkdir()
+        (small_dir / "config.json").write_text(json.dumps(_CONFIG))
+        (small_dir / "model.safetensors").write_bytes(b"0" * 1_000_000)
+        h.pool.discover_models(str(tmp_path / "models"))
+
+        # Drops out of the resident set on teardown but the raw ceiling
+        # never actually recovers -- `.recover()` is never called.
+        h.pool._get_final_ceiling = _controllable_ceiling(h.pool, full=6_500_000)
+
+        started = time.monotonic()
+        with pytest.raises((ModelTooLargeError, InsufficientMemoryError)) as excinfo:
+            await asyncio.wait_for(h.pool.get_engine("small"), timeout=2.0)
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.0  # bounded settle wait, no hang
+        assert "ceiling" in str(excinfo.value)
+
+
+async def test_settle_wait_after_cluster_teardown_never_holds_the_lock(
+    tmp_path, monkeypatch
+):
+    """The post-teardown settle wait polls and sleeps outside `self._lock`
+    -- other pool activity (a concurrent caller, the enforcer, admin
+    routes) must not be blocked while it waits for the admission ceiling
+    to recover.
+    """
+    _pin_live_memory_readings_to_zero(monkeypatch)
+    monkeypatch.setattr(
+        "omlx.engine_pool._CLUSTER_TEARDOWN_SETTLE_INTERVAL_S", 0.05, raising=False
+    )
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+
+        small_dir = tmp_path / "models" / "small"
+        small_dir.mkdir()
+        (small_dir / "config.json").write_text(json.dumps(_CONFIG))
+        (small_dir / "model.safetensors").write_bytes(b"0" * 1_000_000)
+        h.pool.discover_models(str(tmp_path / "models"))
+
+        ceiling_cb = _controllable_ceiling(h.pool, full=6_500_000)
+        h.pool._get_final_ceiling = ceiling_cb
+
+        probe_acquired = asyncio.Event()
+
+        async def _probe():
+            async with h.pool._lock:
+                probe_acquired.set()
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            get_engine_task = asyncio.create_task(h.pool.get_engine("small"))
+
+            # Let teardown complete and the settle loop start sleeping --
+            # the ceiling is still deliberately collapsed at this point.
+            await asyncio.sleep(0.15)
+            assert not get_engine_task.done()
+
+            probe_task = asyncio.create_task(_probe())
+            await asyncio.wait_for(probe_acquired.wait(), timeout=1.0)
+            await probe_task
+
+            ceiling_cb.recover()
+            engine = await asyncio.wait_for(get_engine_task, timeout=2.0)
+
+        assert engine is mock_engine
+        assert h.pool.get_entry("target").kind == "local"

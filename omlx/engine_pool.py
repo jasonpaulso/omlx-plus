@@ -146,6 +146,11 @@ _CLUSTER_UNLOAD_FALLBACK_TIMEOUT_S = 30.0
 # S4 P2b: consecutive `formation.unload` failures before the driver stops
 # auto-retrying a cluster entry's teardown and quarantines it instead.
 _CLUSTER_TEARDOWN_MAX_FAILURES = 3
+# S4 P3 rig defect #2: bounded poll for the freed rank-process memory to
+# become OS-reclaimable after a cluster victim's teardown completes, before
+# the outer get_engine retry re-reads the admission ceiling.
+_CLUSTER_TEARDOWN_SETTLE_TIMEOUT_S = 20.0
+_CLUSTER_TEARDOWN_SETTLE_INTERVAL_S = 0.5
 
 
 class PlacementStaleError(Exception):
@@ -378,6 +383,28 @@ class EnginePool:
             for entry in self._entries.values()
             if entry.kind == "cluster" and entry.engine is not None
         )
+
+    def _admission_ceiling_fits(self, entry: EngineEntry) -> bool:
+        """True when `entry`'s estimated size fits under the current
+        admission ceiling, using the same ceiling cascade and S4 P3
+        head-share correction `_admit_and_load_locked` applies before it
+        admits a load. No lock required: a pure read against the same
+        accessors admission itself consults, used by the post-cluster-
+        teardown settle poll (`_settle_after_cluster_teardown`) to ask the
+        real admission question instead of guessing a fixed sleep.
+        """
+        ceiling = self._current_ceiling()
+        if ceiling <= 0:
+            ceiling = self._fallback_admission_ceiling()
+        if ceiling <= 0:
+            return True  # no ceiling wired up -- admission never refuses
+        ceiling += self._cluster_head_share_total()
+        current = max(
+            mx.get_active_memory(),
+            get_phys_footprint(),
+            self._current_model_memory,
+        )
+        return bool(current + entry.estimated_size <= ceiling)
 
     def _ceiling_binding_and_advice(
         self, *, ceiling: int, current: int, tail: str
@@ -1171,6 +1198,41 @@ class EnginePool:
                 f"{bound:.0f}s"
             ) from exc
 
+    async def _settle_after_cluster_teardown(self, model_id: str) -> None:
+        """S4 P3 rig defect #2: a cluster victim's freed memory lives in the
+        just-killed rank CHILD process, not this one, so it can take seconds
+        to become OS-reclaimable even after `_teardown_cluster_entry` has
+        already signalled completion -- but the very next `get_engine`
+        retry re-reads the dynamic admission ceiling immediately. Rig
+        measurement: teardown completed cleanly, then the retry's load
+        failed with "does not fit under the dynamic memory ceiling
+        (46.85GB) ... only 45.96GB reclaimable right now", while ~15s later
+        the same ceiling read 99.6GB. The bounded 3-attempt outer retry
+        burns all its attempts inside that un-settled window. Local
+        evictions never hit this because `_unload_engine` runs its own
+        in-process settle barrier (mx.synchronize + polling) before
+        returning.
+
+        Called by `get_engine`'s outer loop right after
+        `_await_cluster_teardown` resolves, for `model_id` (the load this
+        attempt actually wants -- not the evicted victim). Polls, bounded
+        and outside `self._lock`, until `model_id`'s load fits under the
+        current admission ceiling (`_admission_ceiling_fits`, the same
+        predicate `_admit_and_load_locked` checks) -- the most direct
+        settle signal available, since it asks the real admission question
+        rather than reconstructing a delta from a pre-teardown snapshot.
+        On timeout, give up quietly: the next attempt just fails with
+        today's clear ceiling error instead of hanging.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None:
+            return
+        deadline = time.monotonic() + _CLUSTER_TEARDOWN_SETTLE_TIMEOUT_S
+        while not self._admission_ceiling_fits(entry):
+            if time.monotonic() >= deadline:
+                return
+            await asyncio.sleep(_CLUSTER_TEARDOWN_SETTLE_INTERVAL_S)
+
     def _claim_cluster_entry_locked(
         self, entry: EngineEntry, decision: PlacementDecision
     ) -> None:
@@ -1466,6 +1528,7 @@ class EnginePool:
                 )
             except _ClusterVictimPendingError as pending:
                 await self._await_cluster_teardown(pending.model_id, pending.event)
+                await self._settle_after_cluster_teardown(model_id)
             except _ClusterLoadPendingError as pending:
                 last_decision = pending.decision
                 with suppress(PlacementStaleError):
