@@ -312,13 +312,24 @@ class EnginePool:
         `:928-932`) — D2's capacity-unknown rule treats a ceiling of 0 as
         "unknown", so applying the same fallback here means the head's own
         placement input is never spuriously unknown just because the guard
-        is disabled.
+        is disabled. Also applies the S4 P3 head-share correction
+        (`_cluster_head_share_total()`): a resident formation's head shard
+        is invisible to the phys footprint the dynamic ceiling is derived
+        from, so the ceiling alone under-reports headroom for a LOCAL fit
+        against an already-resident formation. `plan_placement` folds this
+        `NodeCapacity` into `nodes = [head, *workers]` for the distributed
+        branch too, so the head's own per-rank `NodeFit` there gets the
+        same credit (correct: that fit also nets the resident share against
+        the collapsed ceiling). Only a *worker's* ceiling is unaffected --
+        that capacity comes from `_cluster_worker_capacities()`, not here.
         """
         from .cluster.placement import NodeCapacity
 
         ceiling = self._current_ceiling()
         if ceiling <= 0:
             ceiling = self._fallback_admission_ceiling()
+        if ceiling > 0:
+            ceiling += self._cluster_head_share_total()
         models_present = {
             model_id: entry.estimated_size for model_id, entry in self._entries.items()
         }
@@ -345,6 +356,28 @@ class EnginePool:
             return int(cb())
         except Exception:  # noqa: BLE001
             return 0
+
+    def _cluster_head_share_total(self) -> int:
+        """Sum of `cluster_head_share` across resident (formed) cluster
+        entries (S4 P3 rig finding).
+
+        A formed cluster entry's rank-0 shard is wired in the rank child
+        process, not this one, so it never shows up in the phys footprint
+        the enforcer's dynamic ceiling is derived from -- the ceiling
+        collapses by the shard size as if that memory simply vanished.
+        Meanwhile `_current_model_memory` still counts the same shard via
+        `entry.cluster_head_share` (`:1319`). Left alone, that is a double
+        subtraction: once off the ceiling, once off the usage side. Every
+        admission-side ceiling comparison adds this back to restore the
+        basis convention local models already get, where a model's memory
+        is inside the phys footprint the ceiling is drawn from, not
+        subtracted from the ceiling itself.
+        """
+        return sum(
+            entry.cluster_head_share or 0
+            for entry in self._entries.values()
+            if entry.kind == "cluster" and entry.engine is not None
+        )
 
     def _ceiling_binding_and_advice(
         self, *, ceiling: int, current: int, tail: str
@@ -1670,7 +1703,13 @@ class EnginePool:
             ceiling = self._fallback_admission_ceiling()
             best_effort = ceiling > 0
         if ceiling > 0:
+            # S4 P3: undo the dynamic ceiling's double subtraction of a
+            # resident formation's head shard (`_cluster_head_share_total`).
+            head_share_total = self._cluster_head_share_total()
+            ceiling += head_share_total
             soft_target = self._admission_soft_target()
+            if soft_target > 0:
+                soft_target += head_share_total
             evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
             evicted_any = unloaded_for_admission
             while True:

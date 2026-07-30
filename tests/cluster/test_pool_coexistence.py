@@ -335,8 +335,15 @@ async def test_admission_eviction_of_cluster_victim_never_awaits_under_lock(
         (small_dir / "config.json").write_text(json.dumps(_CONFIG))
         (small_dir / "model.safetensors").write_bytes(b"0" * 1_000_000)
         h.pool.discover_models(str(tmp_path / "models"))
-        # Ceiling only fits "small" alone, not both -- forces eviction.
-        h.pool._get_final_ceiling = lambda: 1_500_000
+        # Ceiling only fits "small" alone, not both -- forces eviction. S4
+        # P3: admission credits the resident head share back onto the
+        # ceiling (`_cluster_head_share_total`), so a *static* ceiling can no
+        # longer both force this eviction (needs < target's 6_037_499 head
+        # share + small's 1_050_000 = 7_087_499, once corrected) and still
+        # admit "small" alone once "target" is gone (needs >= 1_050_000) --
+        # those bounds only overlap once the ceiling is genuinely dynamic
+        # (falls as the shard is torn down), matching the real enforcer.
+        h.pool._get_final_ceiling = _dynamic_ceiling(h.pool, full=6_500_000)
 
         teardown_started = asyncio.Event()
         release_teardown = asyncio.Event()
@@ -388,7 +395,9 @@ async def test_cluster_victim_resolves_within_bounded_retries(tmp_path, monkeypa
         (small_dir / "config.json").write_text(json.dumps(_CONFIG))
         (small_dir / "model.safetensors").write_bytes(b"0" * 1_000_000)
         h.pool.discover_models(str(tmp_path / "models"))
-        h.pool._get_final_ceiling = lambda: 1_500_000
+        # S4 P3: see the sibling deadlock-row test above for why this must
+        # be dynamic, not a static figure.
+        h.pool._get_final_ceiling = _dynamic_ceiling(h.pool, full=6_500_000)
 
         mock_engine = MagicMock()
         mock_engine.start = AsyncMock()
@@ -397,6 +406,7 @@ async def test_cluster_victim_resolves_within_bounded_retries(tmp_path, monkeypa
             engine = await h.pool.get_engine("small")
         assert engine is mock_engine
         assert h.pool.get_entry("small").engine is not None
+        assert h.pool.get_entry("target").kind == "local"  # actually evicted
 
 
 # ---- selection filters: TTL eligible, prefill/enforcer ineligible ---------
@@ -991,3 +1001,212 @@ async def test_already_loaded_entry_makes_zero_placement_io_calls(
         calls.clear()
         await h.pool.get_engine("target")
         assert calls == []
+
+
+# ---- S4 P3: admission ceiling double-count with a resident formation -------
+#
+# A formed cluster entry's rank-0 shard is wired in the rank *child* process,
+# not this one, so it never shows up in the phys footprint the enforcer's
+# dynamic ceiling is derived from -- the ceiling collapses by the shard size
+# as if that memory simply vanished (rig: get_final_ceiling 100.2GB ->
+# 46.0GB with a 60.4GB head share resident). `_current_model_memory` still
+# counts the same shard via `entry.cluster_head_share`. Left uncorrected,
+# that is a double subtraction -- once off the ceiling, once off the usage
+# side -- so a resident formation reads as permanently over ceiling and the
+# next local load of *any* size evicts it (rig repro: a 0.73GB Llama load
+# evicted a 93GB formation). These rows use a genuinely dynamic ceiling
+# callback (unlike the static `_get_final_ceiling` stubs elsewhere in this
+# file) so the collapse recomputes exactly as the real enforcer would.
+
+
+def _dynamic_ceiling(pool, full: int):
+    """A ceiling callback mimicking the enforcer's real collapse: `full`
+    minus whatever cluster head share is currently resident, recomputed on
+    every call (so it reflects eviction/formation as they happen, not a
+    value snapshotted once).
+    """
+
+    def _cb() -> int:
+        resident = sum(
+            e.cluster_head_share or 0
+            for e in pool._entries.values()
+            if e.kind == "cluster" and e.engine is not None
+        )
+        return full - resident
+
+    return _cb
+
+
+def _add_small_local_model(tmp_path, pool, *, model_id: str, model_bytes: int):
+    model_dir = tmp_path / "models" / model_id
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(_CONFIG))
+    (model_dir / "model.safetensors").write_bytes(b"0" * model_bytes)
+    pool.discover_models(str(tmp_path / "models"))
+
+
+async def test_small_local_load_admits_beside_resident_formation(tmp_path, monkeypatch):
+    """Row 1 -- the rig repro. Without the head-share correction, a small
+    local load reads the resident formation as over ceiling (double count)
+    and evicts it even though the *true* headroom (once the shard's memory
+    is credited back) comfortably fits both. Must fail against 80aafa06
+    before the fix: the assertion that "target" is still `kind == "cluster"`
+    fails because the pool tears it down as the LRU victim.
+    """
+    _pin_live_memory_readings_to_zero(monkeypatch)
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+        entry = h.pool.get_entry("target")
+        assert entry.kind == "cluster"
+        assert entry.cluster_head_share == _PER_RANK_ESTIMATE
+
+        _add_small_local_model(
+            tmp_path, h.pool, model_id="small", model_bytes=1_000_000
+        )
+        # Collapsed (raw) ceiling = 10_000_000 - 6_037_500 = 3_962_500, well
+        # under the 6_037_500 already resident -- a permanent false-over-
+        # ceiling reading unless the fix restores the head share.
+        h.pool._get_final_ceiling = _dynamic_ceiling(h.pool, full=10_000_000)
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            engine = await h.pool.get_engine("small")
+
+        assert engine is mock_engine
+        # The formation must still be resident, not evicted by the double
+        # count.
+        target = h.pool.get_entry("target")
+        assert target.kind == "cluster"
+        assert target.engine is not None
+
+
+async def test_over_capacity_local_load_still_evicts_resident_formation(
+    tmp_path, monkeypatch
+):
+    """Row 2 -- the fix must not paper over a *genuine* shortage. A local
+    load bigger than the corrected effective ceiling still evicts the
+    resident formation cleanly.
+    """
+    _pin_live_memory_readings_to_zero(monkeypatch)
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+        assert h.pool.get_entry("target").kind == "cluster"
+
+        # est_size = int(6_500_000 * 1.05) = 6_825_000. With the formation
+        # resident (6_037_500) that's 12_862_500 -- over even the corrected
+        # 8_000_000 ceiling, so eviction is required and expected.
+        _add_small_local_model(tmp_path, h.pool, model_id="big", model_bytes=6_500_000)
+        h.pool._get_final_ceiling = _dynamic_ceiling(h.pool, full=8_000_000)
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            engine = await h.pool.get_engine("big")
+
+        assert engine is mock_engine
+        assert h.pool.get_entry("big").engine is not None
+        target = h.pool.get_entry("target")
+        assert target.kind == "local"  # unformed cleanly
+        assert target.engine is None
+
+
+async def test_soft_target_does_not_preempt_from_double_count_alone(
+    tmp_path, monkeypatch
+):
+    """Row 3 -- the soft admission target (the pre-load eviction trigger,
+    #2319) must get the same head-share correction as the hard ceiling.
+    Uncorrected, a soft target read against the double-counted baseline
+    alone (with no other pressure) preempts the resident formation even
+    though the hard ceiling has plenty of room.
+    """
+    _pin_live_memory_readings_to_zero(monkeypatch)
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+        assert h.pool.get_entry("target").kind == "cluster"
+
+        _add_small_local_model(tmp_path, h.pool, model_id="small", model_bytes=500_000)
+        # Hard ceiling is static and generous -- this row isolates the soft
+        # target's own correction, not the dynamic-collapse behavior row 1
+        # already covers.
+        h.pool._get_final_ceiling = lambda: 20_000_000
+        # Raw soft target (5_000_000) sits below the resident head share
+        # (6_037_500) alone -- an uncorrected soft target reads that as
+        # already over the pre-load watermark.
+        h.pool._get_admission_soft_target = lambda: 5_000_000
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            engine = await h.pool.get_engine("small")
+
+        assert engine is mock_engine
+        target = h.pool.get_entry("target")
+        assert target.kind == "cluster"
+        assert target.engine is not None
+
+
+async def test_placement_preview_head_fit_credits_resident_head_share(tmp_path):
+    """Row 4 -- `head_capacity()` feeds `plan_placement`'s head-fit preview
+    (`GET /v1/cluster/placement` and the local-fit branch of a real load).
+    It needs the same correction as admission for the same reason: a LOCAL
+    fit against an already-resident formation must not read the collapsed
+    ceiling as the true headroom. (Only a *worker's* ceiling is unaffected
+    -- that capacity comes from `_cluster_worker_capacities()`, not
+    `head_capacity()`; the head's own per-rank fit in the distributed
+    branch shares this same correction since `plan_placement` folds this
+    `NodeCapacity` into `nodes = [head, *workers]` there too.)
+    """
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+        assert h.pool.get_entry("target").kind == "cluster"
+
+        h.pool._get_final_ceiling = _dynamic_ceiling(h.pool, full=10_000_000)
+
+        from omlx.cluster.placement import plan_placement
+
+        decision = plan_placement(
+            model_id="small",
+            model_type="llm",
+            est_size=1_050_000,
+            model_config=None,
+            head=h.pool.head_capacity(),
+            workers=[],
+            prefer="local",
+        )
+        assert decision.fits["head"].ok is True
+
+
+async def test_fallback_admission_ceiling_also_credits_resident_head_share(
+    tmp_path, monkeypatch
+):
+    """Row 5 -- the guard-off fallback cascade (#2290: `_get_final_ceiling`
+    reads 0, so admission falls back to `_get_admission_ceiling`) needs the
+    same S4 P3 correction as the primary ceiling. Otherwise disabling the
+    memory guard reintroduces the double count on the fallback path alone.
+    """
+    _pin_live_memory_readings_to_zero(monkeypatch)
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+        entry = h.pool.get_entry("target")
+        assert entry.kind == "cluster"
+
+        _add_small_local_model(
+            tmp_path, h.pool, model_id="small", model_bytes=1_000_000
+        )
+        h.pool._get_final_ceiling = lambda: 0
+        h.pool._get_admission_ceiling = _dynamic_ceiling(h.pool, full=10_000_000)
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            engine = await h.pool.get_engine("small")
+
+        assert engine is mock_engine
+        target = h.pool.get_entry("target")
+        assert target.kind == "cluster"
+        assert target.engine is not None
