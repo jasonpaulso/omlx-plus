@@ -564,6 +564,43 @@ class TestWorkerNodeStateCollection:
             manager._scan_models_present()
             assert len(calls) == 2
 
+    async def test_models_present_excludes_index_incomplete_model(
+        self, worker_settings, tmp_path, monkeypatch
+    ):
+        """S5 P3 rig finding: a partially transferred dir (config + index
+        present, shard files missing) still discovers as a model, so an
+        unfiltered inventory reads it as present and a distributed load
+        skips the transfer pre-step -- forming a silently incomplete model.
+        The heartbeat inventory must omit it."""
+        complete = tmp_path / "model-complete"
+        complete.mkdir()
+        (complete / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (complete / "model.safetensors").write_bytes(b"0" * 1024)
+
+        holed = tmp_path / "model-holed"
+        holed.mkdir()
+        (holed / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (holed / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "a.w": "model-00001-of-00002.safetensors",
+                        "b.w": "model-00002-of-00002.safetensors",
+                    }
+                }
+            )
+        )
+        (holed / "model-00001-of-00002.safetensors").write_bytes(b"0" * 1024)
+
+        async with running_manager(worker_settings) as manager:
+            monkeypatch.setattr(
+                manager.global_settings, "get_effective_model_dirs", lambda: [tmp_path]
+            )
+            present = manager._scan_models_present()
+
+            assert "model-complete" in present
+            assert "model-holed" not in present
+
     async def test_collection_failure_returns_none(self, worker_settings, monkeypatch):
         async with running_manager(worker_settings) as manager:
 

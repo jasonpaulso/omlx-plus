@@ -70,6 +70,7 @@ from .state import (
     WorkerIdentity,
     parse_member_address,
 )
+from .tp import missing_weight_files
 from .versions import VersionInfo, collect_versions, compare_versions
 
 logger = logging.getLogger(__name__)
@@ -1302,6 +1303,19 @@ class ClusterManager:
                 # inventory, not a hard dependency.
                 continue
             for model_id, info in scanned.items():
+                # S5 P3 rig finding: a partially transferred (or externally
+                # holed) dir still parses as a discoverable model, so a
+                # presence-trusting distributed load would skip the
+                # transfer pre-step and form a silently incomplete model.
+                # Presence here means "complete by the model's own index",
+                # existence-only (digest integrity stays the have-scan's).
+                if missing_weight_files(info.model_path):
+                    logger.info(
+                        "cluster: node_state omits %s (incomplete: missing "
+                        "weight files)",
+                        model_id,
+                    )
+                    continue
                 present.setdefault(model_id, info.estimated_size)
         self._node_state_cache = present
         self._node_state_cache_at = now

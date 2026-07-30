@@ -15,6 +15,7 @@ from omlx.cluster.rank_worker import _tax_summary
 from omlx.cluster.tp import (
     TPDivisibilityError,
     check_divisibility,
+    missing_weight_files,
     supports_tensor_parallel,
     tensor_parallel_architectures,
 )
@@ -92,3 +93,47 @@ def test_tax_summary_statistics():
     # Nearest-rank percentiles over the sorted samples.
     assert summary["p50_ms"] == pytest.approx(3.0)
     assert summary["p90_ms"] == pytest.approx(4.0)
+
+
+# -- weight-file completeness (S5 P3 rig finding) -----------------------------
+
+
+def _write_index(root, weight_map):
+    import json
+
+    (root / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+
+
+def test_missing_weight_files_complete_dir_is_empty(tmp_path):
+    _write_index(tmp_path, {"a.w": "model-00001-of-00001.safetensors"})
+    (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"0")
+    assert missing_weight_files(tmp_path) == []
+
+
+def test_missing_weight_files_reports_holes_from_the_models_own_index(tmp_path):
+    _write_index(
+        tmp_path,
+        {
+            "a.w": "model-00001-of-00002.safetensors",
+            "b.w": "model-00002-of-00002.safetensors",
+        },
+    )
+    (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"0")
+    assert missing_weight_files(tmp_path) == ["model-00002-of-00002.safetensors"]
+
+
+def test_missing_weight_files_no_index_with_single_file_is_empty(tmp_path):
+    (tmp_path / "model.safetensors").write_bytes(b"0")
+    assert missing_weight_files(tmp_path) == []
+
+
+def test_missing_weight_files_config_only_dir_is_incomplete(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    assert missing_weight_files(tmp_path) == ["model.safetensors"]
+
+
+def test_missing_weight_files_unreadable_index_defers_to_loader(tmp_path):
+    (tmp_path / "model.safetensors.index.json").write_text("{not json")
+    assert missing_weight_files(tmp_path) == []

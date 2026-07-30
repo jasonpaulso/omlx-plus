@@ -36,6 +36,15 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+class TPIncompleteModelError(RuntimeError):
+    """The model dir's own safetensors index references weight files that
+    are not on disk (e.g. a partially transferred or externally holed
+    copy). Raised BEFORE the lazy ``load_model`` -- mlx-lm loads with
+    ``strict=False``, so missing shards would otherwise materialise as a
+    silently wrong model that only misbehaves at first forward (S5 P3 rig
+    finding)."""
+
+
 class TPUnsupportedError(RuntimeError):
     """A model does not implement tensor-parallel ``shard(group)``."""
 
@@ -167,6 +176,32 @@ class ShardResult:
     post_shard_param_bytes: int
 
 
+def missing_weight_files(model_dir: Any) -> list[str]:
+    """Weight files the model dir's own metadata says should exist but
+    don't -- empty when complete (or when there is no index to check
+    against and at least one ``*.safetensors`` is present).
+
+    Existence-only by design: cheap stat calls suitable for a heartbeat
+    inventory scan. Digest-level integrity stays the transfer have-scan's
+    job (D2); this catches holes, not bitrot.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    root = _Path(model_dir)
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        try:
+            weight_map = _json.loads(index.read_text()).get("weight_map", {})
+        except (OSError, ValueError):
+            return []  # unreadable index: let the loader surface it
+        names = sorted(set(weight_map.values()))
+        return [name for name in names if not (root / name).is_file()]
+    if (root / "config.json").is_file() and not any(root.glob("*.safetensors")):
+        return ["model.safetensors"]
+    return []
+
+
 def shard_and_load(model_path: str, group: Any) -> ShardResult:
     """Load only this rank's tensor-parallel slice of ``model_path``.
 
@@ -185,6 +220,13 @@ def shard_and_load(model_path: str, group: Any) -> ShardResult:
     from mlx_lm.utils import _download, load_model, load_tokenizer
 
     resolved = _download(model_path)
+    missing = missing_weight_files(resolved)
+    if missing:
+        raise TPIncompleteModelError(
+            f"{model_path} is missing {len(missing)} weight file(s) its own "
+            f"index references (first: {missing[0]!r}); refusing to load a "
+            "silently incomplete model"
+        )
     model, config = load_model(resolved, lazy=True, strict=False)
 
     if not supports_tensor_parallel(model):
