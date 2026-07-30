@@ -1,0 +1,1 @@
+{"error":{"message":"Model 'Qwen3.6-27B-bf16' (53.50GB) does not fit under the dynamic memory ceiling (46.85GB). Close other apps to free RAM (static cap is 122.00GB but only 45.96GB is reclaimable right now), raise memory_guard_tier (safe → balanced → aggressive), or use a smaller model.","type":"server_error","param":null,"code":null}}

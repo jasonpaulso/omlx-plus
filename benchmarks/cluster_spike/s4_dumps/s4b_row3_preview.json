@@ -1,0 +1,1 @@
+{"mode":"distributed","world_size":2,"per_rank_estimate":60427446322,"reasons":[],"fits":{"head":{"ceiling":98569601888,"projected":60427446322,"ok":true},"3d0756d1be2005b4":{"ceiling":89869673648,"projected":60427446322,"ok":true}},"presence":{"head":true,"3d0756d1be2005b4":true},"divisible":true,"requires_eviction":false}

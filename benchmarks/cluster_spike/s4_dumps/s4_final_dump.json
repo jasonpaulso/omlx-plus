@@ -1,0 +1,125 @@
+{
+  "sha": "cd872c0c",
+  "captured_at": "2026-07-30 (rig session)",
+  "row3": {
+    "quiesced_loaded_models": [
+      "Qwen3.6-27B-bf16",
+      "Llama-3.2-1B-Instruct-4bit (pinned)"
+    ],
+    "preview": {
+      "mode": "distributed",
+      "world_size": 2,
+      "per_rank_estimate": 60427446322,
+      "reasons": [],
+      "fits": {
+        "head": {
+          "ceiling": 100533936400,
+          "projected": 118606781185,
+          "ok": true,
+          "requires_eviction": true
+        },
+        "3d0756d1be2005b4": {
+          "ceiling": 90296968416,
+          "projected": 60427446322,
+          "ok": true,
+          "requires_eviction": false
+        }
+      },
+      "presence": {
+        "head": true,
+        "3d0756d1be2005b4": true
+      },
+      "divisible": true,
+      "requires_eviction": true
+    },
+    "recorded": {
+      "mode": "distributed",
+      "world_size": 2,
+      "per_rank_estimate": 60427446322,
+      "reasons": [],
+      "fits": {
+        "head": {
+          "ceiling": 100510818576,
+          "projected": 118606781185,
+          "ok": true,
+          "requires_eviction": true
+        },
+        "3d0756d1be2005b4": {
+          "ceiling": 90296960224,
+          "projected": 60427446322,
+          "ok": true,
+          "requires_eviction": false
+        }
+      },
+      "presence": {
+        "head": true,
+        "3d0756d1be2005b4": true
+      },
+      "divisible": true,
+      "requires_eviction": true
+    }
+  },
+  "row1": {
+    "loads": {
+      "minimax": {
+        "status": "ok",
+        "model_id": "MiniMax-M2.7-3bit",
+        "message": "Loaded MiniMax-M2.7-3bit"
+      },
+      "head_llama": {
+        "status": "ok (pinned auto-preload at startup)"
+      },
+      "worker_llama": {
+        "status": "ok",
+        "model_id": "Llama-3.2-1B-Instruct-4bit",
+        "message": "Loaded Llama-3.2-1B-Instruct-4bit"
+      }
+    },
+    "window": {
+      "streams": [
+        {
+          "surface": "head-minimax",
+          "started_at": 167391.387785333,
+          "first_token_at": 167392.169841125,
+          "completed_at": 167396.00063975,
+          "completion_tokens": 193,
+          "content_chars": 774,
+          "usage_tokens": 96,
+          "error": null
+        },
+        {
+          "surface": "head-llama",
+          "started_at": 167391.389984541,
+          "first_token_at": 167391.790308875,
+          "completed_at": 167391.84759425,
+          "completion_tokens": 63,
+          "content_chars": 93,
+          "usage_tokens": 63,
+          "error": null
+        },
+        {
+          "surface": "worker-llama",
+          "started_at": 167391.390142125,
+          "first_token_at": 167393.29729925,
+          "completed_at": 167393.302097416,
+          "completion_tokens": 59,
+          "content_chars": 109,
+          "usage_tokens": 59,
+          "error": null
+        }
+      ]
+    }
+  },
+  "row2": {
+    "pre_evict_cluster_active": true,
+    "evict_trigger_load_ok": true,
+    "post_evict_cluster_active": false,
+    "worker_formation_scrubbed": true,
+    "pinned_model": "Llama-3.2-1B-Instruct-4bit",
+    "pinned_model_loaded_after_trigger": true,
+    "reload": {
+      "preview_mode": "distributed",
+      "status_ready": true
+    }
+  }
+}
