@@ -1011,10 +1011,16 @@ class ClusterManager:
                 f"it is active (a member becomes replaceable after {timeout:g}s "
                 "of silence)"
             )
-        if time.time() - self._head_started_at > timeout:
+        # `_head_started_at` is 0.0 until `start()` sets it, and an epoch-zero
+        # clock would read as "up forever" — the one direction this gate must
+        # never fail in. `join` is unreachable before `start()` anyway (the
+        # command queue refuses submissions until then), so this only pins
+        # the direction.
+        started_at = self._head_started_at
+        if started_at > 0.0 and time.time() - started_at > timeout:
             return None
         return (
-            f"the head started less than {timeout:g}s ago and this member has "
+            f"the head has been up less than {timeout:g}s and this member has "
             "not reported liveness yet"
         )
 

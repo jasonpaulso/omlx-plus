@@ -2,6 +2,7 @@
 """Tests for the cluster manager: membership, liveness, revocation."""
 
 import asyncio
+import ipaddress
 import json
 from dataclasses import replace
 
@@ -10,7 +11,7 @@ import pytest
 from omlx.cluster.client import ClusterClientError
 from omlx.cluster.credentials import cluster_state_path, load_state, verify_secret
 from omlx.cluster.manager import ClusterError, ClusterManager, set_engine_pool_getter
-from omlx.cluster.state import MemberLiveness
+from omlx.cluster.state import Member, MemberLiveness
 from omlx.cluster.versions import PackageVersion, VersionInfo, collect_versions
 from omlx.model_discovery import discover_models
 
@@ -303,8 +304,24 @@ class TestSupersedeOnRejoin:
                 await admit(manager, host="10.0.0.10", name="rack-1")
 
             assert exc.value.status_code == 409
-            assert "head started less than" in exc.value.detail
+            assert "has been up less than" in exc.value.detail
             assert [m.id for m in manager.state.members] == [first["member_id"]]
+
+    async def test_an_unstarted_head_never_supersedes(self, head_settings):
+        """Fail closed: the boot-window clock is 0.0 until start(), and an
+        epoch-zero clock would read as "up forever". join() cannot reach this
+        (the command queue refuses submissions before start()), so this pins
+        the direction rather than a reachable path."""
+        unstarted = ClusterManager(head_settings)
+        member = Member(
+            id="deadbeefdeadbeef",
+            address=ipaddress.ip_address("10.0.0.9"),
+            port=8000,
+            name="rack-1",
+            versions=collect_versions(),
+            joined_at=0.0,
+        )
+        assert unstarted._supersede_refusal(member) is not None
 
     async def test_liveness_less_member_past_the_boot_window_is_superseded(
         self, tmp_path
