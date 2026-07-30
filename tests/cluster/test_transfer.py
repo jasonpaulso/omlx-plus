@@ -588,6 +588,137 @@ async def test_rate_limit_clears_after_the_window(tmp_path, monkeypatch):
     assert second["status"] == "accepted"
 
 
+async def test_rate_limited_rejection_carries_retry_after_and_retry_succeeds(
+    tmp_path, monkeypatch
+):
+    """S5 P2d: the rejection additively carries a machine-readable
+    ``retry_after_s`` -- the guard itself is unchanged (a rapid burst of
+    two genuinely DISTINCT new jobs still refuses the second one), but the
+    SAME job_id, resent on `TRANSFER_START_RETRY_STEP` after waiting that
+    long, is accepted -- a fresh `(job_id, step)` pair rather than a replay
+    of the rejected attempt (CL2-06 would otherwise just re-emit the
+    cached rejection)."""
+    from omlx.cluster import transfer as transfer_mod
+
+    rate_limit = 0.05
+    monkeypatch.setattr(transfer_mod, "NEW_JOB_RATE_LIMIT_S", rate_limit)
+    settings = _worker_settings(tmp_path)
+    root = settings.get_effective_model_dirs()[0]
+    root.mkdir(parents=True, exist_ok=True)
+    executor = TransferWorkerExecutor(settings)
+
+    # Burst: two genuinely new job_ids back-to-back -- the guard must
+    # still refuse the second one; the retry fix never loosens this.
+    first = await executor.dispatch(parse_command(_start_command(job_id="burst-1")))
+    assert first["status"] == "accepted"
+    second = await executor.dispatch(parse_command(_start_command(job_id="burst-2")))
+    assert second["status"] == "rejected"
+    assert "rate limited" in second["detail"]
+    retry_after_s = second["retry_after_s"]
+    assert 0 < retry_after_s <= rate_limit
+
+    # The head's retry path: after waiting the reported window, the
+    # SAME job_id succeeds on a fresh step.
+    await asyncio.sleep(retry_after_s + 0.05)
+    retried = await executor.dispatch(
+        parse_command(
+            _start_command(
+                job_id="burst-2",
+                step=transfer_mod.TRANSFER_START_RETRY_STEP,
+            )
+        )
+    )
+    assert retried["status"] == "accepted"
+
+
+async def test_manager_retries_a_rate_limited_start_exactly_once_then_completes(
+    tmp_path, monkeypatch
+):
+    """S5 P2d, head side: the same abort -> immediate-reload shape as the
+    engine_pool regression (`test_rollback_on_aborted_transfer_then_
+    subsequent_load_proceeds`), driven directly through TransferManager so
+    the retry's own step bookkeeping (`_start_with_rate_limit_retry`,
+    `_await_initial_have`/`_drive_hf`'s `start_step` threading) is pinned
+    independent of EnginePool. The window is widened (not narrowed) so the
+    natural abort->restart latency reliably lands INSIDE it (a tiny window
+    would risk the retry firing for the wrong reason -- flaky, not fixed).
+    """
+    from omlx.cluster import transfer as transfer_mod
+
+    monkeypatch.setattr(transfer_mod, "NEW_JOB_RATE_LIMIT_S", 2.0)
+
+    calls: list[tuple[str, int, str]] = []
+    original_start_command = transfer_mod.TransferManager._start_command
+
+    async def _spy_start_command(
+        self, member, job_id, source, hf_repo_id, hf_revision, epoch, *, step=1
+    ):
+        ack = await original_start_command(
+            self, member, job_id, source, hf_repo_id, hf_revision, epoch, step=step
+        )
+        calls.append((job_id, step, str(ack.get("status"))))
+        return ack
+
+    monkeypatch.setattr(
+        transfer_mod.TransferManager, "_start_command", _spy_start_command
+    )
+
+    async with running_manager(_head_settings(tmp_path)) as manager:
+        member = await _activate_member(manager)
+
+        source_dir = tmp_path / "source" / "target-model"
+        source_dir.mkdir(parents=True)
+        (source_dir / "config.json").write_bytes(b"{}")
+
+        worker_settings = _worker_settings(tmp_path)
+        worker_root = worker_settings.get_effective_model_dirs()[0]
+        worker_root.mkdir(parents=True, exist_ok=True)
+        launcher = _fake_session_launcher({"config.json": b"{}"})
+        worker = TransferWorkerExecutor(worker_settings, session_launcher=launcher)
+
+        tm = TransferManager(manager)
+        manager._transfer = tm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(tm, worker, member, stop))
+        try:
+            job1 = await tm.start_transfer(
+                "target-model", member=member, local_path=str(source_dir), source="peer"
+            )
+            # Wait for the worker to actually process job1's START (sets
+            # `_last_new_job_at`) before aborting it -- otherwise the abort
+            # can race ahead of `_drive_worker`'s poll loop and job2 would
+            # find a worker that never saw a "new job" at all, which
+            # wouldn't exercise the rate limit this test pins.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and job1.id not in worker._jobs:
+                await asyncio.sleep(0.005)
+            assert job1.id in worker._jobs, "worker never processed job1's START"
+
+            await tm.abort_transfer(job1.id)
+
+            job2 = await tm.start_transfer(
+                "target-model", member=member, local_path=str(source_dir), source="peer"
+            )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                current = tm.job(job2.id)
+                if current is not None and current.status in ("done", "error"):
+                    break
+                await asyncio.sleep(0.005)
+            final_job2 = tm.job(job2.id)
+            assert final_job2 is not None
+            assert final_job2.status == "done", final_job2.error
+        finally:
+            stop.set()
+            await driver
+
+    job2_calls = [c for c in calls if c[0] == job2.id]
+    assert [c[2] for c in job2_calls] == ["rejected", "accepted"]
+    assert job2_calls[0][1] == 1
+    assert job2_calls[1][1] == transfer_mod.TRANSFER_START_RETRY_STEP
+
+
 # =============================================================================
 # CL5-16: minimum-progress watchdog
 # =============================================================================
@@ -814,6 +945,112 @@ async def test_hf_success_moves_required_files(tmp_path):
     else:
         pytest.fail("HF job never completed")
     assert (root / "target-model" / "config.json").read_bytes() == content
+
+
+async def test_hf_start_rejects_before_download_when_staging_lacks_free_space(
+    tmp_path, monkeypatch
+):
+    """S5 P2d/R1: the HF branch's free-space precheck (`_check_staging_
+    capacity`, run against the full manifest total before the download is
+    ever scheduled) was pinned by ZERO tests -- deleting it left every
+    other test green. A mocked `shutil.disk_usage` reporting insufficient
+    free space must reject BEFORE the downloader is ever invoked."""
+    from omlx.cluster import transfer as transfer_mod
+
+    settings = _worker_settings(tmp_path)
+    root = settings.get_effective_model_dirs()[0]
+    root.mkdir(parents=True, exist_ok=True)
+
+    downloader_called = False
+
+    async def _hf_downloader(*_args, **_kwargs):
+        nonlocal downloader_called
+        downloader_called = True
+
+    executor = TransferWorkerExecutor(settings, hf_downloader=_hf_downloader)
+    monkeypatch.setattr(
+        transfer_mod.shutil,
+        "disk_usage",
+        lambda _path: types.SimpleNamespace(total=0, used=0, free=1),
+    )
+
+    ack = await executor.dispatch(
+        parse_command(
+            _start_command(source="hf", hf_repo_id="org/name", hf_revision="a" * 40)
+        )
+    )
+    assert ack["status"] == "rejected"
+    assert "CL5-11" in ack["detail"]
+
+    await asyncio.sleep(0.02)  # give any (incorrectly) scheduled task a chance
+    assert downloader_called is False
+
+
+async def test_hf_download_stall_is_killed_by_the_progress_watchdog(
+    tmp_path, monkeypatch
+):
+    """CL5-16/R2: the HF path reuses the SAME minimum-progress watchdog the
+    round path uses (`_wait_with_progress_watchdog`) -- no wall-clock
+    deadline (download duration scales with model size), but zero staging
+    growth for MIN_PROGRESS_STRIKES consecutive polls cancels the download
+    and reports a terminal job error, driven end-to-end through
+    TransferManager so the head's D4 single-active gate is proven released
+    too (not just the worker's own state)."""
+    from omlx.cluster import transfer as transfer_mod
+
+    monkeypatch.setattr(transfer_mod, "MIN_PROGRESS_INTERVAL_S", 0.02)
+    monkeypatch.setattr(transfer_mod, "MIN_PROGRESS_STRIKES", 2)
+
+    async def _stalled_download(*_args, **_kwargs):
+        await asyncio.sleep(1000)  # never grows staging, never returns
+
+    async with running_manager(_head_settings(tmp_path)) as manager:
+        member = await _activate_member(manager)
+
+        source_dir = tmp_path / "source" / "target-model"
+        source_dir.mkdir(parents=True)
+        (source_dir / "config.json").write_bytes(b"{}")
+
+        worker_settings = _worker_settings(tmp_path)
+        worker_root = worker_settings.get_effective_model_dirs()[0]
+        worker_root.mkdir(parents=True, exist_ok=True)
+        worker = TransferWorkerExecutor(
+            worker_settings, hf_downloader=_stalled_download
+        )
+
+        tm = TransferManager(manager)
+        manager._transfer = tm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(tm, worker, member, stop))
+        try:
+            job = await tm.start_transfer(
+                "target-model",
+                member=member,
+                local_path=str(source_dir),
+                source="hf",
+                hf_repo_id="org/name",
+                hf_revision="a" * 40,
+            )
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                current = tm.job(job.id)
+                if current is not None and current.status in ("done", "error"):
+                    break
+                await asyncio.sleep(0.01)
+            final_job = tm.job(job.id)
+            assert final_job is not None
+            assert final_job.status == "error"
+            assert "CL5-16" in final_job.error
+
+            # The head's D4 single-active gate must be released promptly --
+            # a fresh operation can proceed immediately, not wedged behind
+            # the stalled download.
+            manager.acquire_operation_gate("formation", "f1")
+            manager.release_operation_gate("formation", "f1")
+        finally:
+            stop.set()
+            await driver
 
 
 # =============================================================================

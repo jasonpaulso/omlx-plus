@@ -67,7 +67,8 @@ MAX_PENDING_RESULTS_PER_JOB = 64
 # `_jobs`/`_runtime` themselves are the second half of the same gap: a
 # long-lived head daemon never drops a finished job's record, so its history
 # grows without bound. Mirrors `FormationManager.snapshot`'s last-10
-# convention -- only TERMINAL jobs are ever pruned, oldest-finished-first.
+# convention -- only TERMINAL jobs are ever pruned, oldest-CREATED-first
+# (`_prune_finished` sorts by `created_at`, not by when a job finished).
 MAX_FINISHED_JOBS = 10
 # S5 P2/D4: the step number a head-initiated TRANSFER_ABORT always uses.
 # `WorkerCommandExecutor.MAX_STEPS_PER_JOB` (manager.py) is 4096; this sits
@@ -128,6 +129,22 @@ _STAGING_DIR_PREFIXES = ("omlx-transfer-staging-", "omlx-transfer-hf-staging-")
 # exactly the exhaustion CL2-09's formation bound already guards against for
 # formations; this is the same discipline for transfers.
 NEW_JOB_RATE_LIMIT_S = 5.0
+
+# S5 P2d: the ONE legitimate retry the head gives a job whose TRANSFER_START
+# lost the race against CL5-11's guard (e.g. an aborted-then-immediately-
+# retried load, which genuinely is a new job to the worker -- the aborted
+# job never made it into `self._jobs`). Reuses `job_id` but sends this
+# DIFFERENT step number rather than step 1 again: replaying the exact same
+# `(job_id, step)` would just re-emit the cached rejection (CL2-06) instead
+# of re-running `_do_start`'s rate-limit check against the now-later clock.
+# Never collides with a round step (those start at 2 and only increase) or
+# `ABORT_STEP`.
+TRANSFER_START_RETRY_STEP = -1
+# Added to the worker-reported `retry_after_s` before the head sleeps, so a
+# retry issued right at the edge of the window doesn't lose the race to
+# clock/scheduling jitter and get rejected a second time for the same
+# reason.
+_RATE_LIMIT_RETRY_EPSILON_S = 0.25
 
 _MODEL_ID_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 MAX_MODEL_ID_LENGTH = 200
@@ -580,7 +597,7 @@ class TransferManager:
     ) -> None:
         try:
             epoch = self._member_epoch(member)
-            start_ack = await self._start_command(
+            start_ack, start_step = await self._start_with_rate_limit_retry(
                 member, job_id, source, hf_repo_id, hf_revision, epoch
             )
             if start_ack.get("status") == "rejected":
@@ -590,7 +607,7 @@ class TransferManager:
                 start_ack.get("data_plane_address") or ""
             )
             if source == "hf":
-                await self._drive_hf(job_id, member)
+                await self._drive_hf(job_id, member, start_step)
             else:
                 # D2: the START step's own worker-side have-scan (`_scan_have`)
                 # IS the diff authority's starting point -- seed round 1 from
@@ -600,7 +617,7 @@ class TransferManager:
                 # every time). Bounded + falls back to an empty seed on
                 # timeout/failure -- that degrades to today's (correct, just
                 # wasteful) behavior rather than blocking the job.
-                initial_have = await self._await_initial_have(job_id)
+                initial_have = await self._await_initial_have(job_id, start_step)
                 await self._drive_rounds(job_id, member, initial_have=initial_have)
         except asyncio.CancelledError:
             self._finish(job_id, "aborted")
@@ -615,6 +632,66 @@ class TransferManager:
         live = self._manager.liveness(member.id)
         return live.epoch if live is not None else ""
 
+    async def _start_with_rate_limit_retry(
+        self,
+        member: Member,
+        job_id: str,
+        source: str,
+        hf_repo_id: str | None,
+        hf_revision: str | None,
+        epoch: str,
+    ) -> tuple[dict[str, Any], int]:
+        """S5 P2d: retry a CL5-11 rate-limited TRANSFER_START EXACTLY ONCE.
+
+        The worker's flood guard stays exactly as strict as it is (no
+        exemption, no constant change) -- this is the head-side legitimate
+        path for the one shape that guard produces against a genuinely new
+        job that simply lost a race against another recent new job (e.g. an
+        aborted-then-immediately-retried load: the aborted job never made
+        it into the worker's `_jobs`, so the retry is genuinely new too).
+
+        A rejection is retried only if it additively carries
+        ``retry_after_s`` (the worker's own remaining-window hint) -- any
+        other rejection reason (epoch mismatch, bad manifest, pool
+        conflict, ...) is terminal on the first try, fail-closed, exactly
+        as before. The wait is bounded to never exceed the guard's own
+        window (+1s slack): ``retry_after_s`` is itself already bounded by
+        ``NEW_JOB_RATE_LIMIT_S``, so this is a belt-and-braces cap against a
+        malformed/adversarial value, not a real-world ceiling. The retry
+        re-sends on ``TRANSFER_START_RETRY_STEP`` -- never step 1 again --
+        so it is a fresh ``(job_id, step)`` pair rather than a replay of the
+        rejected attempt (CL2-06 would otherwise just re-emit the cached
+        rejection instead of re-running the worker's check against the
+        now-later clock). A second rejection -- for any reason, including
+        the same guard firing again -- is terminal.
+
+        Returns the winning ack alongside the step it was sent on, so the
+        caller awaits the matching "have"/HF-outcome report on that step.
+        """
+        ack = await self._start_command(
+            member, job_id, source, hf_repo_id, hf_revision, epoch, step=1
+        )
+        if ack.get("status") != "rejected":
+            return ack, 1
+        retry_after_s = ack.get("retry_after_s")
+        if not isinstance(retry_after_s, (int, float)) or retry_after_s <= 0:
+            return ack, 1
+        wait_s = min(
+            float(retry_after_s) + _RATE_LIMIT_RETRY_EPSILON_S,
+            NEW_JOB_RATE_LIMIT_S + 1.0,
+        )
+        await asyncio.sleep(wait_s)
+        retry_ack = await self._start_command(
+            member,
+            job_id,
+            source,
+            hf_repo_id,
+            hf_revision,
+            epoch,
+            step=TRANSFER_START_RETRY_STEP,
+        )
+        return retry_ack, TRANSFER_START_RETRY_STEP
+
     async def _start_command(
         self,
         member: Member,
@@ -623,13 +700,15 @@ class TransferManager:
         hf_repo_id: str | None,
         hf_revision: str | None,
         epoch: str,
+        *,
+        step: int = 1,
     ) -> dict[str, Any]:
         job = self._jobs[job_id]
         wire = command_to_wire(
             TransferStartCommand(
                 schema_version=PROTOCOL_VERSION,
                 job_id=job_id,
-                step=1,
+                step=step,
                 model_id=job.model_id,
                 manifest=[entry.to_dict() for entry in job.manifest],
                 source=TransferSource(source),
@@ -679,15 +758,19 @@ class TransferManager:
         finally:
             runtime.round_updates.pop(step, None)
 
-    async def _await_initial_have(self, job_id: str) -> set[str]:
-        """D2: await the START step's own "have" report (`_scan_have`,
-        step=1) -- the worker's fresh digest-verified scan of its final
-        dir, and the diff authority's actual starting point. Falls back to
-        an empty seed (today's pre-fix behavior: correct, just wasteful --
-        round 1 requests the full manifest) on timeout or any non-"have"
-        result, never blocking or failing the job over this.
+    async def _await_initial_have(self, job_id: str, start_step: int) -> set[str]:
+        """D2: await the START step's own "have" report (`_scan_have`) --
+        the worker's fresh digest-verified scan of its final dir, and the
+        diff authority's actual starting point. ``start_step`` is whichever
+        step the winning TRANSFER_START actually landed on (1, or
+        ``TRANSFER_START_RETRY_STEP`` after a P2d rate-limit retry) -- the
+        worker's have-scan reports on that SAME step (`_scan_have` is
+        started with `command.step`). Falls back to an empty seed (today's
+        pre-fix behavior: correct, just wasteful -- round 1 requests the
+        full manifest) on timeout or any non-"have" result, never blocking
+        or failing the job over this.
         """
-        result = await self._await_round_result(job_id, 1, timeout=300.0)
+        result = await self._await_round_result(job_id, start_step, timeout=300.0)
         if result is None or result.get("status") != "have":
             return set()
         return set(result.get("have") or [])
@@ -754,12 +837,16 @@ class TransferManager:
                 return
         self._finish(job_id, "done")
 
-    async def _drive_hf(self, job_id: str, member: Member) -> None:
+    async def _drive_hf(self, job_id: str, member: Member, start_step: int) -> None:
         """HF fan-out (D6): a single TRANSFER_START already carried the repo
         id/revision; the worker's owned task does the whole download+verify
-        +move and reports the outcome as one transfer update.
+        +move and reports the outcome as one transfer update on
+        ``start_step`` -- whichever step the winning TRANSFER_START actually
+        landed on (see `_await_initial_have`'s same note).
         """
-        result = await self._await_round_result(job_id, 1, timeout=ROUND_DEADLINE_S * 4)
+        result = await self._await_round_result(
+            job_id, start_step, timeout=ROUND_DEADLINE_S * 4
+        )
         if result is None:
             self._finish(job_id, "error", error="worker never reported an outcome")
             return
@@ -907,10 +994,18 @@ class TransferWorkerExecutor:
         if is_new_job:
             elapsed = time.time() - self._last_new_job_at
             if elapsed < NEW_JOB_RATE_LIMIT_S:
+                # S5 P2d: `retry_after_s` is additive wire surface (plain
+                # dict, no `extra="forbid"` model on a job update -- see
+                # `make_job_update`) -- a machine-readable hint for the
+                # head's ONE-retry path (`TransferManager.
+                # _start_with_rate_limit_retry`). The guard itself is
+                # UNCHANGED: this only tells a legitimate caller how long
+                # to wait, it never widens or skips the window.
                 return make_job_update(
                     command.job_id,
                     command.step,
                     status="rejected",
+                    retry_after_s=max(NEW_JOB_RATE_LIMIT_S - elapsed, 0.0),
                     detail=(
                         f"a new transfer job was accepted {elapsed:.1f}s ago; "
                         f"rate limited to one new job per {NEW_JOB_RATE_LIMIT_S:.0f}s "
@@ -1184,15 +1279,9 @@ class TransferWorkerExecutor:
         """CL5-16: two watchdogs guard one round, either one killing the
         session; the gate release happens in ``finally`` regardless
         (`_run_round`'s ``cluster.stop()``, `_drive`'s gate release on the
-        head side).
-
-        The wall-clock ceiling (``ROUND_DEADLINE_S``) alone leaves a round
-        that is merely SILENT -- not exited, just stuck -- running the full
-        30 minutes before anything notices. The minimum-progress watchdog
-        polls every ``MIN_PROGRESS_INTERVAL_S`` and tracks the staging
-        directory's total bytes: ``MIN_PROGRESS_STRIKES`` consecutive polls
-        with zero growth declares the round stalled and kills it, well
-        before the wall clock would.
+        head side). Thin wrapper over `_wait_with_progress_watchdog` --
+        the SAME shared machinery the HF path's `_run_hf_download` reuses
+        for its own (wall-clock-free) minimum-progress watchdog.
         """
         leader = cluster.leader
         if leader is None:
@@ -1200,22 +1289,55 @@ class TransferWorkerExecutor:
         loop = asyncio.get_running_loop()
         wait_task = loop.run_in_executor(None, leader.process.wait)
         deadline = loop.time() + ROUND_DEADLINE_S
+        await self._wait_with_progress_watchdog(
+            wait_task, staging_dir, deadline=deadline, kill=cluster.kill
+        )
+
+    async def _wait_with_progress_watchdog(
+        self,
+        wait_task: asyncio.Future[Any],
+        staging_dir: Path,
+        *,
+        deadline: float | None,
+        kill: Callable[[], Any],
+    ) -> bool:
+        """CL5-16: shared minimum-progress watchdog behind both the round
+        path (`_wait_round_deadline`, wall clock + min-progress) and the HF
+        path (`_run_hf_download`, min-progress only -- ``deadline=None``,
+        since download duration scales with model size and a wall-clock
+        ceiling would be the wrong bound there).
+
+        Polls ``staging_dir``'s total bytes every ``MIN_PROGRESS_INTERVAL_S``;
+        ``MIN_PROGRESS_STRIKES`` consecutive polls with zero growth calls
+        ``kill()`` and returns ``True``. If ``deadline`` is not None, also
+        calls ``kill()`` and returns ``True`` once the wall clock passes it
+        (the round path's ``ROUND_DEADLINE_S``). Returns ``False`` if
+        ``wait_task`` completes on its own before either watchdog fires --
+        callers use this to distinguish "killed by the watchdog" from "the
+        underlying work finished/raised normally" without relying on
+        ``asyncio.CancelledError`` (which a WATCHDOG-cancelled
+        ``wait_task`` and an EXTERNALLY-cancelled caller task would
+        otherwise both raise, indistinguishably).
+        """
+        loop = asyncio.get_running_loop()
         last_bytes = -1
         stalled_polls = 0
         try:
             while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    logger.warning(
-                        "cluster: transfer round exceeded its deadline; killing"
-                    )
-                    cluster.kill()
-                    return
-                done, _pending = await asyncio.wait(
-                    {wait_task}, timeout=min(MIN_PROGRESS_INTERVAL_S, remaining)
-                )
+                if deadline is not None:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        logger.warning(
+                            "cluster: transfer round exceeded its deadline; killing"
+                        )
+                        kill()
+                        return True
+                    poll_timeout = min(MIN_PROGRESS_INTERVAL_S, remaining)
+                else:
+                    poll_timeout = MIN_PROGRESS_INTERVAL_S
+                done, _pending = await asyncio.wait({wait_task}, timeout=poll_timeout)
                 if wait_task in done:
-                    return
+                    return False
                 current_bytes = _dir_bytes(staging_dir)
                 if current_bytes > last_bytes:
                     last_bytes = current_bytes
@@ -1224,11 +1346,11 @@ class TransferWorkerExecutor:
                 stalled_polls += 1
                 if stalled_polls >= MIN_PROGRESS_STRIKES:
                     logger.warning(
-                        "cluster: transfer round made no progress for %.0fs; killing",
+                        "cluster: transfer made no progress for %.0fs; killing",
                         MIN_PROGRESS_INTERVAL_S * MIN_PROGRESS_STRIKES,
                     )
-                    cluster.kill()
-                    return
+                    kill()
+                    return True
         finally:
             wait_task.cancel()
 
@@ -1287,13 +1409,45 @@ class TransferWorkerExecutor:
             required = {entry.relative_path for entry in job.manifest}
             missing = required
             for _attempt in range(2):  # D6: one re-fetch on divergence, then terminal
-                try:
-                    await self._hf_downloader(
+                download_task = asyncio.create_task(
+                    self._hf_downloader(
                         job.hf_repo_id,
                         staging_dir,
                         revision=job.hf_revision,
                         ignore_patterns=HF_IGNORE_PATTERNS,
                     )
+                )
+                # CL5-16: the SAME minimum-progress watchdog the round path
+                # uses -- no wall-clock deadline here (download duration
+                # scales with model size, unlike a bounded round), but a
+                # download that stages zero new bytes for
+                # MIN_PROGRESS_STRIKES consecutive polls is cancelled
+                # rather than left to wedge the head's D4 single-active
+                # gate (`_await_round_result`'s own 2-hour backstop in
+                # `_drive_hf` would otherwise be the only thing catching
+                # this, far later than a live watchdog would).
+                killed = await self._wait_with_progress_watchdog(
+                    download_task,
+                    staging_dir,
+                    deadline=None,
+                    kill=download_task.cancel,
+                )
+                if killed:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await download_task
+                    job.status = "error"
+                    self._emit(
+                        job.job_id,
+                        step,
+                        status="error",
+                        detail=(
+                            "HF download made no staging progress; "
+                            "cancelled by the min-progress watchdog (CL5-16)"
+                        ),
+                    )
+                    return
+                try:
+                    await download_task
                 except Exception as exc:
                     job.status = "error"
                     self._emit(

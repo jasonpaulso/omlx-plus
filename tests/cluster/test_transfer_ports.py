@@ -19,8 +19,12 @@ from omlx.settings import (
 
 
 def test_transfer_base_port_is_offset_from_the_ring_base():
-    cluster = ClusterSettings(data_plane_base_port=41100)
-    assert transfer_base_port(cluster) == 41100 + TRANSFER_PORT_RANGE_OFFSET
+    # A non-default base: 41100 is ALSO `ClusterSettings.data_plane_base_port`'s
+    # own default, so a derivation that ignores its argument entirely (e.g.
+    # hardcoding the default's derived value) would still pass against it --
+    # verified via mutation that 45000 does not let that slip through.
+    cluster = ClusterSettings(data_plane_base_port=45000)
+    assert transfer_base_port(cluster) == 45000 + TRANSFER_PORT_RANGE_OFFSET
 
 
 def test_disjoint_ranges_pass():

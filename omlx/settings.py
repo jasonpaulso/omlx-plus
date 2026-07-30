@@ -584,7 +584,9 @@ VALID_CLUSTER_BACKENDS = {"ring", "jaccl", "auto"}
 # from `cluster.manager.MAX_WORLD_SIZE` (settings.py cannot import
 # manager.py -- manager.py imports settings.py) -- kept honest by
 # `assert_transfer_ports_non_overlapping`, exercised by
-# `tests/cluster/test_transfer_ports.py`.
+# `tests/cluster/test_transfer_ports.py` (the derivation itself) and
+# `tests/cluster/test_manager.py::TestTransferPortAssertion` (the assertion
+# wired into `ClusterManager.start()`).
 TRANSFER_PORT_RANGE_OFFSET = 64  # == cluster.manager.MAX_WORLD_SIZE
 
 
