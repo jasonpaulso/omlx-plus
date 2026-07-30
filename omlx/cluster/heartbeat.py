@@ -49,6 +49,7 @@ class HeartbeatSender:
         client_factory: Callable[[str], ClusterClient] | None = None,
         command_sink: Callable[[list[Any]], None] | None = None,
         job_updates_provider: Callable[[], list[dict[str, Any]]] | None = None,
+        transfer_updates_provider: Callable[[], list[dict[str, Any]]] | None = None,
         node_state_provider: Callable[[], dict[str, Any] | None] | None = None,
     ) -> None:
         self.identity = identity
@@ -60,6 +61,11 @@ class HeartbeatSender:
         self._client_factory = client_factory or (lambda url: ClusterClient(url))
         self._command_sink = command_sink
         self._job_updates_provider = job_updates_provider
+        # S5 D1b: a SIBLING channel to job_updates -- per-file transfer
+        # progress/terminal state, not an ack (a TRANSFER_ROUND's ack only
+        # confirms the round started; its outcome may arrive many
+        # heartbeats later, here).
+        self._transfer_updates_provider = transfer_updates_provider
         # S4 D1: advisory capacity/inventory attached to every heartbeat. The
         # provider is best-effort — returning None (or raising, caught below)
         # simply omits the field, exactly S1's heartbeat shape.
@@ -91,6 +97,8 @@ class HeartbeatSender:
         payload: dict[str, Any] = {"seq": sent_seq, "epoch": self.epoch}
         if self._job_updates_provider is not None:
             payload["job_updates"] = self._job_updates_provider()
+        if self._transfer_updates_provider is not None:
+            payload["transfer_updates"] = self._transfer_updates_provider()
         if self._node_state_provider is not None:
             try:
                 node_state = self._node_state_provider()

@@ -36,8 +36,12 @@ from omlx.cluster import hostfile
 
 logger = logging.getLogger(__name__)
 
-# The rank process entry point, matched in the process table by the sweep.
+# The rank process entry points, matched in the process table by the sweep.
 WORKER_MODULE = "omlx.cluster.rank_worker"
+# S5: the per-round transfer rank script (D1/R3c) -- a distinct entry point,
+# never rank_worker, spawned by `launch_transfer_session`.
+TRANSFER_MODULE = "omlx.cluster.transfer_rank"
+_SWEEPABLE_MODULES = (WORKER_MODULE, TRANSFER_MODULE)
 
 # init() blocks until the whole world joins; past this we assume someone never
 # arrives and tear the run down rather than hanging forever.
@@ -83,6 +87,45 @@ def _release_formation(cluster: LocalCluster) -> None:
     with _spawn_lock:
         if _active_cluster is cluster:
             _active_cluster = None
+
+
+# -- S5 R3c: transfer sessions get their OWN single-slot bound ---------------
+#
+# Deliberately a separate lock/singleton from the formation slot above: a
+# live formation (serving requests) and one transfer session must coexist on
+# the same machine, so a transfer must never claim the formation's slot. A
+# SECOND concurrent transfer session is still refused -- each round is its
+# own fresh 2-rank ring session (D1/D2), and running two at once would mean
+# two rank processes racing for the same transfer ports.
+
+
+class TransferSpawnBoundError(RuntimeError):
+    """A transfer session spawn was refused: one is already live (R3c)."""
+
+
+_transfer_spawn_lock = threading.Lock()
+_active_transfer_session: LocalCluster | None = None
+
+
+def _register_transfer_session(cluster: LocalCluster) -> None:
+    global _active_transfer_session
+    with _transfer_spawn_lock:
+        if (
+            _active_transfer_session is not None
+            and _active_transfer_session.any_alive()
+        ):
+            raise TransferSpawnBoundError(
+                "a transfer session is already live on this machine; "
+                "refusing a second concurrent one (R3c)"
+            )
+        _active_transfer_session = cluster
+
+
+def _release_transfer_session(cluster: LocalCluster) -> None:
+    global _active_transfer_session
+    with _transfer_spawn_lock:
+        if _active_transfer_session is cluster:
+            _active_transfer_session = None
 
 
 # -- liveness ----------------------------------------------------------------
@@ -189,7 +232,7 @@ def sweep_orphaned_ranks() -> int:
     killed = 0
     for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
         cmdline = proc.info.get("cmdline") or []
-        if WORKER_MODULE not in cmdline:
+        if not any(module in cmdline for module in _SWEEPABLE_MODULES):
             continue
         parent = proc.info.get("ppid")
         if parent == ours:
@@ -416,6 +459,13 @@ class LocalCluster:
     # one process (the single-host integration test) needs exactly one of them
     # to hold it. The head constructs with this False; the worker leaves it True.
     enforce_spawn_bound: bool = True
+    # S5 R3c: which entry point a spawned rank runs, and how its argv is
+    # built. Defaults reproduce the formation shape exactly (rank_worker,
+    # `--model`/`--seed`/`--control-fd`/`--metrics-path`); a non-default
+    # `module` is never used without a matching `argv_builder` (transfer
+    # sessions run `transfer_rank`, whose argv shape is unrelated).
+    module: str = WORKER_MODULE
+    argv_builder: Callable[[int], list[str]] | None = None
     ranks: list[RankProcess] = field(default_factory=list)
     _workdir: Path | None = None
     _deathwatch: DeathWatch | None = None
@@ -540,26 +590,33 @@ class LocalCluster:
             coordinator=self._coordinator,
             ibv_devices=self._ibv_path,
         )
-        argv = [
-            self.python,
-            "-m",
-            WORKER_MODULE,
-            "--model",
-            self.model,
-            "--seed",
-            str(self.seed),
-        ]
-        if self.metrics_dir is not None:
-            argv += [
-                "--metrics-path",
-                str(Path(self.metrics_dir) / f"rank-{rank}.json"),
-            ]
-
         control_r = control_w = None
-        if rank == 0:
-            control_r, control_w = os.pipe()
-            os.set_inheritable(control_r, True)
-            argv += ["--control-fd", str(control_r)]
+        if self.argv_builder is not None:
+            # A non-rank_worker entry point (e.g. transfer_rank): the caller
+            # owns the whole argv shape, including any inheritable fds it
+            # wants -- rank_worker's control-pipe convention is specific to
+            # its own daemon-abort protocol and does not apply generically.
+            argv = [self.python, "-m", self.module, *self.argv_builder(rank)]
+        else:
+            argv = [
+                self.python,
+                "-m",
+                self.module,
+                "--model",
+                self.model,
+                "--seed",
+                str(self.seed),
+            ]
+            if self.metrics_dir is not None:
+                argv += [
+                    "--metrics-path",
+                    str(Path(self.metrics_dir) / f"rank-{rank}.json"),
+                ]
+
+            if rank == 0:
+                control_r, control_w = os.pipe()
+                os.set_inheritable(control_r, True)
+                argv += ["--control-fd", str(control_r)]
 
         try:
             process = subprocess.Popen(
@@ -809,6 +866,7 @@ class LocalCluster:
             if entry.alive:
                 entry.process.kill()
         _release_formation(self)
+        _release_transfer_session(self)
 
     def stop(self, *, timeout: float = 10.0) -> None:
         """Shut every local rank down, politely then not.
@@ -844,3 +902,62 @@ class LocalCluster:
 
         self.ranks.clear()
         _release_formation(self)
+        _release_transfer_session(self)
+
+
+# -- S5 R3c: spawning one node's rank of a transfer-session round ------------
+
+
+def launch_transfer_session(
+    *,
+    rank: int,
+    world_size: int,
+    ips: list[str],
+    base_port: int,
+    argv_builder: Callable[[int], list[str]],
+    data_plane_subnet: str | None,
+    allow_routable_data_plane: bool = False,
+    allow_loopback: bool = False,
+    python: str | None = None,
+) -> LocalCluster:
+    """Spawn this node's rank of one transfer-session round (D1/D2/R3c).
+
+    Reuses :class:`LocalCluster`'s hostfile/link-scope/join-timeout/
+    deathwatch machinery with a parameterized entry module -- ``transfer_rank``,
+    never ``rank_worker`` -- so a transfer session gets the same salvage-pitfall
+    protections (rank 0 must listen before a peer connects, a dead rank is
+    noticed in seconds) without duplicating them. Always ring (D1: no RDMA
+    need for a transfer).
+
+    Transfer sessions claim the DEDICATED slot from
+    :func:`_register_transfer_session`, distinct from the formation slot: a
+    live formation and one transfer session coexist on the same machine; a
+    second concurrent transfer session raises :class:`TransferSpawnBoundError`.
+    The caller is responsible for releasing the session once its local
+    process has exited or been torn down (``cluster.stop()``/``cluster.kill()``
+    release both slots unconditionally, so this need not be called twice).
+    """
+    cluster = LocalCluster(
+        model="",
+        world_size=world_size,
+        backend="ring",
+        base_port=base_port,
+        python=python or sys.executable,
+        module=TRANSFER_MODULE,
+        argv_builder=argv_builder,
+        # This function owns its own (distinct) slot -- never the formation's.
+        enforce_spawn_bound=False,
+    )
+    _register_transfer_session(cluster)
+    try:
+        cluster.start(
+            [rank],
+            ips=ips,
+            data_plane_subnet=data_plane_subnet,
+            allow_routable_data_plane=allow_routable_data_plane,
+            allow_loopback=allow_loopback,
+        )
+    except BaseException:
+        _release_transfer_session(cluster)
+        raise
+    return cluster

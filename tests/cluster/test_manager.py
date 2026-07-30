@@ -603,3 +603,90 @@ class TestSnapshot:
                 "configured": False,
                 "expires_at": None,
             }
+
+
+class TestTransferUpdatesBoundsAndGate:
+    """S5 CL5-04 (bounded transfer_updates) and D4 (the operation gate)."""
+
+    async def test_oversized_transfer_updates_batch_is_dropped_not_truncated(
+        self, head_settings
+    ):
+        from omlx.cluster.manager import MAX_TRANSFER_UPDATES_PER_BEAT
+
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+            oversized = [
+                {"job_id": "j", "step": i, "status": "have"}
+                for i in range(MAX_TRANSFER_UPDATES_PER_BEAT + 1)
+            ]
+            recorded = []
+            manager._transfer.record_transfer_updates = lambda m, u: recorded.append(u)
+            manager.record_heartbeat(
+                member, seq=1, epoch="e1", transfer_updates=oversized
+            )
+            # Liveness recording still succeeds; the batch is simply dropped.
+            assert recorded == []
+
+    async def test_oversized_update_string_is_dropped_not_truncated(
+        self, head_settings
+    ):
+        from omlx.cluster.manager import MAX_TRANSFER_UPDATE_STRING_LENGTH
+
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+            recorded = []
+            manager._transfer.record_transfer_updates = lambda m, u: recorded.append(u)
+            manager.record_heartbeat(
+                member,
+                seq=1,
+                epoch="e1",
+                transfer_updates=[
+                    {
+                        "job_id": "j",
+                        "step": 1,
+                        "status": "error",
+                        "detail": "x" * (MAX_TRANSFER_UPDATE_STRING_LENGTH + 1),
+                    }
+                ],
+            )
+            assert recorded == []
+
+    async def test_well_formed_transfer_updates_reach_the_transfer_manager(
+        self, head_settings
+    ):
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+            recorded = []
+            manager._transfer.record_transfer_updates = lambda m, u: recorded.append(u)
+            update = {"job_id": "j", "step": 1, "status": "have", "have": ["a.json"]}
+            manager.record_heartbeat(
+                member, seq=1, epoch="e1", transfer_updates=[update]
+            )
+            assert recorded == [[update]]
+
+    async def test_gate_refuses_formation_while_transfer_active(self, head_settings):
+        async with running_manager(head_settings) as manager:
+            manager.acquire_operation_gate("transfer", "t1")
+            with pytest.raises(ClusterError) as excinfo:
+                manager.acquire_operation_gate("formation", "f1")
+            assert excinfo.value.status_code == 409
+            assert "t1" in excinfo.value.detail
+
+
+class TestTransferPortAssertion:
+    """S5 CL5-17: the derived transfer port range never silently overlaps."""
+
+    async def test_start_refuses_an_overlapping_configured_base_port(self, tmp_path):
+        settings = make_settings(
+            tmp_path,
+            role="head",
+            data_plane_subnet="10.0.2.0/24",
+            data_plane_address="10.0.2.1",
+            data_plane_base_port=41150,  # overlaps the derived transfer range
+        )
+        manager = ClusterManager(settings)
+        with pytest.raises(ValueError, match="overlaps"):
+            await manager.start()

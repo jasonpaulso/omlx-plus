@@ -61,6 +61,11 @@ class HeartbeatRequest(BaseModel):
     # rejecting the request here; a malformed value must never fail the
     # heartbeat's liveness path.
     node_state: Any = None
+    # S5 D1b: a SIBLING channel to job_updates, not an ack -- see
+    # `ClusterManager.record_heartbeat`. Bounds are enforced there
+    # (CL5-04), not by this model, so an oversized batch is a clean drop
+    # rather than a validation error.
+    transfer_updates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class LocalJoinRequest(BaseModel):
@@ -249,6 +254,7 @@ async def heartbeat(
             epoch=body.epoch,
             job_updates=body.job_updates,
             node_state=body.node_state,
+            transfer_updates=body.transfer_updates,
         )
     except ClusterError as exc:
         raise _http_error(exc) from exc

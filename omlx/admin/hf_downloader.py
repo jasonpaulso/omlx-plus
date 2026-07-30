@@ -8,6 +8,7 @@ with directory-size-based progress polling.
 import asyncio
 import enum
 import logging
+import re
 import shutil
 import time
 import uuid
@@ -37,6 +38,17 @@ _HF_API_TIMEOUT = 10
 
 # Seconds with no download progress before considering the download stalled.
 _STALL_TIMEOUT = 300
+
+# S5 CL5-02: strict repo_id charset -- a repo_id becomes a path component
+# (`self._model_dir / task.repo_id`, and on the cluster path a staging dir
+# path) both here and in `download_model_to_dir` below, so it must be a
+# well-formed two-segment HF id and nothing else. Covers the pre-existing
+# admin caller (`start_download`) too, not just the new cluster path.
+_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+# S5 CL5-03: the cluster path requires a full 40-hex commit sha, never a
+# branch or tag -- a name can move between the head resolving it and the
+# worker fetching it, which would silently defeat the manifest's pin.
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 # Cache of (configured_endpoint -> resolved_endpoint) so we only probe each
 # endpoint once per process lifetime. Mirrors like hf-mirror.com permanently
@@ -633,7 +645,7 @@ class HFDownloader:
             ValueError: If repo_id format is invalid or download is already queued.
         """
         repo_id = repo_id.strip()
-        if "/" not in repo_id or len(repo_id.split("/")) != 2:
+        if not _REPO_ID_RE.match(repo_id):
             raise ValueError(
                 f"Invalid repository ID: '{repo_id}'. "
                 "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"
@@ -1099,3 +1111,46 @@ class HFDownloader:
                 logger.info(f"Cleaned up in-progress shards: {temp_dir}")
             except Exception as e:
                 logger.error(f"Failed to clean up {temp_dir}: {e}")
+
+
+async def download_model_to_dir(
+    repo_id: str,
+    target_dir: Path,
+    *,
+    revision: str,
+    hf_token: str = "",
+    ignore_patterns: Optional[list] = None,  # noqa: UP045 - matches this file's existing Optional[...] style
+) -> None:
+    """Download one HF repo straight into ``target_dir`` (S5 D6).
+
+    Additive and standalone from :class:`HFDownloader`'s task/progress-poll
+    machinery -- the cluster transfer path wants one awaitable call into a
+    caller-owned staging dir, not a tracked, cancellable ``DownloadTask``.
+
+    ``revision`` is REQUIRED and must be a full 40-hex commit sha (CL5-03):
+    the head resolved one specific commit, and a branch/tag name could move
+    between that resolution and this fetch, silently defeating the
+    manifest's pin. ``ignore_patterns`` is the caller's DETERMINISTIC list
+    (D3a/CL5-01) -- never the ``model_info``-conditional one `start_download`
+    computes for the admin UI, which vanishes on a metadata failure.
+    """
+    repo_id = repo_id.strip()
+    if not _REPO_ID_RE.match(repo_id):
+        raise ValueError(f"Invalid repository ID: '{repo_id}'")
+    if not _COMMIT_SHA_RE.match(revision or ""):
+        raise ValueError(
+            f"Invalid revision {revision!r}: the cluster transfer path requires "
+            "a full 40-hex commit sha, never a branch or tag"
+        )
+    _api, endpoint = _get_hf_api()
+    dl_kwargs: dict = {
+        "repo_id": repo_id,
+        "revision": revision,
+        "local_dir": str(target_dir),
+        "token": hf_token or None,
+        "endpoint": endpoint,
+        "etag_timeout": 30,
+    }
+    if ignore_patterns:
+        dl_kwargs["ignore_patterns"] = list(ignore_patterns)
+    await asyncio.to_thread(snapshot_download, **dl_kwargs)  # type: ignore[arg-type]

@@ -39,7 +39,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 # rather than the primary skew defence (CL2-04).
 # S3 bump (was 1): adds RankOp, the forward-replay message the TP batch
 # generator broadcasts once per model invocation.
-PROTOCOL_VERSION = 2
+# S5 bump (was 2): adds TRANSFER_START/TRANSFER_ROUND/TRANSFER_ABORT.
+PROTOCOL_VERSION = 3
 
 
 class ProtocolError(ValueError):
@@ -367,6 +368,16 @@ class CommandKind(str, Enum):  # noqa: UP042
     SWEEP = "sweep"
     PRESENCE = "presence"
     TEARDOWN = "teardown"
+    TRANSFER_START = "transfer_start"
+    TRANSFER_ROUND = "transfer_round"
+    TRANSFER_ABORT = "transfer_abort"
+
+
+class TransferSource(str, Enum):  # noqa: UP042
+    """Where a transfer's bytes come from (D6)."""
+
+    PEER = "peer"
+    HF = "hf"
 
 
 class Backend(str, Enum):  # noqa: UP042
@@ -436,13 +447,75 @@ class TeardownCommand(_CommandBase):
     kind: Literal[CommandKind.TEARDOWN] = CommandKind.TEARDOWN
 
 
-Command = SpawnRankCommand | SweepCommand | PresenceCommand | TeardownCommand
+class TransferStartCommand(_CommandBase):
+    """Open a transfer job for one model (D2/D4).
+
+    ``manifest`` carries raw ``{relative_path, size, sha256}`` dicts -- shape
+    and business-rule validation both happen worker-side through
+    :func:`omlx.cluster.manifest.validate_received_manifest`, the single
+    path every entry must clear before it can reach ``FileManifestEntry``
+    (CL5-06's "single validating entry type"); this command layer stays a
+    plain container, matching every other command's typed-scalar style.
+
+    Deliberately never carries ``hf_token`` or ``endpoint`` (D7 low): the
+    worker uses its own settings for both, and ``extra="forbid"`` makes an
+    attempt to add either a rejected command, not a silently-accepted one.
+    ``epoch`` binds the job to the worker's CURRENT liveness epoch (CL5-10)
+    -- a job replayed against a worker that has since restarted (and so
+    minted a new epoch) is refused, never resumed against stale local state.
+    ``repair`` opts into re-transferring a destination the worker already
+    finds digest-complete (CL5-10 default-refuses that case).
+    """
+
+    kind: Literal[CommandKind.TRANSFER_START] = CommandKind.TRANSFER_START
+    model_id: str
+    manifest: list[dict[str, Any]]
+    source: TransferSource
+    epoch: str
+    repair: bool = False
+    # HF-source only (D6). None on a peer transfer.
+    hf_repo_id: str | None = None
+    hf_revision: str | None = None
+
+
+class TransferRoundCommand(_CommandBase):
+    """Run one round: transfer exactly ``subset`` over a fresh 2-rank ring
+    session addressed by ``peers``/``base_port`` (D1/D2). ``peers`` is
+    ``[head_address, worker_address]`` in rank order, re-validated by the
+    worker against its own link-scope settings exactly like formation's
+    ``SpawnRankCommand.peers`` (CL2-03).
+    """
+
+    kind: Literal[CommandKind.TRANSFER_ROUND] = CommandKind.TRANSFER_ROUND
+    subset: list[str]
+    peers: list[str]
+    base_port: int = Field(ge=1, le=65535)
+
+
+class TransferAbortCommand(_CommandBase):
+    """Cancel the owned transfer task and discard its staging (D4)."""
+
+    kind: Literal[CommandKind.TRANSFER_ABORT] = CommandKind.TRANSFER_ABORT
+
+
+Command = (
+    SpawnRankCommand
+    | SweepCommand
+    | PresenceCommand
+    | TeardownCommand
+    | TransferStartCommand
+    | TransferRoundCommand
+    | TransferAbortCommand
+)
 
 _COMMAND_BY_KIND: dict[str, type[_CommandBase]] = {
     CommandKind.SPAWN_RANK.value: SpawnRankCommand,
     CommandKind.SWEEP.value: SweepCommand,
     CommandKind.PRESENCE.value: PresenceCommand,
     CommandKind.TEARDOWN.value: TeardownCommand,
+    CommandKind.TRANSFER_START.value: TransferStartCommand,
+    CommandKind.TRANSFER_ROUND.value: TransferRoundCommand,
+    CommandKind.TRANSFER_ABORT.value: TransferAbortCommand,
 }
 
 
@@ -487,6 +560,24 @@ def make_job_update(
     any member/rank id carried here (CL2-07), so this shape deliberately does
     not name a member. ``status`` is one of ``accepted``, ``spawned``,
     ``present``, ``absent``, ``swept``, ``torn_down``, ``error``, ``rejected``.
+    """
+    update: dict[str, Any] = {"job_id": job_id, "step": step, "status": status}
+    update.update(extra)
+    return update
+
+
+def make_transfer_update(
+    job_id: str, step: int, *, status: str, **extra: Any
+) -> dict[str, Any]:
+    """Build a worker->head transfer update (D1b/D2).
+
+    Rides the heartbeat's ``transfer_updates`` field, a sibling of
+    ``job_updates`` -- NOT an ack: a TRANSFER_ROUND command's immediate ack
+    only confirms the round started, and its actual outcome (arriving
+    possibly minutes later) is one of these instead, so nothing is dropped
+    for being unmatched to a single-shot ack future. ``status`` is one of
+    ``accepted``, ``rejected``, ``have`` (a bare presence report), ``round_done``,
+    ``round_error``, ``aborted``, ``hf_progress``, ``done``, ``error``.
     """
     update: dict[str, Any] = {"job_id": job_id, "step": step, "status": status}
     update.update(extra)

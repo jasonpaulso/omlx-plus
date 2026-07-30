@@ -266,6 +266,89 @@ def test_parse_sweep_and_teardown_and_presence():
     assert presence.kind is CommandKind.PRESENCE
 
 
+# -- S5: TRANSFER_START/TRANSFER_ROUND/TRANSFER_ABORT ------------------------
+
+
+def _transfer_start_payload(**over):
+    base = {
+        "kind": "transfer_start",
+        "schema_version": PROTOCOL_VERSION,
+        "job_id": "j",
+        "step": 1,
+        "model_id": "m",
+        "manifest": [{"relative_path": "a.json", "size": 1, "sha256": "0" * 64}],
+        "source": "peer",
+        "epoch": "ep1",
+    }
+    base.update(over)
+    return base
+
+
+def test_parse_transfer_start_round_trip():
+    command = parse_command(_transfer_start_payload())
+    assert command.kind is CommandKind.TRANSFER_START
+    assert command.repair is False
+    assert command.hf_repo_id is None
+    assert command.hf_revision is None
+    wire = command_to_wire(command)
+    assert "hf_token" not in wire
+    assert "endpoint" not in wire
+
+
+def test_transfer_start_never_accepts_hf_token_or_endpoint():
+    # extra="forbid": these fields were never declared, so an attempt to
+    # smuggle them in is a rejected command, not a silently-accepted one.
+    with pytest.raises(ProtocolError):
+        parse_command(_transfer_start_payload(hf_token="secret"))
+    with pytest.raises(ProtocolError):
+        parse_command(_transfer_start_payload(endpoint="https://evil.example"))
+
+
+def test_parse_transfer_round_and_abort():
+    round_cmd = parse_command(
+        {
+            "kind": "transfer_round",
+            "schema_version": PROTOCOL_VERSION,
+            "job_id": "j",
+            "step": 2,
+            "subset": ["a.json"],
+            "peers": ["10.0.2.1", "10.0.2.2"],
+            "base_port": 41164,
+        }
+    )
+    assert round_cmd.kind is CommandKind.TRANSFER_ROUND
+
+    abort_cmd = parse_command(
+        {
+            "kind": "transfer_abort",
+            "schema_version": PROTOCOL_VERSION,
+            "job_id": "j",
+            "step": 3,
+        }
+    )
+    assert abort_cmd.kind is CommandKind.TRANSFER_ABORT
+
+
+def test_transfer_start_source_is_a_closed_enum():
+    with pytest.raises(ProtocolError):
+        parse_command(_transfer_start_payload(source="ftp"))
+
+
+def test_transfer_round_base_port_is_bounded():
+    with pytest.raises(ProtocolError):
+        parse_command(
+            {
+                "kind": "transfer_round",
+                "schema_version": PROTOCOL_VERSION,
+                "job_id": "j",
+                "step": 2,
+                "subset": [],
+                "peers": ["10.0.2.1", "10.0.2.2"],
+                "base_port": 70000,
+            }
+        )
+
+
 def test_parse_command_rejects_unknown_kind():
     with pytest.raises(ProtocolError):
         parse_command(

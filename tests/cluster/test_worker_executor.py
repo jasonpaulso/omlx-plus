@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
 from omlx.cluster import hostfile
 from omlx.cluster.manager import WorkerCommandExecutor
 from omlx.cluster.protocol import PROTOCOL_VERSION, SpawnRankCommand
@@ -307,3 +309,62 @@ async def test_presence_answers_absent(tmp_path):
         }
     )
     assert update["present"] is False
+
+
+# -- S5 CL5-05: per-job LRU + step ceiling on the replay dedup dicts ----------
+
+
+def _sweep_cmd(job_id: str, step: int) -> dict:
+    return {
+        "kind": "sweep",
+        "schema_version": PROTOCOL_VERSION,
+        "job_id": job_id,
+        "step": step,
+    }
+
+
+async def test_deliver_rejects_a_step_beyond_the_per_job_ceiling(tmp_path):
+    executor = _executor(tmp_path, [])
+    over = executor.MAX_STEPS_PER_JOB + 1
+    executor.deliver([_sweep_cmd("j1", over)])
+    # Never enqueued -- the queue stays empty, nothing to process.
+    assert executor._queue.empty()
+
+
+async def test_deliver_evicts_the_oldest_job_after_the_tracked_job_cap(tmp_path):
+    executor = _executor(tmp_path, [])
+    executor.MAX_TRACKED_JOBS = 2  # instance override, cheap to test small
+    for job_id in ("j1", "j2", "j3"):
+        executor.deliver([_sweep_cmd(job_id, 1)])
+        await executor._apply(_sweep_cmd(job_id, 1))
+        executor._applied[(job_id, 1)] = {"status": "swept"}
+    # j1 was the oldest and should have been evicted once j3 pushed the
+    # tracked-job count past the cap.
+    assert ("j1", 1) not in executor._seen
+    assert ("j2", 1) in executor._seen
+    assert ("j3", 1) in executor._seen
+
+
+async def test_replayed_command_reemits_prior_ack_without_reapplying(tmp_path):
+    executor = _executor(tmp_path, [])
+    await executor.start()
+    try:
+        cmd = _sweep_cmd("j1", 1)
+        executor.deliver([cmd])
+        for _ in range(200):
+            first_updates = executor.pending_job_updates()
+            if first_updates:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            pytest.fail("sweep command was never applied")
+        assert first_updates[0]["status"] == "swept"
+
+        # Re-delivering the same (job_id, step) must not re-enqueue; it
+        # re-emits the prior ack instead (CL2-06).
+        executor.deliver([cmd])
+        assert executor._queue.empty()
+        replayed = executor.pending_job_updates()
+        assert replayed == first_updates
+    finally:
+        await executor.stop()

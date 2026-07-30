@@ -544,6 +544,9 @@ class ClusterSettings:
     # role != "head", the placement call is never reached and the pool
     # behaves exactly as it did before S4.
     auto_placement: bool = True
+    # S5 D7 low: default-on switch to disable HF-source cluster transfers
+    # (peer transfers are unaffected).
+    allow_hf_transfer: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -568,11 +571,60 @@ class ClusterSettings:
                 data.get("allow_routable_data_plane", False)
             ),
             auto_placement=bool(data.get("auto_placement", True)),
+            allow_hf_transfer=bool(data.get("allow_hf_transfer", True)),
         )
 
 
 VALID_CLUSTER_ROLES = {"off", "head", "worker"}
 VALID_CLUSTER_BACKENDS = {"ring", "jaccl", "auto"}
+
+# S5 CL5-17: transfer sessions get a DEDICATED port range, offset from the
+# formation ring range (`data_plane_base_port .. +MAX_WORLD_SIZE-1`) so a
+# transfer session never collides with a live formation's ports. Duplicated
+# from `cluster.manager.MAX_WORLD_SIZE` (settings.py cannot import
+# manager.py -- manager.py imports settings.py) -- kept honest by
+# `assert_transfer_ports_non_overlapping`, exercised by the unit gate.
+TRANSFER_PORT_RANGE_OFFSET = 64  # == cluster.manager.MAX_WORLD_SIZE
+
+
+def transfer_base_port(cluster: ClusterSettings) -> int:
+    """The first port of the 2-port range one transfer session's ring uses
+    (D1: always ring, always 2 ranks)."""
+    return int(cluster.data_plane_base_port) + TRANSFER_PORT_RANGE_OFFSET
+
+
+def assert_transfer_ports_non_overlapping(cluster: ClusterSettings) -> None:
+    """CL5-17: loudly assert the derived transfer port range does not
+    collide with the formation ring range or the jaccl coordinator port.
+
+    Raises ``ValueError`` naming the overlap; called from
+    ``ClusterManager.start()`` so a misconfigured node refuses to start its
+    cluster role rather than silently risk a live collision.
+    """
+    from .cluster.hostfile import DEFAULT_JACCL_COORDINATOR_PORT
+
+    ring_lo = int(cluster.data_plane_base_port)
+    ring_hi = ring_lo + TRANSFER_PORT_RANGE_OFFSET - 1  # inclusive, max world size
+    xfer_lo = transfer_base_port(cluster)
+    xfer_hi = xfer_lo + 1  # a transfer session is always exactly 2 ranks
+
+    if xfer_lo < 1 or xfer_hi > 65535:
+        raise ValueError(
+            f"cluster transfer port range [{xfer_lo}, {xfer_hi}] (derived from "
+            f"data_plane_base_port={ring_lo}) is out of the valid port range"
+        )
+    if xfer_lo <= ring_hi:
+        raise ValueError(
+            f"cluster transfer port range [{xfer_lo}, {xfer_hi}] overlaps the "
+            f"formation ring range [{ring_lo}, {ring_hi}]; increase "
+            "cluster.data_plane_base_port"
+        )
+    if ring_lo <= DEFAULT_JACCL_COORDINATOR_PORT <= xfer_hi:
+        raise ValueError(
+            f"cluster transfer port range [{xfer_lo}, {xfer_hi}] overlaps the "
+            f"jaccl coordinator port {DEFAULT_JACCL_COORDINATOR_PORT}; increase "
+            "cluster.data_plane_base_port"
+        )
 
 
 def normalize_cluster_role(value: Any) -> str:

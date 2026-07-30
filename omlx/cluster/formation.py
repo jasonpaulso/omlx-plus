@@ -207,6 +207,10 @@ class FormationManager:
         # and this job is where a reader (GET /v1/cluster/models/status)
         # finds it.
         job.decision = decision.to_dict() if decision is not None else None
+        # S5 D4: the single-active cluster-operation gate -- refuses (409)
+        # while a transfer is in flight, so a formation and a transfer
+        # sequence can never interleave.
+        self._manager.acquire_operation_gate("formation", job.id)
         try:
             member = self._require_active_member()
             # Step 1: model present on the head's OWN dirs (id-only).
@@ -262,29 +266,37 @@ class FormationManager:
             job.mark("failed", "error", str(exc))
             await self._abort_formation()
             raise
+        finally:
+            self._manager.release_operation_gate("formation", job.id)
 
     async def _unload(self, model_id: str) -> dict[str, Any]:
         if self._active_model != model_id:
             raise ClusterError(404, f"no active distributed formation for {model_id!r}")
         job = self._new_job("unload", model_id)
-        # Arm the CL2-06 alarm before the teardown reaches the worker: after
-        # this, any worker update still reporting the formation as live is the
-        # on-path suppression residual.
-        self._torn_down_jobs.add(job.id)
-        member = self._active_member_or_none()
-        if member is not None:
-            try:
-                await self._command(member, self._teardown_cmd(job), job, "teardown")
-            except ClusterError as exc:
-                # Best-effort: the local teardown still runs.
-                job.mark("teardown_command", "error", str(exc))
-        engine = self._engines.pop(model_id, None)
-        if engine is not None:
-            await engine.stop()
-        await self._abort_formation()
-        job.status = "done"
-        job.mark("unloaded", "done")
-        return {"model": model_id, "status": "unloaded", "job_id": job.id}
+        self._manager.acquire_operation_gate("formation", job.id)
+        try:
+            # Arm the CL2-06 alarm before the teardown reaches the worker:
+            # after this, any worker update still reporting the formation as
+            # live is the on-path suppression residual.
+            self._torn_down_jobs.add(job.id)
+            member = self._active_member_or_none()
+            if member is not None:
+                try:
+                    await self._command(
+                        member, self._teardown_cmd(job), job, "teardown"
+                    )
+                except ClusterError as exc:
+                    # Best-effort: the local teardown still runs.
+                    job.mark("teardown_command", "error", str(exc))
+            engine = self._engines.pop(model_id, None)
+            if engine is not None:
+                await engine.stop()
+            await self._abort_formation()
+            job.status = "done"
+            job.mark("unloaded", "done")
+            return {"model": model_id, "status": "unloaded", "job_id": job.id}
+        finally:
+            self._manager.release_operation_gate("formation", job.id)
 
     async def stop(self) -> None:
         for engine in list(self._engines.values()):

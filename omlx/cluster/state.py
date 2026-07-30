@@ -175,13 +175,32 @@ class FileManifestEntry:
 
 @dataclass(frozen=True)
 class TransferJob:
-    """A resumable job record. S1 only reserves the shape."""
+    """A resumable job record (S1 reserved the shape; S5 D3/D4 is its first
+    real instantiation).
+
+    In-memory only, like :class:`~omlx.cluster.formation.FormationJob` --
+    :class:`ClusterState` never carries a live one, so a head restart loses
+    in-flight job records. The durable part of a transfer is the worker's
+    digest-verified final-dir contents (D2/D4); a re-issued job re-derives
+    its diff from a fresh worker ``have`` report rather than from anything
+    persisted here. Frozen, like every other record in this module -- a
+    mutation is a ``dataclasses.replace()`` producing a new snapshot, never
+    an in-place edit.
+    """
 
     id: str
     kind: str
     status: str
     created_at: float
     manifest: tuple[FileManifestEntry, ...] = ()
+    # S5 additive fields (D4):
+    model_id: str = ""
+    member_id: str = ""
+    source: str = ""  # "peer" | "hf"
+    have: tuple[str, ...] = ()  # verified relative paths, most recent report
+    rounds_completed: int = 0
+    error: str = ""
+    updated_at: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -190,6 +209,13 @@ class TransferJob:
             "status": self.status,
             "created_at": self.created_at,
             "manifest": [entry.to_dict() for entry in self.manifest],
+            "model_id": self.model_id,
+            "member_id": self.member_id,
+            "source": self.source,
+            "have": list(self.have),
+            "rounds_completed": self.rounds_completed,
+            "error": self.error,
+            "updated_at": self.updated_at,
         }
 
     @classmethod
@@ -203,6 +229,13 @@ class TransferJob:
                 FileManifestEntry.from_dict(entry)
                 for entry in data.get("manifest") or []
             ),
+            model_id=str(data.get("model_id") or ""),
+            member_id=str(data.get("member_id") or ""),
+            source=str(data.get("source") or ""),
+            have=tuple(str(p) for p in data.get("have") or []),
+            rounds_completed=int(data.get("rounds_completed") or 0),
+            error=str(data.get("error") or ""),
+            updated_at=float(data.get("updated_at") or 0.0),
         )
 
 

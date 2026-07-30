@@ -21,6 +21,7 @@ import logging
 import secrets
 import socket
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -28,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .formation import FormationManager
+    from .transfer import TransferManager, TransferWorkerExecutor
 
 from ..admin.auth import fingerprint_key
 from ..model_discovery import discover_models
@@ -53,6 +55,9 @@ from .protocol import (
     SpawnRankCommand,
     SweepCommand,
     TeardownCommand,
+    TransferAbortCommand,
+    TransferRoundCommand,
+    TransferStartCommand,
     make_job_update,
     parse_command,
 )
@@ -178,6 +183,14 @@ class WorkerCommandExecutor:
     is minutes-scale, so a rank spawn must not stall the liveness loop.
     """
 
+    # S5 CL5-05: LRU bound on how many distinct job_ids' (job_id, step) replay
+    # keys this worker keeps -- unbounded across a worker's lifetime, this
+    # would grow forever (many more steps per transfer job than any
+    # formation job ever had). Also doubles as CL5-11's round-cap backstop:
+    # a step beyond the per-job ceiling is refused outright.
+    MAX_TRACKED_JOBS = 64
+    MAX_STEPS_PER_JOB = 4096
+
     def __init__(
         self,
         global_settings: GlobalSettings,
@@ -185,6 +198,7 @@ class WorkerCommandExecutor:
         spawn_fn: Callable[[_PreparedSpawn], Any] | None = None,
         model_resolver: Callable[[str], tuple[str, int] | None] | None = None,
         local_addresses: set[str] | None = None,
+        transfer_executor: TransferWorkerExecutor | None = None,
     ) -> None:
         self._global_settings = global_settings
         self._spawn_fn = spawn_fn
@@ -192,10 +206,16 @@ class WorkerCommandExecutor:
         self._local_addresses = local_addresses
         self._applied: dict[tuple[str, int], dict[str, Any]] = {}
         self._seen: set[tuple[str, int]] = set()
+        self._job_order: OrderedDict[str, None] = OrderedDict()  # CL5-05 LRU
         self._updates: list[dict[str, Any]] = []
         self._cluster: Any = None
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
+        if transfer_executor is None:
+            from .transfer import TransferWorkerExecutor
+
+            transfer_executor = TransferWorkerExecutor(global_settings)
+        self._transfer = transfer_executor
 
     @property
     def settings(self) -> ClusterSettings:
@@ -205,6 +225,18 @@ class WorkerCommandExecutor:
     def cluster(self) -> Any:
         """The active local formation, or None."""
         return self._cluster
+
+    @property
+    def transfer(self) -> Any:
+        """The worker-side transfer executor (S5 D1b)."""
+        return self._transfer
+
+    def set_epoch(self, epoch: str) -> None:
+        """Wired from the heartbeat's own epoch (CL5-10): a transfer job is
+        bound to the epoch that was live when it started, and refuses a
+        command echoing a stale one.
+        """
+        self._transfer.set_epoch(epoch)
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -226,31 +258,75 @@ class WorkerCommandExecutor:
         Called from the heartbeat loop after the response signature has been
         checked, so it must stay fast: it only dedups and enqueues, never
         spawns. A re-delivered command that already produced an ack re-emits
-        that ack and never spawns again.
+        that ack and never spawns again. A step beyond ``MAX_STEPS_PER_JOB``
+        for its job_id is refused outright, never enqueued (CL5-05/CL5-11).
         """
         for raw in commands:
             if not isinstance(raw, dict):
                 continue
             key = self._replay_key(raw)
             if key is not None and key in self._seen:
+                self._job_order.move_to_end(key[0])
                 prior = self._applied.get(key)
                 if prior is not None:
-                    self._updates.append(prior)
+                    self._append_update(prior, self._channel_for_raw(raw))
                 continue
             if key is not None:
+                job_id, step = key
+                if step > self.MAX_STEPS_PER_JOB:
+                    logger.warning(
+                        "cluster: rejecting command for job %s: step %d exceeds "
+                        "the %d ceiling (CL5-05/CL5-11)",
+                        job_id,
+                        step,
+                        self.MAX_STEPS_PER_JOB,
+                    )
+                    continue
                 self._seen.add(key)
+                self._track_job(job_id)
             self._queue.put_nowait(raw)
+
+    def _track_job(self, job_id: str) -> None:
+        """CL5-05: LRU-evict the oldest job_id's replay keys once more than
+        ``MAX_TRACKED_JOBS`` distinct job_ids have been seen."""
+        if job_id in self._job_order:
+            self._job_order.move_to_end(job_id)
+            return
+        self._job_order[job_id] = None
+        if len(self._job_order) > self.MAX_TRACKED_JOBS:
+            oldest, _ = self._job_order.popitem(last=False)
+            for key in [k for k in self._seen if k[0] == oldest]:
+                self._seen.discard(key)
+                self._applied.pop(key, None)
 
     def pending_job_updates(self) -> list[dict[str, Any]]:
         """Drain the job updates accumulated since the last heartbeat."""
         updates, self._updates = self._updates, []
         return updates
 
+    def pending_transfer_updates(self) -> list[dict[str, Any]]:
+        """Drain the transfer updates accumulated since the last heartbeat
+        (S5 D1b) -- a SIBLING channel to job updates, not the same list."""
+        return self._transfer.pending_transfer_updates()
+
+    def _channel_for_raw(self, raw: dict[str, Any]) -> str:
+        kind = raw.get("kind")
+        if kind in ("transfer_start", "transfer_round", "transfer_abort"):
+            return "transfer"
+        return "job"
+
+    def _append_update(self, update: dict[str, Any], channel: str) -> None:
+        if channel == "transfer":
+            self._transfer.record_local_update(update)
+        else:
+            self._updates.append(update)
+
     # ---- command application (off the heartbeat path) --------------------
 
     async def _run(self) -> None:
         while True:
             raw = await self._queue.get()
+            channel = self._channel_for_raw(raw)
             try:
                 update = await self._apply(raw)
             except asyncio.CancelledError:
@@ -266,7 +342,7 @@ class WorkerCommandExecutor:
             key = self._replay_key(raw)
             if key is not None:
                 self._applied[key] = update
-            self._updates.append(update)
+            self._append_update(update, channel)
 
     async def _apply(self, raw: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -311,6 +387,10 @@ class WorkerCommandExecutor:
         if isinstance(command, TeardownCommand):
             await self._teardown_local()
             return make_job_update(command.job_id, command.step, status="torn_down")
+        if isinstance(
+            command, (TransferStartCommand, TransferRoundCommand, TransferAbortCommand)
+        ):
+            return await self._transfer.dispatch(command)
         # The command union is closed; anything else is a schema/parse invariant
         # violation. Fail closed rather than assert (which -O compiles out on the
         # spawn dispatch path).
@@ -576,6 +656,12 @@ class ClusterManager:
         self._executor: WorkerCommandExecutor | None = None
         # Head role: drives formation jobs on the E6 queue (D8), set in start().
         self._formation: FormationManager | None = None
+        # Head role: drives transfer jobs (S5 D4), set in start().
+        self._transfer: TransferManager | None = None
+        # S5 D4: the single-active cluster-operation gate -- one flag + owner,
+        # checked by both FormationManager's and TransferManager's queued
+        # ops, so a formation and a transfer sequence can never interleave.
+        self._active_operation: tuple[str, str] | None = None  # (kind, job_id)
 
     # ---- basic accessors -------------------------------------------------
 
@@ -626,12 +712,22 @@ class ClusterManager:
                 "`omlx serve --api-key ...`, the OMLX_API_KEY environment "
                 "variable, or the admin settings page, then restart."
             )
+        # CL5-17: loud, fail-fast assertion that the derived transfer port
+        # range does not collide with the formation ring range or the jaccl
+        # coordinator port. Applies to both roles -- either could spawn a
+        # transfer-session rank.
+        from ..settings import assert_transfer_ports_non_overlapping
+
+        assert_transfer_ports_non_overlapping(self.settings)
+
         self._state = load_state(self.state_path)
         await self._queue.start()
         if self.role == "head":
             from .formation import FormationManager
+            from .transfer import TransferManager
 
             self._formation = FormationManager(self)
+            self._transfer = TransferManager(self)
             self._scrub_task = asyncio.create_task(self._scrub_loop())
         elif self.role == "worker":
             self._executor = WorkerCommandExecutor(self.global_settings)
@@ -653,6 +749,9 @@ class ClusterManager:
         if self._formation is not None:
             await self._formation.stop()
             self._formation = None
+        if self._transfer is not None:
+            await self._transfer.stop()
+            self._transfer = None
         if self._executor is not None:
             await self._executor.stop()
             self._executor = None
@@ -665,9 +764,38 @@ class ClusterManager:
         return self._formation
 
     @property
+    def transfer(self) -> TransferManager | None:
+        """The head's transfer manager, or None off the head role."""
+        return self._transfer
+
+    @property
     def executor(self) -> WorkerCommandExecutor | None:
         """The worker's command executor, or None off the worker role."""
         return self._executor
+
+    # ---- S5 D4: the single-active cluster-operation gate ------------------
+
+    def acquire_operation_gate(self, kind: str, job_id: str) -> None:
+        """Claim the single-active-operation slot, or refuse with a 409
+        naming the in-flight job (D4 -- "concurrent formation/transfer
+        sequences are impossible by construction"). Symmetric: a formation
+        op refuses while a transfer is active, and vice versa.
+        """
+        if self._active_operation is not None:
+            active_kind, active_job = self._active_operation
+            raise ClusterError(
+                409,
+                f"a {active_kind} operation ({active_job}) is already in "
+                f"flight; {kind} operations must wait",
+            )
+        self._active_operation = (kind, job_id)
+
+    def release_operation_gate(self, kind: str, job_id: str) -> None:
+        """Release the slot, but only if it is still held by ``(kind, job_id)``
+        -- a release from a stale/already-superseded caller is a no-op.
+        """
+        if self._active_operation == (kind, job_id):
+            self._active_operation = None
 
     # ---- head commands ---------------------------------------------------
 
@@ -789,6 +917,7 @@ class ClusterManager:
         epoch: str,
         job_updates: list[dict[str, Any]] | None = None,
         node_state: Any = None,
+        transfer_updates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Record liveness for a heartbeat. Touches no persisted state.
 
@@ -799,15 +928,23 @@ class ClusterManager:
 
         The optional ``job_updates`` are attributed to the AUTHENTICATED
         ``member`` and any member/rank id in the update bodies is ignored
-        (CL2-07). When the head has formation work queued for this member the
-        reply carries ``commands`` plus a signature over the commands and the
-        echoed epoch+seq (CL2-05/CL2-06); S1 heartbeats (no updates, no
-        pending commands) get exactly the S1 reply.
+        (CL2-07). When the head has formation OR transfer work queued for
+        this member the reply carries ``commands`` plus a signature over the
+        commands and the echoed epoch+seq (CL2-05/CL2-06); S1 heartbeats (no
+        updates, no pending commands) get exactly the S1 reply.
 
         The optional ``node_state`` (S4 D1) is parsed leniently: a malformed
         or absent value simply means this member has no capacity data for
         placement — it never fails the heartbeat, and liveness is recorded
         either way.
+
+        The optional ``transfer_updates`` (S5 D1b) are a SIBLING of
+        ``job_updates``, not an ack -- a TRANSFER_ROUND command's immediate
+        ack only confirms the round started, and per-file progress/terminal
+        state arrive here, possibly several heartbeats later, and are
+        ACCUMULATED on the TransferJob rather than resolving a single-shot
+        future. Bounded, not truncated (CL5-04): an oversized batch is
+        dropped whole and logged, never partially applied.
         """
         if not epoch:
             raise ClusterError(400, "Heartbeat epoch must not be empty")
@@ -838,16 +975,27 @@ class ClusterManager:
         if job_updates and self._formation is not None:
             self._formation.record_job_updates(member, job_updates)
 
+        if transfer_updates and self._transfer is not None:
+            bounded = _bound_transfer_updates(transfer_updates)
+            if bounded is None:
+                logger.warning(
+                    "cluster: dropping oversized transfer_updates batch from "
+                    "member %s (CL5-04)",
+                    member.id,
+                )
+            else:
+                self._transfer.record_transfer_updates(member, bounded)
+
         reply: dict[str, Any] = {
             "member_id": member.id,
             "status": "active",
             "heartbeat_interval_s": float(self.settings.heartbeat_interval_s),
         }
-        commands = (
-            self._formation.commands_for(member.id)
-            if self._formation is not None
-            else []
-        )
+        commands: list[dict[str, Any]] = []
+        if self._formation is not None:
+            commands += self._formation.commands_for(member.id)
+        if self._transfer is not None:
+            commands += self._transfer.commands_for(member.id)
         if commands:
             digest = self._state.member_digests.get(member.id, "")
             reply["commands"] = commands
@@ -1157,8 +1305,15 @@ class ClusterManager:
             job_updates_provider=(
                 executor.pending_job_updates if executor is not None else None
             ),
+            transfer_updates_provider=(
+                executor.pending_transfer_updates if executor is not None else None
+            ),
             node_state_provider=self._collect_node_state,
         )
+        if executor is not None:
+            # CL5-10: a transfer job is bound to the epoch live when it
+            # started; the executor needs to know its own current one.
+            executor.set_epoch(self._heartbeat.epoch)
         await self._heartbeat.start()
 
     async def _scrub_loop(self) -> None:
@@ -1171,6 +1326,44 @@ class ClusterManager:
                 raise
             except Exception as exc:  # noqa: BLE001 - the loop must survive
                 logger.warning("Cluster scrub failed: %s", exc)
+
+
+# S5 CL5-04: bounds for one heartbeat's `transfer_updates` batch.
+MAX_TRANSFER_UPDATES_PER_BEAT = 50
+MAX_TRANSFER_UPDATE_STRING_LENGTH = 4096
+MAX_TRANSFER_UPDATE_LIST_ENTRIES = 100_000
+
+
+def _bound_transfer_updates(
+    raw: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """CL5-04: bound one heartbeat's ``transfer_updates`` batch.
+
+    Rejects (returns ``None`` for the WHOLE batch) rather than truncating any
+    single oversized field -- silently truncating a ``have`` list or an
+    error string could hide data loss instead of surfacing it.
+    """
+    if not isinstance(raw, list) or len(raw) > MAX_TRANSFER_UPDATES_PER_BEAT:
+        return None
+    for update in raw:
+        if not isinstance(update, dict):
+            return None
+        for value in update.values():
+            if (
+                isinstance(value, str)
+                and len(value) > MAX_TRANSFER_UPDATE_STRING_LENGTH
+            ):
+                return None
+            if isinstance(value, list):
+                if len(value) > MAX_TRANSFER_UPDATE_LIST_ENTRIES:
+                    return None
+                if any(
+                    isinstance(item, str)
+                    and len(item) > MAX_TRANSFER_UPDATE_STRING_LENGTH
+                    for item in value
+                ):
+                    return None
+    return raw
 
 
 def _bounded_interval(value: Any, *, default: float) -> float:

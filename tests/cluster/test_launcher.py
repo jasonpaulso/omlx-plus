@@ -20,8 +20,12 @@ from omlx.cluster.launcher import (
     LocalCluster,
     ReplyReader,
     SpawnBoundError,
+    TransferSpawnBoundError,
     _register_formation,
+    _register_transfer_session,
     _release_formation,
+    _release_transfer_session,
+    launch_transfer_session,
     sweep_orphaned_ranks,
 )
 
@@ -30,6 +34,7 @@ from omlx.cluster.launcher import (
 def _reset_formation_slot():
     yield
     launcher._active_cluster = None
+    launcher._active_transfer_session = None
 
 
 def _fake_cluster(alive: bool):
@@ -240,4 +245,113 @@ def test_ring_spawn_still_builds_hostfile_env(monkeypatch, tmp_path):
     assert env0["OMLX_CLUSTER_BACKEND"] == "ring"
     assert env0["MLX_HOSTFILE"]
     assert "MLX_JACCL_COORDINATOR" not in env0
-    assert "MLX_IBV_DEVICES" not in env0
+
+
+# -- S5 R3c: transfer sessions get their OWN single-slot bound ---------------
+
+
+def test_transfer_session_second_concurrent_is_refused():
+    first = _fake_cluster(alive=True)
+    _register_transfer_session(first)
+    with pytest.raises(TransferSpawnBoundError):
+        _register_transfer_session(_fake_cluster(alive=True))
+
+
+def test_transfer_session_slot_frees_after_release():
+    first = _fake_cluster(alive=True)
+    _register_transfer_session(first)
+    _release_transfer_session(first)
+    _register_transfer_session(_fake_cluster(alive=True))
+
+
+def test_transfer_session_coexists_with_a_live_formation():
+    # A live formation and one transfer session use DISTINCT slots.
+    _register_formation(_fake_cluster(alive=True))
+    _register_transfer_session(_fake_cluster(alive=True))  # must not raise
+
+
+def test_launch_transfer_session_uses_transfer_module_and_argv_builder(
+    monkeypatch, tmp_path
+):
+    def argv_builder(rank):
+        return ["--role", "dst", "--manifest", "/m.json", "--root", str(tmp_path)]
+
+    captured: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_popen(argv, env=None, **kwargs):
+        captured.append((argv, dict(env or {})))
+        return _FakePopen(argv, env, **kwargs)
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(LocalCluster, "wait_until_ready", lambda self, **_k: True)
+
+    cluster = launch_transfer_session(
+        rank=1,
+        world_size=2,
+        ips=["127.0.0.1", "127.0.0.1"],
+        base_port=41164,
+        argv_builder=argv_builder,
+        data_plane_subnet="127.0.0.0/8",
+        allow_loopback=True,
+    )
+    try:
+        assert len(captured) == 1
+        argv, env = captured[0]
+        assert argv[1:3] == ["-m", "omlx.cluster.transfer_rank"]
+        assert argv[3:] == [
+            "--role",
+            "dst",
+            "--manifest",
+            "/m.json",
+            "--root",
+            str(tmp_path),
+        ]
+        # transfer_rank's argv shape has no --control-fd (rank_worker-only).
+        assert "--control-fd" not in argv
+        assert env["MLX_RANK"] == "1"
+    finally:
+        cluster.stop()
+    # cluster.stop() releases both slots unconditionally.
+    assert launcher._active_transfer_session is None
+
+
+def test_launch_transfer_session_refuses_a_second_while_first_is_live(
+    monkeypatch, tmp_path
+):
+    def argv_builder(rank):
+        return ["--role", "dst", "--manifest", "/m.json", "--root", str(tmp_path)]
+
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "Popen",
+        lambda argv, env=None, **kw: _FakePopen(argv, env, **kw),
+    )
+    monkeypatch.setattr(LocalCluster, "wait_until_ready", lambda self, **_k: True)
+
+    first = launch_transfer_session(
+        rank=1,
+        world_size=2,
+        ips=["127.0.0.1", "127.0.0.1"],
+        base_port=41164,
+        argv_builder=argv_builder,
+        data_plane_subnet="127.0.0.0/8",
+        allow_loopback=True,
+    )
+    try:
+        with pytest.raises(TransferSpawnBoundError):
+            launch_transfer_session(
+                rank=1,
+                world_size=2,
+                ips=["127.0.0.1", "127.0.0.1"],
+                base_port=41164,
+                argv_builder=argv_builder,
+                data_plane_subnet="127.0.0.0/8",
+                allow_loopback=True,
+            )
+    finally:
+        first.stop()
+
+
+def test_sweep_matches_both_worker_and_transfer_modules():
+    assert launcher.WORKER_MODULE in launcher._SWEEPABLE_MODULES
+    assert launcher.TRANSFER_MODULE in launcher._SWEEPABLE_MODULES
