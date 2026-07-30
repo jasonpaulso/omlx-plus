@@ -314,6 +314,14 @@ async def test_admission_eviction_of_cluster_victim_never_awaits_under_lock(
     """Deadlock row: a formation job occupies the E6 queue while a task
     holding the pool lock selects the cluster entry as LRU victim --
     completes, and no formation await ever runs under the lock.
+
+    S4 P2b: the probe must run WHILE the driver's `formation.unload` await
+    is genuinely in flight, not merely after `get_engine("small")` has
+    already returned -- a post-hoc probe only proves a *completed*
+    operation released the lock (a placebo the M1 mutation, awaiting
+    formation.unload under `self._lock` in the driver, would still pass).
+    Gating the fake `formation.unload` lets the probe observe the lock
+    mid-await instead.
     """
     _pin_live_memory_readings_to_zero(monkeypatch)
     async with harness(tmp_path, load_delay=0.05) as h:
@@ -330,6 +338,17 @@ async def test_admission_eviction_of_cluster_victim_never_awaits_under_lock(
         # Ceiling only fits "small" alone, not both -- forces eviction.
         h.pool._get_final_ceiling = lambda: 1_500_000
 
+        teardown_started = asyncio.Event()
+        release_teardown = asyncio.Event()
+        real_unload = h.formation.unload
+
+        async def _gated_unload(model_id):
+            teardown_started.set()
+            await release_teardown.wait()
+            return await real_unload(model_id)
+
+        monkeypatch.setattr(h.formation, "unload", _gated_unload)
+
         # If the pool ever awaited formation.unload() under self._lock, this
         # concurrent lock probe would hang for the duration of that await.
         probe_acquired = asyncio.Event()
@@ -342,13 +361,21 @@ async def test_admission_eviction_of_cluster_victim_never_awaits_under_lock(
         mock_engine.start = AsyncMock()
         mock_engine.stop = AsyncMock()
         with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
-            engine = await h.pool.get_engine("small")
+            get_engine_task = asyncio.create_task(h.pool.get_engine("small"))
+
+            # The eviction has picked "target" as victim and the driver's
+            # teardown is now genuinely blocked inside formation.unload.
+            await asyncio.wait_for(teardown_started.wait(), timeout=1.0)
+
+            probe_task = asyncio.create_task(_probe())
+            await asyncio.wait_for(probe_acquired.wait(), timeout=1.0)
+            await probe_task
+
+            release_teardown.set()
+            engine = await asyncio.wait_for(get_engine_task, timeout=2.0)
+
         assert engine is mock_engine
         assert h.pool.get_entry("target").kind == "local"  # unformed
-
-        probe_task = asyncio.create_task(_probe())
-        await asyncio.wait_for(probe_acquired.wait(), timeout=1.0)
-        await probe_task
 
 
 async def test_cluster_victim_resolves_within_bounded_retries(tmp_path, monkeypatch):
@@ -415,6 +442,71 @@ async def test_enforcer_pressure_selection_filters_cluster_entries(tmp_path):
         # Default include_cluster=False -- the enforcer's own call site.
         assert h.pool._find_lru_victim() is None
         assert h.pool._find_lru_victim(include_cluster=True) == "target"
+
+
+async def test_enforcer_hard_pressure_loop_with_only_cluster_entries_is_bounded(
+    tmp_path, monkeypatch
+):
+    """S4 P2b test-quality item: prior coverage of the cluster/enforcer
+    interaction only exercised the selectors in isolation
+    (test_enforcer_pressure_selection_filters_cluster_entries above); this
+    drives the real hard-pressure while loop in `_check_and_enforce` with a
+    real EnginePool whose only non-pinned loaded entry is a cluster entry.
+    `_find_lru_victim()` and the busy-victim selector both filter it out, so
+    the loop must fall through to the "nothing evictable" branch and break
+    -- never calling `formation.unload` (no driver-owned teardown was
+    requested) or `_unload_engine` (which raises for kind="cluster").
+    """
+    from omlx.process_memory_enforcer import ProcessMemoryEnforcer
+
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+        entry = h.pool.get_entry("target")
+        assert entry.kind == "cluster"
+
+        real_unload = h.formation.unload
+        unload_calls: list[str] = []
+
+        async def _spy_unload(model_id):
+            unload_calls.append(model_id)
+            return await real_unload(model_id)
+
+        monkeypatch.setattr(h.formation, "unload", _spy_unload)
+
+        real_unload_engine = h.pool._unload_engine
+        unload_engine_calls: list[str] = []
+
+        async def _spy_unload_engine(model_id):
+            unload_engine_calls.append(model_id)
+            return await real_unload_engine(model_id)
+
+        monkeypatch.setattr(h.pool, "_unload_engine", _spy_unload_engine)
+
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=h.pool, soft_threshold=1.0, hard_threshold=1.0
+        )
+        enforcer._get_hard_limit_bytes = lambda: 1
+        enforcer._get_ceiling_breakdown = lambda: {
+            "static": 1,
+            "dynamic": 1,
+            "metal_cap": 1,
+            "hard_limit": 1,
+        }
+        monkeypatch.setattr(
+            "omlx.process_memory_enforcer.mx.get_active_memory", lambda: 100
+        )
+        monkeypatch.setattr(
+            "omlx.process_memory_enforcer.get_phys_footprint", lambda: 100
+        )
+
+        # Bounded: a hang here (an unbroken while loop with nothing to
+        # evict) would fail the test instead of stalling the suite.
+        await asyncio.wait_for(enforcer._check_and_enforce(), timeout=5.0)
+
+        assert unload_calls == []
+        assert unload_engine_calls == []
+        assert h.pool.get_entry("target").kind == "cluster"
+        assert h.pool.get_entry("target").engine is not None
 
 
 async def test_enforcer_busy_victim_selector_filters_cluster_entries(tmp_path):
@@ -575,6 +667,242 @@ async def test_placement_stale_triggers_exactly_one_recompute(tmp_path, monkeypa
         # caller (get_engine) recomputes on its next attempt, which this
         # unit exercises directly instead of driving get_engine's retry.
         assert calls == []
+
+
+# ---- driver teardown failure & quarantine (S4 P2b) -------------------------
+
+
+async def test_cluster_teardown_failure_preserves_state_then_driver_retries_to_success(
+    tmp_path, monkeypatch
+):
+    """S4 P2b residual #1: formation.unload failing during driver teardown
+    must not revert the entry to a loadable local state or drop its memory
+    accounting -- the driver's own retry (not a caller) is what eventually
+    tears it down.
+    """
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+        original_memory = h.pool.current_model_memory
+        original_engine = h.pool.get_entry("target").engine
+
+        attempt_2_started = asyncio.Event()
+        release_attempt_2 = asyncio.Event()
+        calls = {"n": 0}
+        real_unload = h.formation.unload
+
+        async def _flaky_unload(model_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated formation.unload failure")
+            attempt_2_started.set()
+            await release_attempt_2.wait()
+            return await real_unload(model_id)
+
+        monkeypatch.setattr(h.formation, "unload", _flaky_unload)
+
+        unload_task = asyncio.create_task(h.pool.request_unload("target"))
+        await asyncio.wait_for(attempt_2_started.wait(), timeout=1.0)
+
+        # After the first failed attempt, before the retry's own await
+        # resolves: still a cluster entry, still fully accounted, not yet
+        # quarantined, and the driver has already reclaimed it for retry.
+        entry = h.pool.get_entry("target")
+        assert entry.kind == "cluster"
+        assert entry.engine is original_engine
+        assert entry.cluster_teardown_failures == 1
+        assert entry.cluster_teardown_quarantined is False
+        assert entry.cluster_teardown_in_progress is True
+        assert h.pool.current_model_memory == original_memory
+
+        release_attempt_2.set()
+        await unload_task
+
+        assert calls["n"] == 2
+        entry = h.pool.get_entry("target")
+        assert entry.kind == "local"
+        assert entry.engine is None
+        assert entry.cluster_teardown_failures == 0
+        assert h.pool.current_model_memory == 0
+
+
+async def test_cluster_teardown_quarantines_after_max_failures_and_blocks_reload(
+    tmp_path, monkeypatch
+):
+    """S4 P2b residual #1: after `_CLUSTER_TEARDOWN_MAX_FAILURES` consecutive
+    `formation.unload` failures the driver stops auto-retrying and leaves
+    the entry quarantined -- accounting intact, still kind="cluster" (never
+    a loadable local row). `get_engine`/`load_cluster_model` both refuse it
+    with a clear error naming the divergence and the manual remedy.
+    """
+    from omlx.engine_pool import _CLUSTER_TEARDOWN_MAX_FAILURES
+    from omlx.exceptions import ModelUnavailableError
+
+    async with harness(tmp_path) as h:
+        await h.pool.load_cluster_model("target", "auto")
+        original_memory = h.pool.current_model_memory
+        original_engine = h.pool.get_entry("target").engine
+
+        async def _always_fail(model_id):
+            raise RuntimeError("simulated formation.unload failure")
+
+        monkeypatch.setattr(h.formation, "unload", _always_fail)
+
+        async with h.pool._lock:
+            entry = h.pool.get_entry("target")
+            h.pool._force_mark_cluster_unload_locked(entry, "test forced unload")
+
+        for _ in range(300):
+            if h.pool.get_entry("target").cluster_teardown_quarantined:
+                break
+            await asyncio.sleep(0.01)
+
+        entry = h.pool.get_entry("target")
+        assert entry.cluster_teardown_quarantined is True
+        assert entry.cluster_teardown_failures == _CLUSTER_TEARDOWN_MAX_FAILURES
+        assert entry.kind == "cluster"
+        assert entry.engine is original_engine
+        assert h.pool.current_model_memory == original_memory
+
+        with pytest.raises(ModelUnavailableError, match="quarantined"):
+            await h.pool.get_engine("target")
+        with pytest.raises(ModelUnavailableError, match="quarantined"):
+            await h.pool.load_cluster_model("target", "auto")
+
+        # Manual remedy: an explicit operator unload resets the counters
+        # and re-enters the claim pool -- the documented way out of
+        # quarantine.
+        async with h.pool._lock:
+            entry = h.pool.get_entry("target")
+            h.pool._force_mark_cluster_unload_locked(entry, "operator retry")
+            assert entry.cluster_teardown_quarantined is False
+            assert entry.cluster_teardown_failures == 0
+
+
+async def test_get_engine_retries_exhausted_names_last_placement_reasons(
+    tmp_path, monkeypatch
+):
+    """S4 P2b residual #3: when the bounded outer retry in `get_engine`
+    exhausts without settling, the raised `ModelLoadingError` names the
+    last computed placement decision's reasons instead of a bare "retry
+    the request".
+    """
+    from omlx.cluster import placement as placement_mod
+    from omlx.cluster.placement import PlacementDecision
+    from omlx.exceptions import ModelLoadingError
+
+    async with harness(tmp_path) as h:
+        # A synthetic, always-distributed decision with a known reason --
+        # avoids depending on what real placement's reasons happen to
+        # contain for this fixture's exact fit/presence numbers.
+        fake_decision = PlacementDecision(
+            mode="distributed",
+            world_size=2,
+            per_rank_estimate=1,
+            reasons=("synthetic reason for test",),
+            fits={},
+            presence={},
+            divisible=True,
+            requires_eviction=False,
+        )
+        monkeypatch.setattr(
+            placement_mod, "plan_placement", lambda *a, **k: fake_decision
+        )
+        # Every claim-time revalidation finds it stale, so the outer retry
+        # in get_engine exhausts without ever settling into a loaded state.
+        monkeypatch.setattr(
+            h.pool,
+            "_revalidate_cluster_decision_locked",
+            lambda entry, decision: False,
+        )
+
+        with pytest.raises(ModelLoadingError) as excinfo:
+            await h.pool.get_engine("target")
+
+        message = str(excinfo.value)
+        assert "did not settle into a loaded state" in message
+        assert "synthetic reason for test" in message
+
+
+# ---- variant+gate race (S4 P2b) ---------------------------------------------
+
+
+async def test_variant_reload_race_does_not_serve_wrong_variant(tmp_path, monkeypatch):
+    """S4 P2b residual #4: `_get_engine_attempt`'s cluster-gate branch
+    releases `self._lock` for placement I/O (config.json read) and
+    re-acquires it to bind. If a concurrent request reloaded the model
+    with a *different* runtime_settings variant in that window, the
+    re-acquired scope must not silently serve it -- it must retry so the
+    next attempt reconciles to the variant this caller actually requested.
+
+    There is no genuine `await` between the pool's two lock scopes here
+    today (the placement I/O is synchronous), so nothing can interleave in
+    production as written; this pins the guard's behavior defensively by
+    simulating the race as a side effect of the I/O call itself -- the
+    deterministic equivalent of a second task grabbing the freed lock and
+    completing its own reload before this attempt reacquires it.
+    """
+    from omlx.cluster import placement as placement_mod
+
+    async with harness(tmp_path) as h:
+        # Force the "local" placement branch (cluster gate active, but
+        # mode="local") so this exercises the release/reacquire window
+        # without needing a real distributed formation load. "target" is
+        # sized to fail the local ceiling by design (the harness's whole
+        # point is forcing distributed placement) -- raise it so the local
+        # admission this test forces can actually succeed.
+        import dataclasses
+
+        h.pool._get_final_ceiling = lambda: 100_000_000
+
+        real_plan = placement_mod.plan_placement
+
+        def _force_local(*args, **kwargs):
+            decision = real_plan(*args, **kwargs)
+            return dataclasses.replace(decision, mode="local")
+
+        monkeypatch.setattr(placement_mod, "plan_placement", _force_local)
+
+        requested_signature = (("variant", "requested"),)
+        monkeypatch.setattr(
+            h.pool,
+            "_engine_runtime_signature",
+            lambda model_id, runtime_settings=None, **kw: requested_signature,
+        )
+
+        real_resolve_inputs = placement_mod.resolve_placement_inputs
+        raced = {"done": False}
+
+        def _resolve_inputs_with_one_time_race(model_path):
+            if not raced["done"]:
+                raced["done"] = True
+                # Simulate a concurrent request finishing its own reload
+                # with a DIFFERENT variant while this attempt's lock was
+                # released for this I/O.
+                racing_engine = MagicMock()
+                racing_engine.stop = AsyncMock()
+                racing_engine.has_active_requests = MagicMock(return_value=False)
+                entry = h.pool._entries["target"]
+                entry.engine = racing_engine
+                entry.runtime_settings_signature = (("variant", "racing"),)
+            return real_resolve_inputs(model_path)
+
+        monkeypatch.setattr(
+            placement_mod,
+            "resolve_placement_inputs",
+            _resolve_inputs_with_one_time_race,
+        )
+
+        _pin_live_memory_readings_to_zero(monkeypatch)
+        final_engine = MagicMock()
+        final_engine.start = AsyncMock()
+        final_engine.stop = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=final_engine):
+            engine = await h.pool.get_engine("target", runtime_settings=object())
+
+        assert raced["done"] is True
+        assert engine is final_engine
+        entry = h.pool.get_entry("target")
+        assert entry.runtime_settings_signature == requested_signature
 
 
 # ---- variant-branch (kind guard) rows --------------------------------------

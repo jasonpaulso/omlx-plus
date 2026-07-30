@@ -1151,6 +1151,13 @@ class ProcessMemoryEnforcer:
         )
         admission_paused = self._pressure_level != "ok"
         for entry in self._engine_pool._entries.values():
+            if getattr(entry, "kind", "local") == "cluster":
+                # S4 P2b: a cluster entry's scheduler lives in a rank
+                # subprocess -- ClusterEngine never builds `._engine`, so
+                # `_resolve_scheduler` would find nothing and log the
+                # "could not resolve scheduler" warning below as if this
+                # were a wrapper-chain regression. Skip it explicitly.
+                continue
             scheduler = self._resolve_scheduler(entry)
             if scheduler is None:
                 engine = getattr(entry, "engine", None)

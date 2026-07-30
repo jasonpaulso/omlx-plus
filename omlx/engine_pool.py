@@ -126,6 +126,15 @@ class EngineEntry:
     # (matches _unload_engine's immediate-abort semantics for local
     # entries); background marks (TTL, admission eviction) do not set this.
     cluster_unload_force: bool = False
+    # S4 P2b: consecutive `formation.unload` failures for this entry's
+    # driver-owned teardown. Reset to 0 on a successful teardown or a fresh
+    # operator unload (`_force_mark_cluster_unload_locked`).
+    cluster_teardown_failures: int = 0
+    # Set once `cluster_teardown_failures` hits `_CLUSTER_TEARDOWN_MAX_FAILURES`:
+    # the entry stays kind="cluster" (never silently reverts to a loadable
+    # local row) but the driver stops auto-retrying it. Only an explicit
+    # operator unload (which resets the counters above) clears this.
+    cluster_teardown_quarantined: bool = False
 
 
 # S4 D4: bounded outer retry for get_engine's cluster branches (rev4/5/6).
@@ -134,6 +143,9 @@ _GET_ENGINE_MAX_ATTEMPTS = 3
 # teardown (request_unload, admission eviction of a cluster victim).
 _CLUSTER_UNLOAD_MARGIN_S = 15.0
 _CLUSTER_UNLOAD_FALLBACK_TIMEOUT_S = 30.0
+# S4 P2b: consecutive `formation.unload` failures before the driver stops
+# auto-retrying a cluster entry's teardown and quarantines it instead.
+_CLUSTER_TEARDOWN_MAX_FAILURES = 3
 
 
 class PlacementStaleError(Exception):
@@ -168,6 +180,22 @@ class _ClusterLoadPendingError(Exception):
     def __init__(self, decision: PlacementDecision) -> None:
         super().__init__(decision.mode)
         self.decision = decision
+
+
+class _ConcurrentVariantRaceError(Exception):
+    """Internal control-flow signal (S4 P2b): the cluster-gate branch of
+    ``_get_engine_attempt`` released ``self._lock`` for placement I/O and,
+    on re-acquiring it, found the entry loaded with a runtime-settings
+    variant that does not match what this attempt requested -- a
+    concurrent request reloaded it in the window. Raised under the lock so
+    the caller never serves the wrong variant; the outer ``get_engine``
+    retry loop (bound already exists) re-evaluates against the now-current
+    entry, which will unload/reload to the requested variant.
+    """
+
+    def __init__(self, model_id: str) -> None:
+        super().__init__(model_id)
+        self.model_id = model_id
 
 
 class EnginePool:
@@ -917,9 +945,15 @@ class EnginePool:
         matching `_unload_engine`'s documented immediate-abort semantics for
         local entries. Distinct from `_mark_pending_unload_locked`, whose
         pin/busy refusal is for background marks (TTL, admission eviction).
+
+        Also clears a prior quarantine (S4 P2b): an explicit unload is the
+        documented manual remedy for a divergence left by repeated
+        `formation.unload` failures, so it gets a fresh set of retries.
         """
         entry.pending_unload_reason = reason
         entry.cluster_unload_force = True
+        entry.cluster_teardown_failures = 0
+        entry.cluster_teardown_quarantined = False
         self._wake_cluster_unload_driver_locked()
 
     def _cluster_unload_completion_event_locked(self, model_id: str) -> asyncio.Event:
@@ -963,6 +997,11 @@ class EnginePool:
         for mid, entry in self._entries.items():
             if entry.kind != "cluster" or entry.cluster_teardown_in_progress:
                 continue
+            if entry.cluster_teardown_quarantined:
+                # S4 P2b: stop auto-retrying after repeated failures; an
+                # explicit operator unload clears this and re-enters the
+                # claim pool.
+                continue
             if not entry.pending_unload_reason or entry.is_loading:
                 continue
             if not entry.cluster_unload_force and self._entry_is_busy(entry):
@@ -972,37 +1011,82 @@ class EnginePool:
         return None
 
     async def _teardown_cluster_entry(self, model_id: str) -> None:
-        """Unform one claimed cluster entry outside the pool lock, then
-        restore it to a plain unloaded `kind="local"` row and signal
-        anything awaiting its completion event.
+        """Unform one claimed cluster entry outside the pool lock.
+
+        On success, restore it to a plain unloaded `kind="local"` row and
+        signal anything awaiting its completion event.
+
+        On failure (S4 P2b): `formation.unload` raising must not revert the
+        entry to a loadable local state -- pool and formation would then
+        diverge (formation may still hold live ranks / an active_model)
+        while a fresh local load of the same model_id becomes possible.
+        The entry stays `kind="cluster"` and `_current_model_memory` keeps
+        counting its share (the head's memory is still resident); the
+        claim is released so the driver's own retry loop picks it back up.
+        After `_CLUSTER_TEARDOWN_MAX_FAILURES` consecutive failures the
+        entry is quarantined -- no further automatic retries, and
+        `get_engine`/`load_cluster_model` refuse it with a clear pointer at
+        the manual remedy (`POST /v1/cluster/models/unload`, which also
+        clears the quarantine).
         """
         from .cluster.manager import get_cluster_manager
 
+        unload_ok = False
         try:
             manager = get_cluster_manager()
             if manager is not None and manager.formation is not None:
                 await manager.formation.unload(model_id)
+            unload_ok = True
         except Exception:
             logger.exception("cluster: driver teardown failed for '%s'", model_id)
         finally:
             async with self._lock:
                 entry = self._entries.get(model_id)
                 if entry is not None and entry.kind == "cluster":
-                    if entry.engine is not None:
-                        self._current_model_memory = max(
-                            0, self._current_model_memory - entry.estimated_size
-                        )
-                    entry.engine = None
-                    entry.kind = "local"
-                    if entry.cluster_original_estimated_size is not None:
-                        entry.estimated_size = entry.cluster_original_estimated_size
-                    entry.cluster_original_estimated_size = None
-                    entry.cluster_head_share = None
-                    entry.cluster_teardown_in_progress = False
-                    entry.pending_unload_reason = None
-                    entry.cluster_unload_force = False
-                    entry.last_access = 0.0
-                self._signal_cluster_unload_complete_locked(model_id)
+                    if unload_ok:
+                        if entry.engine is not None:
+                            self._current_model_memory = max(
+                                0, self._current_model_memory - entry.estimated_size
+                            )
+                        entry.engine = None
+                        entry.kind = "local"
+                        if entry.cluster_original_estimated_size is not None:
+                            entry.estimated_size = entry.cluster_original_estimated_size
+                        entry.cluster_original_estimated_size = None
+                        entry.cluster_head_share = None
+                        entry.cluster_teardown_in_progress = False
+                        entry.pending_unload_reason = None
+                        entry.cluster_unload_force = False
+                        entry.cluster_teardown_failures = 0
+                        entry.cluster_teardown_quarantined = False
+                        entry.last_access = 0.0
+                        self._signal_cluster_unload_complete_locked(model_id)
+                    else:
+                        entry.cluster_teardown_in_progress = False
+                        entry.cluster_teardown_failures += 1
+                        if (
+                            entry.cluster_teardown_failures
+                            >= _CLUSTER_TEARDOWN_MAX_FAILURES
+                        ):
+                            entry.cluster_teardown_quarantined = True
+                            logger.error(
+                                "cluster: teardown for '%s' failed %d consecutive "
+                                "times -- quarantining the entry; pool and "
+                                "formation state may have diverged. Retry with "
+                                "POST /v1/cluster/models/unload.",
+                                model_id,
+                                entry.cluster_teardown_failures,
+                            )
+                        # Do not signal completion here: an awaiter
+                        # (unload_cluster_model / admission eviction) times
+                        # out via `_await_cluster_teardown`'s own bound
+                        # instead of being told the unload succeeded when
+                        # it did not.
+                else:
+                    # Entry vanished or is no longer a cluster row (should
+                    # not happen -- nothing else deletes/reverts a cluster
+                    # entry mid-teardown); still release any waiter.
+                    self._signal_cluster_unload_complete_locked(model_id)
             self._wake_process_memory_enforcer()
 
     async def _cluster_unload_driver_loop(self) -> None:
@@ -1101,6 +1185,24 @@ class EnginePool:
         entry.is_loading = False
         entry.loading_started_at = None
 
+    @staticmethod
+    def _raise_if_cluster_quarantined(entry: EngineEntry) -> None:
+        """S4 P2b: a cluster entry whose teardown failed
+        `_CLUSTER_TEARDOWN_MAX_FAILURES` times in a row is left quarantined
+        (kind stays "cluster" so accounting isn't silently dropped, but
+        nothing may treat it as loaded or reload it out from under a
+        possibly still-live formation). Caller holds `self._lock`.
+        """
+        if entry.kind == "cluster" and entry.cluster_teardown_quarantined:
+            raise ModelUnavailableError(
+                entry.model_id,
+                f"Model '{entry.model_id}' is quarantined after "
+                f"{entry.cluster_teardown_failures} consecutive failed "
+                "cluster teardown attempts; the engine pool and cluster "
+                "formation state may have diverged. Retry with POST "
+                "/v1/cluster/models/unload before loading this model again.",
+            )
+
     async def load_cluster_model(
         self,
         model_id: str,
@@ -1134,6 +1236,7 @@ class EnginePool:
                 entry = self._entries.get(model_id)
                 if entry is None:
                     raise ModelNotFoundError(model_id, list(self._entries.keys()))
+                self._raise_if_cluster_quarantined(entry)
                 if entry.engine is not None:
                     entry.last_access = time.time()
                     return {"model": model_id, "status": "ready", "decision": None}
@@ -1152,6 +1255,7 @@ class EnginePool:
                 entry = self._entries.get(model_id)
                 if entry is None:
                     raise ModelNotFoundError(model_id, list(self._entries.keys()))
+                self._raise_if_cluster_quarantined(entry)
                 if entry.engine is not None:
                     entry.last_access = time.time()
                     return {"model": model_id, "status": "ready", "decision": None}
@@ -1177,6 +1281,7 @@ class EnginePool:
                 entry = self._entries.get(model_id)
                 if entry is None:
                     raise ModelNotFoundError(model_id, list(self._entries.keys()))
+                self._raise_if_cluster_quarantined(entry)
                 if entry.engine is not None:
                     entry.last_access = time.time()
                     return {
@@ -1317,6 +1422,7 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
+        last_decision: PlacementDecision | None = None
         for _attempt in range(_GET_ENGINE_MAX_ATTEMPTS):
             try:
                 return await self._get_engine_attempt(
@@ -1328,14 +1434,20 @@ class EnginePool:
             except _ClusterVictimPendingError as pending:
                 await self._await_cluster_teardown(pending.model_id, pending.event)
             except _ClusterLoadPendingError as pending:
+                last_decision = pending.decision
                 with suppress(PlacementStaleError):
                     await self.load_cluster_model(
                         model_id, "auto", decision=pending.decision
                     )
+            except _ConcurrentVariantRaceError:
+                pass  # entry now reflects a concurrent load; next attempt re-evaluates
+        detail = ""
+        if last_decision is not None and last_decision.reasons:
+            detail = f" Last placement decision: {'; '.join(last_decision.reasons)}."
         raise ModelLoadingError(
             model_id,
             f"Model '{model_id}' did not settle into a loaded state after "
-            f"{_GET_ENGINE_MAX_ATTEMPTS} attempts; retry the request.",
+            f"{_GET_ENGINE_MAX_ATTEMPTS} attempts; retry the request.{detail}",
         )
 
     async def _get_engine_attempt(
@@ -1354,6 +1466,7 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if not entry:
                 raise ModelNotFoundError(model_id, list(self._entries.keys()))
+            self._raise_if_cluster_quarantined(entry)
             unloaded_for_admission = False
 
             # Already loaded - just update access time. Cluster entries take
@@ -1456,6 +1569,22 @@ class EnginePool:
             if entry.engine is not None:
                 # Raced with a concurrent loader while the lock was released
                 # for the config.json read above; the entry is now loaded.
+                # S4 P2b: if this attempt asked for a specific runtime
+                # settings variant, don't silently serve whatever variant
+                # the racing loader landed -- let the outer retry
+                # re-evaluate against the now-current entry instead.
+                expected_signature = self._engine_runtime_signature(
+                    model_id, runtime_settings
+                )
+                if (
+                    expected_signature is not None
+                    and entry.runtime_settings_signature is not None
+                    and entry.runtime_settings_signature != expected_signature
+                ) or (
+                    runtime_settings is not None
+                    and entry.runtime_settings_signature is None
+                ):
+                    raise _ConcurrentVariantRaceError(model_id)
                 entry.last_access = time.time()
                 if _lease:
                     entry.in_use += 1
