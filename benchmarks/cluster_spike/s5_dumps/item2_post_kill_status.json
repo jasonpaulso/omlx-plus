@@ -1,0 +1,1 @@
+{"active_model":null,"jobs":[],"alarms":[],"transfer":{"jobs":[{"id":"feb83e7241e5","kind":"transfer","status":"error","model_id":"gpt-oss-120b-Fable-5-Distilled","member_id":"e90025295b30fc64","source":"peer","created_at":1785426654.083432,"updated_at":1785426705.816135,"rounds_completed":0,"error":"worker did not ack in time","files_total":22,"files_verified":16}]}}

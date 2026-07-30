@@ -1,0 +1,267 @@
+{
+ "sha": "7f9576bf (item1 captured at bc9d1469; P3a/P3b fixes landed mid-run)",
+ "captured_at": "2026-07-30T12:23:58",
+ "item1": {
+  "model_id": "gpt-oss-120b-Fable-5-Distilled",
+  "manifest_entry_count": 22,
+  "load_accepted": true,
+  "preemptive_user_actions": [],
+  "job_reached_done": true,
+  "formation_ready": true,
+  "post_form_stream_tokens": 48,
+  "worker_discovered_id": "gpt-oss-120b-Fable-5-Distilled",
+  "worker_final_dir_file_count": 22
+ },
+ "item2": {
+  "killed_mid_flight": true,
+  "verified_before_kill": [
+   {
+    "path": "chat_template.jinja",
+    "size": 16738,
+    "mtime_ns": 1785424841182393087
+   },
+   {
+    "path": "config.json",
+    "size": 40893,
+    "mtime_ns": 1785424841183296801
+   },
+   {
+    "path": "generation_config.json",
+    "size": 172,
+    "mtime_ns": 1785424841184288932
+   },
+   {
+    "path": "model-00001-of-00013.safetensors",
+    "size": 5260027926,
+    "mtime_ns": 1785424842331898421
+   },
+   {
+    "path": "model-00002-of-00013.safetensors",
+    "size": 5173657574,
+    "mtime_ns": 1785424843402598646
+   },
+   {
+    "path": "model-00003-of-00013.safetensors",
+    "size": 5173657586,
+    "mtime_ns": 1785424844592226809
+   },
+   {
+    "path": "model-00004-of-00013.safetensors",
+    "size": 5173657575,
+    "mtime_ns": 1785424846472393619
+   },
+   {
+    "path": "model-00005-of-00013.safetensors",
+    "size": 5173657706,
+    "mtime_ns": 1785424847962025536
+   },
+   {
+    "path": "model-00006-of-00013.safetensors",
+    "size": 5173657626,
+    "mtime_ns": 1785424849487444089
+   },
+   {
+    "path": "model-00007-of-00013.safetensors",
+    "size": 5173657702,
+    "mtime_ns": 1785424874862124786
+   },
+   {
+    "path": "model-00008-of-00013.safetensors",
+    "size": 5173657676,
+    "mtime_ns": 1785425276204175801
+   },
+   {
+    "path": "model.safetensors.index.json",
+    "size": 100431,
+    "mtime_ns": 1785424882337868041
+   },
+   {
+    "path": "README.md",
+    "size": 10584,
+    "mtime_ns": 1785424841180011322
+   },
+   {
+    "path": "special_tokens_map.json",
+    "size": 440,
+    "mtime_ns": 1785424882339561176
+   },
+   {
+    "path": "tokenizer_config.json",
+    "size": 485,
+    "mtime_ns": 1785424882361651103
+   },
+   {
+    "path": "tokenizer.json",
+    "size": 27868342,
+    "mtime_ns": 1785424882359918009
+   },
+   {
+    "path": "TOOL_CALLING.md",
+    "size": 13671,
+    "mtime_ns": 1785424841181440498
+   }
+  ],
+  "verified_after_resume": [
+   {
+    "path": "chat_template.jinja",
+    "size": 16738,
+    "mtime_ns": 1785424841182393087
+   },
+   {
+    "path": "config.json",
+    "size": 40893,
+    "mtime_ns": 1785424841183296801
+   },
+   {
+    "path": "generation_config.json",
+    "size": 172,
+    "mtime_ns": 1785424841184288932
+   },
+   {
+    "path": "model-00001-of-00013.safetensors",
+    "size": 5260027926,
+    "mtime_ns": 1785424842331898421
+   },
+   {
+    "path": "model-00002-of-00013.safetensors",
+    "size": 5173657574,
+    "mtime_ns": 1785424843402598646
+   },
+   {
+    "path": "model-00003-of-00013.safetensors",
+    "size": 5173657586,
+    "mtime_ns": 1785424844592226809
+   },
+   {
+    "path": "model-00004-of-00013.safetensors",
+    "size": 5173657575,
+    "mtime_ns": 1785424846472393619
+   },
+   {
+    "path": "model-00005-of-00013.safetensors",
+    "size": 5173657706,
+    "mtime_ns": 1785424847962025536
+   },
+   {
+    "path": "model-00006-of-00013.safetensors",
+    "size": 5173657626,
+    "mtime_ns": 1785424849487444089
+   },
+   {
+    "path": "model-00007-of-00013.safetensors",
+    "size": 5173657702,
+    "mtime_ns": 1785424874862124786
+   },
+   {
+    "path": "model-00008-of-00013.safetensors",
+    "size": 5173657676,
+    "mtime_ns": 1785426809372133098
+   },
+   {
+    "path": "model-00009-of-00013.safetensors",
+    "size": 5173657674,
+    "mtime_ns": 1785426812431275401
+   },
+   {
+    "path": "model-00010-of-00013.safetensors",
+    "size": 5173657690,
+    "mtime_ns": 1785426814400432134
+   },
+   {
+    "path": "model-00011-of-00013.safetensors",
+    "size": 5173657706,
+    "mtime_ns": 1785426815949591734
+   },
+   {
+    "path": "model-00012-of-00013.safetensors",
+    "size": 5173657690,
+    "mtime_ns": 1785426837373278832
+   },
+   {
+    "path": "model-00013-of-00013.safetensors",
+    "size": 1216686375,
+    "mtime_ns": 1785426837669421197
+   },
+   {
+    "path": "model.safetensors.index.json",
+    "size": 100431,
+    "mtime_ns": 1785424882337868041
+   },
+   {
+    "path": "README.md",
+    "size": 10584,
+    "mtime_ns": 1785424841180011322
+   },
+   {
+    "path": "special_tokens_map.json",
+    "size": 440,
+    "mtime_ns": 1785424882339561176
+   },
+   {
+    "path": "tokenizer_config.json",
+    "size": 485,
+    "mtime_ns": 1785424882361651103
+   },
+   {
+    "path": "tokenizer.json",
+    "size": 27868342,
+    "mtime_ns": 1785424882359918009
+   },
+   {
+    "path": "TOOL_CALLING.md",
+    "size": 13671,
+    "mtime_ns": 1785424841181440498
+   }
+  ],
+  "resent_paths": [
+   "model-00008-of-00013.safetensors",
+   "model-00009-of-00013.safetensors",
+   "model-00010-of-00013.safetensors",
+   "model-00011-of-00013.safetensors",
+   "model-00012-of-00013.safetensors",
+   "model-00013-of-00013.safetensors"
+  ],
+  "exempt_paths": [
+   "model-00008-of-00013.safetensors"
+  ]
+ },
+ "item3": {
+  "corrupted_path": "model-00008-of-00013.safetensors",
+  "corrupted_sha_observed": "e19176c60102d453c0aa8f226c04294c0c78bd61df5d224c5ff0478d0fc8c8d0",
+  "manifest_sha": "fe5e2322704444fbf71276ab55b95971459ff3bda8ec967ddb32faa47f2231ba",
+  "final_sha_after_resume": "fe5e2322704444fbf71276ab55b95971459ff3bda8ec967ddb32faa47f2231ba",
+  "refetched": true
+ },
+ "item4": {
+  "both_viable_choice_required": true,
+  "explicit_source": "hf",
+  "revision": "a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3",
+  "head_revision": "a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3",
+  "required_set_count": 10,
+  "final_dir_listing": [
+   "added_tokens.json",
+   "config.json",
+   "merges.txt",
+   "model.safetensors",
+   "model.safetensors.index.json",
+   "README.md",
+   "special_tokens_map.json",
+   "tokenizer_config.json",
+   "tokenizer.json",
+   "vocab.json"
+  ],
+  "digest_verified_paths": [
+   "added_tokens.json",
+   "config.json",
+   "merges.txt",
+   "model.safetensors",
+   "model.safetensors.index.json",
+   "README.md",
+   "special_tokens_map.json",
+   "tokenizer_config.json",
+   "tokenizer.json",
+   "vocab.json"
+  ],
+  "formation_ready": true
+ }
+}

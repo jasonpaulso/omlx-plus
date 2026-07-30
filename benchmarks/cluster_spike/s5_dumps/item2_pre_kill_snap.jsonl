@@ -1,0 +1,17 @@
+{"path": "chat_template.jinja", "size": 16738, "mtime_ns": 1785424841182393087}
+{"path": "config.json", "size": 40893, "mtime_ns": 1785424841183296801}
+{"path": "generation_config.json", "size": 172, "mtime_ns": 1785424841184288932}
+{"path": "model-00001-of-00013.safetensors", "size": 5260027926, "mtime_ns": 1785424842331898421}
+{"path": "model-00002-of-00013.safetensors", "size": 5173657574, "mtime_ns": 1785424843402598646}
+{"path": "model-00003-of-00013.safetensors", "size": 5173657586, "mtime_ns": 1785424844592226809}
+{"path": "model-00004-of-00013.safetensors", "size": 5173657575, "mtime_ns": 1785424846472393619}
+{"path": "model-00005-of-00013.safetensors", "size": 5173657706, "mtime_ns": 1785424847962025536}
+{"path": "model-00006-of-00013.safetensors", "size": 5173657626, "mtime_ns": 1785424849487444089}
+{"path": "model-00007-of-00013.safetensors", "size": 5173657702, "mtime_ns": 1785424874862124786}
+{"path": "model-00008-of-00013.safetensors", "size": 5173657676, "mtime_ns": 1785425276204175801}
+{"path": "model.safetensors.index.json", "size": 100431, "mtime_ns": 1785424882337868041}
+{"path": "README.md", "size": 10584, "mtime_ns": 1785424841180011322}
+{"path": "special_tokens_map.json", "size": 440, "mtime_ns": 1785424882339561176}
+{"path": "tokenizer_config.json", "size": 485, "mtime_ns": 1785424882361651103}
+{"path": "tokenizer.json", "size": 27868342, "mtime_ns": 1785424882359918009}
+{"path": "TOOL_CALLING.md", "size": 13671, "mtime_ns": 1785424841181440498}

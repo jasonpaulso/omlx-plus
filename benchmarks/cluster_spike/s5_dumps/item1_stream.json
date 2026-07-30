@@ -1,0 +1,1 @@
+{"completion_tokens": 86, "usage": {"prompt_tokens": 78, "completion_tokens": 48, "total_tokens": 126, "input_tokens": 78, "output_tokens": 48, "prompt_tokens_details": {"cached_tokens": 0}, "time_to_first_token": 1.01, "total_time": 1.99, "prompt_eval_duration": 1.01, "generation_duration": 0.99, "prompt_tokens_per_second": 77.42, "generation_tokens_per_second": 48.7}}
