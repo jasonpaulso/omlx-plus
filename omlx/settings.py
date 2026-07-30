@@ -520,6 +520,10 @@ class ClusterSettings:
     heartbeat_interval_s: float = 5.0
     member_timeout_s: float = 20.0
     bootstrap_token_ttl_s: float = 900.0
+    # S6 D3: how long a member may stay `lost` before the head prunes it and
+    # revokes its credential. Much longer than member_timeout_s on purpose --
+    # a timeout is a liveness statement, expiry is the trust decision.
+    lost_member_ttl_s: float = 86400.0
     # Single-host test mode: admit members whose socket address is loopback
     # (CL-10 otherwise rejects loopback, unspecified and multicast).
     allow_loopback: bool = False
@@ -560,6 +564,9 @@ class ClusterSettings:
             heartbeat_interval_s=float(data.get("heartbeat_interval_s", 5.0)),
             member_timeout_s=float(data.get("member_timeout_s", 20.0)),
             bootstrap_token_ttl_s=float(data.get("bootstrap_token_ttl_s", 900.0)),
+            lost_member_ttl_s=normalize_lost_member_ttl(
+                data.get("lost_member_ttl_s", 86400.0)
+            ),
             allow_loopback=bool(data.get("allow_loopback", False)),
             node_name=str(data.get("node_name") or ""),
             data_plane_subnet=str(data.get("data_plane_subnet") or ""),
@@ -641,6 +648,26 @@ def normalize_cluster_role(value: Any) -> str:
         logger.warning(f"Invalid cluster role: {value!r}, using 'off'")
         return "off"
     return role
+
+
+def normalize_lost_member_ttl(value: Any, *, default: float = 86400.0) -> float:
+    """Coerce the lost-member TTL to a positive value (S6 D3).
+
+    The TTL drives credential revocation, so a zero, negative or
+    unparseable value would expire every lost member on the next scrub
+    instead of doing nothing; it falls back to the default and says so.
+    """
+    try:
+        ttl = float(value)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid cluster lost_member_ttl_s: {value!r}, using {default}")
+        return default
+    if ttl <= 0:
+        logger.warning(
+            f"cluster lost_member_ttl_s must be positive (got {ttl}), using {default}"
+        )
+        return default
+    return ttl
 
 
 def normalize_cluster_backend(value: Any) -> str:
@@ -1143,6 +1170,12 @@ class GlobalSettings:
                     setattr(self.cluster, attr, float(raw))
                 except ValueError:
                     logger.warning(f"Invalid {env_name} value: {raw}")
+        if lost_ttl := os.getenv("OMLX_CLUSTER_LOST_MEMBER_TTL_S"):
+            # Not in the loop above: a non-positive TTL has to fall back to
+            # the default rather than be accepted verbatim (S6 D3).
+            self.cluster.lost_member_ttl_s = normalize_lost_member_ttl(
+                lost_ttl, default=self.cluster.lost_member_ttl_s
+            )
         if allow_loopback := os.getenv("OMLX_CLUSTER_ALLOW_LOOPBACK"):
             self.cluster.allow_loopback = allow_loopback.strip().lower() in {
                 "1",

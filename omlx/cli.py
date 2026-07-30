@@ -781,6 +781,19 @@ def _local_server(args):
     return settings, f"http://{connect_host}:{port}", headers
 
 
+def _format_age(seconds) -> str:
+    """Compact age for cluster status output (S6 D3 lost-since surfacing)."""
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    if value >= 3600:
+        return f"{value / 3600:.1f}h"
+    if value >= 60:
+        return f"{value / 60:.1f}m"
+    return f"{value:.0f}s"
+
+
 def _cluster_request(method: str, url: str, headers: dict, json_body=None):
     """Call the local server and exit with a readable message on failure."""
     import requests
@@ -980,9 +993,11 @@ def cluster_command(args):
     members = result.get("members", [])
     print(f"Role: {result.get('role')}  members: {len(members)}")
     for member in members:
+        lost_for = member.get("lost_for_s")
+        age = f"  lost_for={_format_age(lost_for)}" if lost_for is not None else ""
         print(
             f"  {member.get('id')}  {member.get('address')}:{member.get('port')}  "
-            f"{member.get('status')}  {member.get('name') or ''}"
+            f"{member.get('status')}  {member.get('name') or ''}{age}"
         )
     formation = result.get("formation")
     if formation:

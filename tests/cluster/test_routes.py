@@ -4,6 +4,7 @@
 import pytest
 
 from omlx.cluster.credentials import generate_secret
+from omlx.cluster.state import MemberLiveness
 from omlx.cluster.versions import PackageVersion, VersionInfo, collect_versions
 
 from .conftest import (
@@ -38,9 +39,9 @@ ALLOWED = {
 }
 
 
-async def admit(manager, host="10.0.0.9"):
+async def admit(manager, host="10.0.0.9", name="w"):
     return await manager.join(
-        peer_host=host, port=8000, name="w", versions=collect_versions().to_dict()
+        peer_host=host, port=8000, name=name, versions=collect_versions().to_dict()
     )
 
 
@@ -325,6 +326,32 @@ class TestHeartbeatAndLeaveEndpoints:
             assert member["status"] == "active"
             assert member["last_seq"] == 1
 
+    async def test_superseded_credential_no_longer_authenticates(self, head_settings):
+        """S6 D3: the ghost's secret dies with the rejoin, not at the TTL."""
+        async with running_manager(head_settings) as manager:
+            first = await admit(manager, name="rack-1")
+            member = manager.state.member(first["member_id"])
+            manager.record_heartbeat(member, seq=1, epoch="e1")
+            manager._liveness[member.id] = MemberLiveness(
+                epoch="e1", last_seq=1, last_heartbeat_at=0.0, status="lost"
+            )
+            second = await admit(manager, host="10.0.0.10", name="rack-1")
+
+            app = build_app()
+            async with http_client(app) as client:
+                gone = await client.post(
+                    "/v1/cluster/heartbeat",
+                    headers=bearer(first["member_secret"]),
+                    json={"seq": 2, "epoch": "e1"},
+                )
+                alive = await client.post(
+                    "/v1/cluster/heartbeat",
+                    headers=bearer(second["member_secret"]),
+                    json={"seq": 1, "epoch": "e2"},
+                )
+            assert gone.status_code == 401
+            assert alive.status_code == 200
+
     async def test_replayed_heartbeat_is_refused(self, head_settings):
         async with running_manager(head_settings) as manager:
             joined = await admit(manager)
@@ -346,8 +373,11 @@ class TestHeartbeatAndLeaveEndpoints:
     async def test_after_leave_the_secret_no_longer_authenticates(self, head_settings):
         """CL-03: revocation is real and scoped to the member that left."""
         async with running_manager(head_settings) as manager:
-            first = await admit(manager, host="10.0.0.9")
-            second = await admit(manager, host="10.0.0.10")
+            # Distinct names: two members sharing one name is the ghost
+            # state S6 D3 collapses, so a rejoin would supersede rather than
+            # admit a second member.
+            first = await admit(manager, host="10.0.0.9", name="w1")
+            second = await admit(manager, host="10.0.0.10", name="w2")
             app = build_app()
             async with http_client(app) as client:
                 left = await client.post(

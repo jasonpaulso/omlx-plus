@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the cluster manager: membership, liveness, revocation."""
 
+import asyncio
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -218,6 +220,235 @@ class TestHeartbeatAndScrub:
             assert restarted.liveness(member.id).epoch == "e2"
 
 
+class TestSupersedeOnRejoin:
+    """S6 D3/CL6-01: a rejoin by name replaces a member that is already gone.
+
+    The join payload carries no stable machine identity, so the worker's
+    asserted ``name`` is the only key — which is why every row here is about
+    what the bootstrap token may NOT do.
+    """
+
+    async def test_empty_name_join_never_supersedes(self, head_settings):
+        """CL6-02: unnamed workers stay independent members."""
+        async with running_manager(head_settings) as manager:
+            first = await admit(manager, name="")
+            second = await admit(manager, host="10.0.0.10", name=None)
+
+            assert len(manager.state.members) == 2
+            for joined in (first, second):
+                assert verify_secret(
+                    joined["member_secret"],
+                    manager.state.member_digests[joined["member_id"]],
+                )
+
+    async def test_same_name_join_supersedes_a_lost_member(self, head_settings):
+        async with running_manager(head_settings) as manager:
+            first = await admit(manager, name="rack-1")
+            member = manager.state.member(first["member_id"])
+            manager.record_heartbeat(member, seq=1, epoch="e1")
+            manager._liveness[member.id] = MemberLiveness(
+                epoch="e1", last_seq=1, last_heartbeat_at=0.0, status="lost"
+            )
+
+            second = await admit(manager, host="10.0.0.10", name="rack-1")
+
+            assert second["member_id"] != first["member_id"]
+            assert [m.id for m in manager.state.members] == [second["member_id"]]
+            # Revoked atomically with the replacement: the old secret matches
+            # no digest at all, not merely a different member's.
+            assert not any(
+                verify_secret(first["member_secret"], digest)
+                for digest in manager.state.member_digests.values()
+            )
+            assert manager.liveness(first["member_id"]) is None
+            persisted = load_state(cluster_state_path(head_settings.base_path))
+            assert [m.id for m in persisted.members] == [second["member_id"]]
+            assert set(persisted.member_digests) == {second["member_id"]}
+
+    async def test_same_name_join_against_an_active_member_is_refused(
+        self, head_settings
+    ):
+        async with running_manager(head_settings) as manager:
+            first = await admit(manager, name="rack-1")
+            member = manager.state.member(first["member_id"])
+            manager.record_heartbeat(member, seq=1, epoch="e1")
+
+            with pytest.raises(ClusterError) as exc:
+                await admit(manager, host="10.0.0.10", name="rack-1")
+
+            assert exc.value.status_code == 409
+            assert "already present" in exc.value.detail
+            # The refusal names the rule, never the incumbent.
+            assert first["member_id"] not in exc.value.detail
+            assert "10.0.0.9" not in exc.value.detail
+            # The active member is untouched.
+            assert [m.id for m in manager.state.members] == [first["member_id"]]
+            assert verify_secret(
+                first["member_secret"], manager.state.member_digests[member.id]
+            )
+            assert manager.liveness(member.id).status == "active"
+
+    async def test_liveness_less_member_inside_the_boot_window_is_refused(
+        self, tmp_path
+    ):
+        """Rev4: every member is liveness-less right after a head start, so
+        the absent-liveness branch alone would let an in-TTL token bearer
+        evict a live member. A long timeout keeps this test in the window."""
+        settings = make_settings(tmp_path / "head", member_timeout_s=3600.0)
+        async with running_manager(settings) as manager:
+            first = await admit(manager, name="rack-1")
+            assert manager.liveness(first["member_id"]) is None
+
+            with pytest.raises(ClusterError) as exc:
+                await admit(manager, host="10.0.0.10", name="rack-1")
+
+            assert exc.value.status_code == 409
+            assert "head started less than" in exc.value.detail
+            assert [m.id for m in manager.state.members] == [first["member_id"]]
+
+    async def test_liveness_less_member_past_the_boot_window_is_superseded(
+        self, tmp_path
+    ):
+        """The identical join, once the head has been up longer than
+        member_timeout_s: a member that has had time to beat and did not is
+        genuinely gone."""
+        settings = make_settings(tmp_path / "head", member_timeout_s=0.05)
+        async with running_manager(settings) as manager:
+            first = await admit(manager, name="rack-1")
+            await asyncio.sleep(0.1)
+
+            second = await admit(manager, host="10.0.0.10", name="rack-1")
+
+            assert [m.id for m in manager.state.members] == [second["member_id"]]
+            assert first["member_id"] not in manager.state.member_digests
+
+    async def test_a_rejoin_collapses_pre_existing_duplicates(self, tmp_path):
+        """State written before S6 can already hold several members under one
+        name; the next rejoin leaves exactly one."""
+        settings = make_settings(tmp_path / "head", member_timeout_s=0.05)
+        async with running_manager(settings) as manager:
+            first = await admit(manager, name="rack-1")
+            ghost = replace(
+                manager.state.member(first["member_id"]), id="00ghost00ghost00"
+            )
+            digests = dict(manager.state.member_digests)
+            digests[ghost.id] = digests[first["member_id"]]
+            manager._persist(
+                replace(
+                    manager.state,
+                    members=manager.state.members + (ghost,),
+                    member_digests=digests,
+                )
+            )
+            await asyncio.sleep(0.1)
+
+            third = await admit(manager, host="10.0.0.10", name="rack-1")
+
+            assert [m.id for m in manager.state.members] == [third["member_id"]]
+            assert set(manager.state.member_digests) == {third["member_id"]}
+
+
+class TestLostMemberExpiry:
+    """S6 D3: a member lost longer than the TTL is pruned and revoked.
+
+    ``heartbeat_interval_s`` is raised in these rows so the background scrub
+    loop never fires and every sweep in the test is the explicit one.
+    """
+
+    def expiry_settings(self, tmp_path, **overrides):
+        return make_settings(
+            tmp_path / "head",
+            **{"heartbeat_interval_s": 30.0, "lost_member_ttl_s": 0.05, **overrides},
+        )
+
+    async def test_lost_member_past_the_ttl_is_pruned_and_revoked(self, tmp_path):
+        settings = self.expiry_settings(tmp_path)
+        async with running_manager(settings) as manager:
+            joined = await admit(manager, name="rack-1")
+            member = manager.state.member(joined["member_id"])
+            manager.record_heartbeat(member, seq=1, epoch="e1")
+            manager._liveness[member.id] = MemberLiveness(
+                epoch="e1", last_seq=1, last_heartbeat_at=0.0, status="active"
+            )
+
+            # First sweep only marks it lost — that is still a liveness
+            # statement, and it starts the TTL clock.
+            assert await manager.scrub() == [member.id]
+            assert manager.state.member(member.id) is not None
+
+            await asyncio.sleep(0.1)
+            await manager.scrub()
+
+            assert manager.state.member(member.id) is None
+            assert manager.state.member_digests == {}
+            assert manager.liveness(member.id) is None
+            assert load_state(cluster_state_path(settings.base_path)).members == ()
+
+    async def test_an_active_member_is_never_expired(self, tmp_path):
+        settings = self.expiry_settings(tmp_path, member_timeout_s=3600.0)
+        async with running_manager(settings) as manager:
+            joined = await admit(manager, name="rack-1")
+            member = manager.state.member(joined["member_id"])
+            manager.record_heartbeat(member, seq=1, epoch="e1")
+            await asyncio.sleep(0.1)
+            manager.record_heartbeat(member, seq=2, epoch="e1")
+
+            await manager.scrub()
+
+            assert manager.state.member(member.id) is not None
+            assert verify_secret(
+                joined["member_secret"], manager.state.member_digests[member.id]
+            )
+
+    async def test_head_restart_expires_ghosts_and_spares_a_beating_member(
+        self, tmp_path
+    ):
+        """Liveness is runtime-only, so a restart leaves every persisted
+        member liveness-less; the TTL restarts from head boot for them."""
+        settings = self.expiry_settings(tmp_path, member_timeout_s=3600.0)
+        async with running_manager(settings) as manager:
+            ghost = await admit(manager, name="ghost")
+            live = await admit(manager, host="10.0.0.10", name="live")
+
+        async with running_manager(settings) as restarted:
+            assert restarted.liveness(ghost["member_id"]) is None
+            restarted.record_heartbeat(
+                restarted.state.member(live["member_id"]), seq=1, epoch="e2"
+            )
+            await asyncio.sleep(0.1)
+
+            await restarted.scrub()
+
+            assert restarted.state.member(ghost["member_id"]) is None
+            assert ghost["member_id"] not in restarted.state.member_digests
+            assert restarted.state.member(live["member_id"]) is not None
+            assert verify_secret(
+                live["member_secret"],
+                restarted.state.member_digests[live["member_id"]],
+            )
+
+    async def test_snapshot_surfaces_the_lost_since_age(self, tmp_path):
+        settings = self.expiry_settings(tmp_path, lost_member_ttl_s=3600.0)
+        async with running_manager(settings) as manager:
+            lost = await admit(manager, name="rack-1")
+            live = await admit(manager, host="10.0.0.10", name="rack-2")
+            for joined in (lost, live):
+                manager.record_heartbeat(
+                    manager.state.member(joined["member_id"]), seq=1, epoch="e1"
+                )
+            manager._liveness[lost["member_id"]] = MemberLiveness(
+                epoch="e1", last_seq=1, last_heartbeat_at=0.0, status="active"
+            )
+            await manager.scrub()
+
+            entries = {m["id"]: m for m in manager.snapshot()["members"]}
+
+            assert entries[lost["member_id"]].get("lost_since") is not None
+            assert entries[lost["member_id"]].get("lost_for_s") >= 0
+            assert entries[live["member_id"]].get("lost_since") is None
+            assert entries[live["member_id"]].get("lost_for_s") is None
+
+
 class TestNodeState:
     """S4 D1: advisory node_state riding the heartbeat."""
 
@@ -380,8 +611,11 @@ class TestRanksStatus:
 class TestRevocation:
     async def test_leave_revokes_only_the_caller(self, head_settings):
         async with running_manager(head_settings) as manager:
-            first = await admit(manager, host="10.0.0.9")
-            second = await admit(manager, host="10.0.0.10")
+            # Distinct names: two members sharing one name is the ghost
+            # state S6 D3 collapses, so a rejoin would supersede rather than
+            # admit a second member.
+            first = await admit(manager, host="10.0.0.9", name="worker-a")
+            second = await admit(manager, host="10.0.0.10", name="worker-b")
             member = manager.state.member(first["member_id"])
 
             await manager.member_leave(member)

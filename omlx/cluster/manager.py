@@ -656,6 +656,15 @@ class ClusterManager:
         self._client_factory = client_factory or (lambda url: ClusterClient(url))
         self._state = ClusterState()
         self._liveness: dict[str, MemberLiveness] = {}
+        # S6 D3: when each member became `lost`, in memory only (like
+        # liveness) -- the authoritative clock for supersede-on-rejoin and
+        # the expiry sweep. Seeded by `scrub` when it marks a member lost,
+        # and at head start for the persisted members, which are all
+        # liveness-less at that point.
+        self._lost_since: dict[str, float] = {}
+        # S6 D3: wall clock at which this node's cluster role started. The
+        # supersede boot window is measured against it.
+        self._head_started_at: float = 0.0
         # S4 D1: advisory, liveness-side. Never persisted, never consulted
         # for auth or liveness — placement scoring only.
         self._node_state: dict[str, MemberNodeState] = {}
@@ -738,6 +747,15 @@ class ClusterManager:
         assert_transfer_ports_non_overlapping(self.settings)
 
         self._state = load_state(self.state_path)
+        self._head_started_at = time.time()
+        # S6 D3: liveness is runtime-only, so every persisted member starts
+        # out liveness-less. Stamping them here is what gives the expiry
+        # sweep a clock for pre-restart ghosts (which scrub never touches,
+        # since it only looks at members that have reported liveness); the
+        # TTL deliberately restarts from head boot for them.
+        self._lost_since = {
+            member.id: self._head_started_at for member in self._state.members
+        }
         await self._queue.start()
         if self.role == "head":
             from .formation import FormationManager
@@ -869,25 +887,48 @@ class ClusterManager:
                 )
             except ValueError as exc:
                 raise ClusterError(400, str(exc)) from exc
+            sanitized = _sanitize_name(name)
+            superseded = self._resolve_supersede(sanitized)
             member = Member(
                 id=secrets.token_hex(MEMBER_ID_BYTES),
                 address=address,
                 port=port,
-                name=_sanitize_name(name),
+                name=sanitized,
                 versions=remote,
                 joined_at=time.time(),
                 peer_cert_fingerprint=None,
             )
             secret = generate_secret()
             digests = dict(self._state.member_digests)
+            superseded_ids = {old.id for old in superseded}
+            for old_id in superseded_ids:
+                digests.pop(old_id, None)
             digests[member.id] = digest_secret(secret)
+            # One persisted transition: the replacement lands and every
+            # superseded credential is revoked in the same write, so there is
+            # no window in which both the old and the new secret authenticate.
             self._persist(
                 replace(
                     self._state,
-                    members=self._state.members + (member,),
+                    members=tuple(
+                        m for m in self._state.members if m.id not in superseded_ids
+                    )
+                    + (member,),
                     member_digests=digests,
                 )
             )
+            for old in superseded:
+                self._liveness.pop(old.id, None)
+                self._node_state.pop(old.id, None)
+                self._lost_since.pop(old.id, None)
+                logger.warning(
+                    "Cluster member superseded on rejoin: old=%s new=%s "
+                    "endpoint=%s name_fp=%s -- old credential revoked",
+                    old.id,
+                    member.id,
+                    old.endpoint,
+                    fingerprint_key(old.name),
+                )
             logger.info(
                 "Cluster member joined: id=%s endpoint=%s name=%s",
                 member.id,
@@ -902,6 +943,80 @@ class ClusterManager:
             }
 
         return await self._queue.submit("join", _apply)
+
+    def _resolve_supersede(self, sanitized_name: str) -> list[Member]:
+        """The members a same-name rejoin replaces (S6 D3/CL6-01).
+
+        The join payload carries no stable machine identity: the only key is
+        the worker-asserted, optional ``name``, presented under a bootstrap
+        token that is TTL-bounded but reusable. So supersede is deliberately
+        narrow — it never widens what that token can do beyond replacing a
+        member that is already gone. An empty name never matches anything
+        (CL6-02: unnamed workers stay independent members, exactly today's
+        behaviour), and one ineligible match refuses the whole join.
+
+        Matching by name rather than by member id means a state that already
+        accumulated duplicates (the pre-S6 ghost case) collapses to a single
+        entry on the next rejoin instead of leaving one ghost behind.
+        """
+        if not sanitized_name:
+            return []
+        matches = [m for m in self._state.members if m.name == sanitized_name]
+        for existing in matches:
+            reason = self._supersede_refusal(existing)
+            if reason is None:
+                continue
+            logger.warning(
+                "Refused same-name cluster join: existing=%s endpoint=%s "
+                "name_fp=%s reason=%s",
+                existing.id,
+                existing.endpoint,
+                fingerprint_key(sanitized_name),
+                reason,
+            )
+            raise ClusterError(
+                409,
+                "A cluster member with this name is already present and cannot "
+                f"be superseded: {reason}. Retry once it is marked lost, or "
+                "have an operator remove it explicitly.",
+            )
+        return matches
+
+    def _supersede_refusal(self, member: Member) -> str | None:
+        """Why ``member`` may not be superseded by a same-name rejoin, or None.
+
+        D3-sec condition (iii): a ``lost`` member may be replaced, and a
+        member with no liveness at all only once the head has been up longer
+        than ``member_timeout_s``. Right after a head restart EVERY persisted
+        member is liveness-less, so without that boot window a bootstrap-token
+        bearer could evict a live member during it.
+
+        The two branches also give the plan's "ANY same-name member inside
+        the boot window is refused" for free: liveness only becomes ``lost``
+        through :meth:`scrub`, which needs an ACTIVE liveness whose
+        ``last_heartbeat_at`` is older than ``member_timeout_s``, and that
+        timestamp cannot predate head start — so a ``lost`` member implies
+        the head is already past the window.
+
+        Residual, recorded rather than defended against: an attacker who can
+        also suppress the victim's heartbeats past ``member_timeout_s`` holds
+        network-level power this control cannot reach (CL5-13 posture).
+        """
+        timeout = float(self.settings.member_timeout_s)
+        live = self._liveness.get(member.id)
+        if live is not None:
+            if live.status == "lost":
+                return None
+            return (
+                f"it is active (a member becomes replaceable after {timeout:g}s "
+                "of silence)"
+            )
+        if time.time() - self._head_started_at > timeout:
+            return None
+        return (
+            f"the head started less than {timeout:g}s ago and this member has "
+            "not reported liveness yet"
+        )
 
     async def remove_member(self, member_id: str) -> dict[str, Any]:
         """Remove a member and revoke its secret."""
@@ -921,6 +1036,7 @@ class ClusterManager:
             )
             self._liveness.pop(member_id, None)
             self._node_state.pop(member_id, None)
+            self._lost_since.pop(member_id, None)
             logger.info("Cluster member removed: id=%s", member_id)
             return {"member_id": member_id, "removed": True}
 
@@ -978,6 +1094,9 @@ class ClusterManager:
         self._liveness[member.id] = MemberLiveness(
             epoch=epoch, last_seq=seq, last_heartbeat_at=now, status="active"
         )
+        # S6 D3: the member is demonstrably here, so it is neither expiry
+        # material nor supersede-able until it goes lost again.
+        self._lost_since.pop(member.id, None)
         if revived:
             logger.info("Cluster member revived: id=%s", member.id)
 
@@ -1123,11 +1242,13 @@ class ClusterManager:
         return snap
 
     async def scrub(self) -> list[str]:
-        """Mark members past the timeout as lost. Never revokes a credential.
+        """Mark members past the timeout as lost, then expire the long-lost.
 
-        A timeout is a liveness statement, not a trust decision: a resumed
-        heartbeat revives the member. Revocation belongs to explicit leave
-        and operator removal.
+        A timeout is still a liveness statement, not a trust decision: a
+        resumed heartbeat revives the member, and the returned ids are the
+        ones marked lost by this pass. Only ``cluster.lost_member_ttl_s``
+        later does a member become a ghost worth revoking (S6 D3) — before
+        that, revocation belongs to explicit leave and operator removal.
         """
 
         async def _apply() -> list[str]:
@@ -1140,15 +1261,68 @@ class ClusterManager:
                     continue
                 if now - live.last_heartbeat_at > timeout:
                     self._liveness[member.id] = replace(live, status="lost")
+                    self._lost_since[member.id] = now
                     expired.append(member.id)
                     logger.warning(
                         "Cluster member timed out: id=%s endpoint=%s",
                         member.id,
                         member.endpoint,
                     )
+            self._expire_lost_members(now)
             return expired
 
         return await self._queue.submit("scrub", _apply)
+
+    def _expire_lost_members(self, now: float) -> None:
+        """Prune members lost longer than the TTL and revoke them (S6 D3).
+
+        Runs inside :meth:`scrub`'s queued op, so it never races a join.
+        Untouched: anything active, anything whose loss is still inside the
+        TTL, and anything with no ``lost_since`` at all. The defensive
+        non-positive check matters because ``ClusterSettings`` is a plain
+        mutable dataclass — a zero written straight onto the instance must
+        not revoke every lost member on the next pass.
+        """
+        ttl = float(self.settings.lost_member_ttl_s)
+        if ttl <= 0:
+            return
+        doomed: list[tuple[Member, float]] = []
+        for member in self._state.members:
+            since = self._lost_since.get(member.id)
+            if since is None:
+                continue
+            live = self._liveness.get(member.id)
+            if live is not None and live.status == "active":
+                continue
+            age = now - since
+            if age > ttl:
+                doomed.append((member, age))
+        if not doomed:
+            return
+        doomed_ids = {member.id for member, _ in doomed}
+        digests = dict(self._state.member_digests)
+        for member_id in doomed_ids:
+            digests.pop(member_id, None)
+        self._persist(
+            replace(
+                self._state,
+                members=tuple(m for m in self._state.members if m.id not in doomed_ids),
+                member_digests=digests,
+            )
+        )
+        for member, age in doomed:
+            self._liveness.pop(member.id, None)
+            self._node_state.pop(member.id, None)
+            self._lost_since.pop(member.id, None)
+            logger.warning(
+                "Cluster member expired after %.0fs lost (ttl=%.0fs): id=%s "
+                "endpoint=%s name_fp=%s -- credential revoked",
+                age,
+                ttl,
+                member.id,
+                member.endpoint,
+                fingerprint_key(member.name),
+            )
 
     # ---- worker commands -------------------------------------------------
 
@@ -1245,6 +1419,7 @@ class ClusterManager:
     def snapshot(self) -> dict[str, Any]:
         """State for the API and dashboard. Never contains credential material."""
         members = []
+        now = time.time()
         for member in self._state.members:
             live = self._liveness.get(member.id)
             entry = member.to_dict()
@@ -1252,6 +1427,11 @@ class ClusterManager:
             entry["last_heartbeat_at"] = live.last_heartbeat_at if live else None
             entry["last_seq"] = live.last_seq if live else None
             entry["epoch"] = live.epoch if live else None
+            # S6 D3: how long this member has been lost, so an operator can
+            # see expiry coming instead of discovering it from the log.
+            lost_since = self._lost_since.get(member.id)
+            entry["lost_since"] = lost_since
+            entry["lost_for_s"] = None if lost_since is None else now - lost_since
             members.append(entry)
         bootstrap = self._state.bootstrap
         snapshot: dict[str, Any] = {

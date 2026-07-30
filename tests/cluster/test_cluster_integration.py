@@ -331,3 +331,59 @@ def test_two_node_cluster_lifecycle(nodes):
     removed = head.request("DELETE", f"/v1/cluster/members/{new_id}")
     assert removed.status_code == 200, removed.text
     assert member_of(head) == {}
+
+
+def test_rejoin_without_leave_supersedes_the_ghost(nodes):
+    """S6 D3: a re-provisioned worker rejoining under its own name replaces
+    the entry it left behind instead of accumulating a second one.
+
+    The pre-S6 shape of this is what bit the rig in S2: the old member kept
+    its credential forever because only an explicit leave or an operator
+    removal ever revoked one.
+    """
+    head, worker = nodes
+    head.start()
+    worker.start()
+
+    minted = head.cli("cluster", "token")
+    assert minted.returncode == 0, minted.stdout + minted.stderr
+    token_file = worker.base_path / "join-token"
+    token_file.write_text(TOKEN_RE.search(minted.stdout).group(0), encoding="utf-8")
+    joined = worker.cli("join", head.url, "--token-file", str(token_file))
+    assert joined.returncode == 0, joined.stdout + joined.stderr
+
+    member = wait_until(
+        lambda: member_of(head) or None, message="the worker to appear on the head"
+    )
+    ghost_id = member["id"]
+    ghost_secret = json.loads(worker.cluster_file.read_text(encoding="utf-8"))[
+        "worker"
+    ]["secret"]
+
+    # Gone without leaving, then re-provisioned: same node name, no
+    # credential. The head only accepts the supersede once it has marked the
+    # old member lost.
+    worker.kill()
+    wait_until(
+        lambda: member_of(head).get("status") == "lost",
+        message="the scrub loop to mark the member lost",
+    )
+    worker.cluster_file.unlink()
+    worker.start()
+
+    minted = head.cli("cluster", "token")
+    token_file.write_text(TOKEN_RE.search(minted.stdout).group(0), encoding="utf-8")
+    rejoined = worker.cli("join", head.url, "--token-file", str(token_file))
+    assert rejoined.returncode == 0, rejoined.stdout + rejoined.stderr
+
+    members = head.request("GET", "/v1/cluster/state").json()["members"]
+    assert len(members) == 1, members
+    assert members[0]["id"] != ghost_id
+
+    revoked = requests.post(
+        f"{head.url}/v1/cluster/heartbeat",
+        headers={"Authorization": f"Bearer {ghost_secret}"},
+        json={"seq": 99, "epoch": "ghost"},
+        timeout=10,
+    )
+    assert revoked.status_code == 401

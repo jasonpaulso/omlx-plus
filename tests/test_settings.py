@@ -2293,6 +2293,8 @@ class TestClusterSettings:
         assert cluster.heartbeat_interval_s == 5.0
         assert cluster.member_timeout_s == 20.0
         assert cluster.bootstrap_token_ttl_s == 900.0
+        # S6 D3: a lost member is pruned and revoked after a day.
+        assert cluster.lost_member_ttl_s == 86400.0
         # S4 D5: on by default -- meaningful only when role="head".
         assert cluster.auto_placement is True
 
@@ -2304,11 +2306,21 @@ class TestClusterSettings:
             heartbeat_interval_s=1.5,
             member_timeout_s=6.0,
             bootstrap_token_ttl_s=60.0,
+            lost_member_ttl_s=3600.0,
             allow_loopback=True,
             node_name="studio",
             auto_placement=False,
         )
         assert ClusterSettings.from_dict(original.to_dict()) == original
+
+    def test_a_non_positive_lost_member_ttl_falls_back_to_the_default(self):
+        """S6 D3: the TTL drives credential revocation, so a 0 must not mean
+        "expire every lost member on the next scrub"."""
+        for bad in (0, -1.0, "nonsense", None):
+            assert (
+                ClusterSettings.from_dict({"lost_member_ttl_s": bad}).lost_member_ttl_s
+                == 86400.0
+            )
 
     def test_unknown_role_falls_back_to_off(self):
         assert ClusterSettings.from_dict({"role": "leader"}).role == "off"
@@ -2338,6 +2350,7 @@ class TestClusterSettings:
                 "OMLX_CLUSTER_HEARTBEAT_INTERVAL_S": "0.5",
                 "OMLX_CLUSTER_MEMBER_TIMEOUT_S": "2",
                 "OMLX_CLUSTER_BOOTSTRAP_TOKEN_TTL_S": "30",
+                "OMLX_CLUSTER_LOST_MEMBER_TTL_S": "120",
                 "OMLX_CLUSTER_ALLOW_LOOPBACK": "true",
                 "OMLX_CLUSTER_NODE_NAME": "node-a",
                 "OMLX_CLUSTER_AUTO_PLACEMENT": "false",
@@ -2348,6 +2361,7 @@ class TestClusterSettings:
             assert settings.cluster.heartbeat_interval_s == 0.5
             assert settings.cluster.member_timeout_s == 2.0
             assert settings.cluster.bootstrap_token_ttl_s == 30.0
+            assert settings.cluster.lost_member_ttl_s == 120.0
             assert settings.cluster.allow_loopback is True
             assert settings.cluster.node_name == "node-a"
             assert settings.cluster.auto_placement is False

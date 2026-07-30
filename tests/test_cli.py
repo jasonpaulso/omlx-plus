@@ -1094,6 +1094,56 @@ class TestClusterTokenResolution:
         with pytest.raises(SystemExit):
             _resolve_join_token(args)
 
+    def test_status_shows_how_long_a_member_has_been_lost(self, capsys):
+        """S6 D3: operators see expiry coming instead of reading it in a log."""
+        from omlx.cli import cluster_command
+        from omlx.settings import GlobalSettings
+
+        state = {
+            "role": "head",
+            "members": [
+                {
+                    "id": "abc123",
+                    "address": "10.0.0.9",
+                    "port": 8000,
+                    "status": "lost",
+                    "name": "rack-1",
+                    "lost_since": 1.0,
+                    "lost_for_s": 7200.0,
+                },
+                {
+                    "id": "def456",
+                    "address": "10.0.0.10",
+                    "port": 8000,
+                    "status": "active",
+                    "name": "rack-2",
+                    "lost_since": None,
+                    "lost_for_s": None,
+                },
+            ],
+        }
+        args = SimpleNamespace(action="status", model=None, prefer="auto")
+        with (
+            patch(
+                "omlx.cli._local_server",
+                return_value=(GlobalSettings(), "http://x", {}),
+            ),
+            patch("omlx.cli._cluster_request", return_value=state),
+        ):
+            cluster_command(args)
+
+        out = capsys.readouterr().out
+        assert "lost_for=2.0h" in out
+        assert "def456  10.0.0.10:8000  active  rack-2\n" in out
+
+    def test_format_age_units(self):
+        from omlx.cli import _format_age
+
+        assert _format_age(45) == "45s"
+        assert _format_age(90) == "1.5m"
+        assert _format_age(7200) == "2.0h"
+        assert _format_age(None) == "?"
+
     def test_cluster_and_join_commands_are_registered(self):
         result = subprocess.run(
             [sys.executable, "-m", "omlx.cli", "--help"],
