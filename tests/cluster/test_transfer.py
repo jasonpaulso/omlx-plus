@@ -90,13 +90,9 @@ def test_resolve_transfer_destination_refuses_existing_symlink(tmp_path):
 
 
 def _worker_settings(tmp_path, **overrides):
-    return make_settings(
-        tmp_path / "worker",
-        role="worker",
-        data_plane_subnet="10.0.2.0/24",
-        data_plane_address="10.0.2.2",
-        **overrides,
-    )
+    opts = {"data_plane_subnet": "10.0.2.0/24", "data_plane_address": "10.0.2.2"}
+    opts.update(overrides)
+    return make_settings(tmp_path / "worker", role="worker", **opts)
 
 
 def _start_command(**over):
@@ -125,6 +121,10 @@ async def test_transfer_start_accepts_and_reports_have(tmp_path):
     command = parse_command(_start_command())
     ack = await executor.dispatch(command)
     assert ack["status"] == "accepted"
+    # The ack carries the worker's own DATA-PLANE address (never
+    # member.endpoint's control-plane one) so the head can address a round
+    # session's ring -- mirrors PresenceCommand's reply for formation.
+    assert ack["data_plane_address"] == "10.0.2.2"
 
     # The have-scan is an owned task; wait for its report.
     for _ in range(100):
@@ -647,6 +647,46 @@ async def test_diff_authority_round_shrinks_subset_to_done(tmp_path):
 
         final_config = worker_root / "target-model" / "config.json"
         assert final_config.read_bytes() == b"{}"
+
+
+async def test_round_peers_use_data_plane_not_control_plane_address(tmp_path):
+    # A worker that never reported a data-plane address (e.g. misconfigured)
+    # must fail the job with a named error, never send member.endpoint's
+    # control-plane address into a round command.
+    async with running_manager(_head_settings(tmp_path)) as manager:
+        member = await _activate_member(manager)
+
+        source_dir = tmp_path / "source" / "target-model"
+        source_dir.mkdir(parents=True)
+        (source_dir / "config.json").write_bytes(b"{}")
+
+        worker_settings = _worker_settings(tmp_path, data_plane_address="")
+        worker_root = worker_settings.get_effective_model_dirs()[0]
+        worker_root.mkdir(parents=True, exist_ok=True)
+        worker = TransferWorkerExecutor(worker_settings)
+
+        tm = TransferManager(manager)
+        manager._transfer = tm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(tm, worker, member, stop))
+        try:
+            job = await tm.start_transfer(
+                "target-model", member=member, local_path=str(source_dir), source="peer"
+            )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                current = tm.job(job.id)
+                if current is not None and current.status in ("done", "error"):
+                    break
+                await asyncio.sleep(0.01)
+            final_job = tm.job(job.id)
+            assert final_job is not None
+            assert final_job.status == "error"
+            assert "data-plane address" in final_job.error
+        finally:
+            stop.set()
+            await driver
 
 
 async def test_round_cap_gives_up_after_no_progress(tmp_path, monkeypatch):

@@ -162,6 +162,12 @@ class _JobRuntime:
     round_updates: dict[int, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict
     )
+    # The worker's own DATA-PLANE address (Thunderbolt-link, distinct from
+    # `member.endpoint`'s control-plane address), reported on the
+    # TRANSFER_START ack -- mirrors formation's PresenceCommand exchange
+    # (`_build_ips`), since a round session must ring-connect over the data
+    # plane, never the join/heartbeat address.
+    worker_data_plane_address: str = ""
 
 
 class TransferManager:
@@ -335,6 +341,9 @@ class TransferManager:
             if start_ack.get("status") == "rejected":
                 self._finish(job_id, "error", error=str(start_ack.get("detail") or ""))
                 return
+            self._runtime[job_id].worker_data_plane_address = str(
+                start_ack.get("data_plane_address") or ""
+            )
             if source == "hf":
                 await self._drive_hf(job_id, member)
             else:
@@ -412,6 +421,15 @@ class TransferManager:
     async def _drive_rounds(self, job_id: str, member: Member) -> None:
         job = self._jobs[job_id]
         manifest_by_path = {entry.relative_path: entry for entry in job.manifest}
+        peers = self._round_peers(job_id)
+        if peers is None:
+            self._finish(
+                job_id,
+                "error",
+                error="worker never reported a data-plane address; cannot form "
+                "a round session",
+            )
+            return
         have: set[str] = set()
         step = 1
         stalled = 0
@@ -424,7 +442,7 @@ class TransferManager:
                     job_id=job_id,
                     step=step,
                     subset=subset,
-                    peers=self._round_peers(member),
+                    peers=peers,
                     base_port=self._round_base_port(),
                 )
             )
@@ -482,9 +500,19 @@ class TransferManager:
             job, status=status, error=error, updated_at=time.time()
         )
 
-    def _round_peers(self, member: Member) -> list[str]:
+    def _round_peers(self, job_id: str) -> list[str] | None:
+        """``[head_data_plane_address, worker_data_plane_address]`` -- NEVER
+        ``member.endpoint`` (the control-plane join/heartbeat address, a
+        different network entirely from the Thunderbolt data-plane link a
+        round's ring session must form over). Mirrors formation's
+        ``_build_ips``, which sources the same address from a
+        ``PresenceCommand`` reply rather than membership state.
+        """
+        worker_addr = self._runtime[job_id].worker_data_plane_address
+        if not worker_addr:
+            return None
         head_addr = self._manager.settings.data_plane_address
-        return [head_addr, member.endpoint.rsplit(":", 1)[0]]
+        return [head_addr, worker_addr]
 
     def _round_base_port(self) -> int:
         from ..settings import transfer_base_port
@@ -633,7 +661,20 @@ class TransferWorkerExecutor:
             job.task = asyncio.create_task(
                 self._scan_have(job, command.step, repair=command.repair)
             )
-        return make_job_update(command.job_id, command.step, status="accepted")
+        return make_job_update(
+            command.job_id,
+            command.step,
+            status="accepted",
+            data_plane_address=self._reportable_address(),
+        )
+
+    def _reportable_address(self) -> str:
+        """This node's own data-plane address (D1/R3c), reported on the
+        TRANSFER_START ack so the head knows where to ring-connect for a
+        round -- the SAME field a ``PresenceCommand`` reply carries for
+        formation, never `member.endpoint`'s control-plane address.
+        """
+        return self._global_settings.cluster.data_plane_address
 
     def _resolve_destination(self, model_id: str) -> Path:
         roots = self._global_settings.get_effective_model_dirs()
