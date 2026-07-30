@@ -319,6 +319,40 @@ def _fake_session_launcher(file_contents: dict[str, bytes]):
     return launcher
 
 
+def _fake_head_session_launcher(calls: list | None = None):
+    """Head-side (rank 0, ``--role src``) stand-in. The worker-side fake
+    already writes the round's bytes into staging, so the src session is a
+    no-op that records its invocation eagerly (the round's tmp manifest is
+    deleted when the round ends, so it must be read at call time)."""
+
+    class _FakeSrcSession:
+        def __init__(self):
+            self.stop_called = False
+
+        def stop(self):
+            self.stop_called = True
+
+        def kill(self):
+            pass
+
+    def launcher(**kwargs):
+        session = _FakeSrcSession()
+        if calls is not None:
+            argv = kwargs["argv_builder"](kwargs["rank"])
+            manifest_path = Path(argv[argv.index("--manifest") + 1])
+            calls.append(
+                {
+                    "kwargs": kwargs,
+                    "argv": argv,
+                    "entries": json.loads(manifest_path.read_text()),
+                    "session": session,
+                }
+            )
+        return session
+
+    return launcher
+
+
 def _round_command(**over):
     base = {
         "kind": "transfer_round",
@@ -676,7 +710,7 @@ async def test_manager_retries_a_rate_limited_start_exactly_once_then_completes(
         launcher = _fake_session_launcher({"config.json": b"{}"})
         worker = TransferWorkerExecutor(worker_settings, session_launcher=launcher)
 
-        tm = TransferManager(manager)
+        tm = TransferManager(manager, session_launcher=_fake_head_session_launcher())
         manager._transfer = tm
 
         stop = asyncio.Event()
@@ -1018,7 +1052,7 @@ async def test_hf_download_stall_is_killed_by_the_progress_watchdog(
             worker_settings, hf_downloader=_stalled_download
         )
 
-        tm = TransferManager(manager)
+        tm = TransferManager(manager, session_launcher=_fake_head_session_launcher())
         manager._transfer = tm
 
         stop = asyncio.Event()
@@ -1152,7 +1186,7 @@ async def test_diff_authority_round_shrinks_subset_to_done(tmp_path):
         )
         worker = TransferWorkerExecutor(worker_settings, session_launcher=launcher)
 
-        tm = TransferManager(manager)
+        tm = TransferManager(manager, session_launcher=_fake_head_session_launcher())
         manager._transfer = tm
 
         stop = asyncio.Event()
@@ -1198,7 +1232,7 @@ async def test_round_peers_use_data_plane_not_control_plane_address(tmp_path):
         worker_root.mkdir(parents=True, exist_ok=True)
         worker = TransferWorkerExecutor(worker_settings)
 
-        tm = TransferManager(manager)
+        tm = TransferManager(manager, session_launcher=_fake_head_session_launcher())
         manager._transfer = tm
 
         stop = asyncio.Event()
@@ -1242,7 +1276,7 @@ async def test_round_cap_gives_up_after_no_progress(tmp_path, monkeypatch):
         launcher = _fake_session_launcher({})
         worker = TransferWorkerExecutor(worker_settings, session_launcher=launcher)
 
-        tm = TransferManager(manager)
+        tm = TransferManager(manager, session_launcher=_fake_head_session_launcher())
         manager._transfer = tm
 
         stop = asyncio.Event()
@@ -1269,6 +1303,72 @@ async def test_round_cap_gives_up_after_no_progress(tmp_path, monkeypatch):
             await driver
 
 
+async def test_round_drive_spawns_head_src_session(tmp_path):
+    """The head must run rank 0 (``--role src``) of every round session.
+
+    S5 P3 rig failure this pins: the worker spawned its rank-1 dst each
+    round while no head-side rank ever launched, so every round died on a
+    join timeout ("3 consecutive failed/no-progress rounds"). This test
+    fails if ``_drive_rounds`` never calls the head-side session launcher.
+    """
+    calls: list = []
+    async with running_manager(_head_settings(tmp_path)) as manager:
+        member = await _activate_member(manager)
+
+        source_dir = tmp_path / "source" / "target-model"
+        source_dir.mkdir(parents=True)
+        (source_dir / "config.json").write_bytes(b"{}")
+
+        worker_settings = _worker_settings(tmp_path)
+        worker_root = worker_settings.get_effective_model_dirs()[0]
+        worker_root.mkdir(parents=True, exist_ok=True)
+        launcher = _fake_session_launcher({"config.json": b"{}"})
+        worker = TransferWorkerExecutor(worker_settings, session_launcher=launcher)
+
+        tm = TransferManager(
+            manager, session_launcher=_fake_head_session_launcher(calls)
+        )
+        manager._transfer = tm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(tm, worker, member, stop))
+        try:
+            job = await tm.start_transfer(
+                "target-model",
+                member=member,
+                local_path=str(source_dir),
+                source="peer",
+            )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                current = tm.job(job.id)
+                if current is not None and current.status in ("done", "error"):
+                    break
+                await asyncio.sleep(0.01)
+            final_job = tm.job(job.id)
+            assert final_job is not None
+            assert final_job.status == "done"
+
+            assert len(calls) == 1, "head src session spawned exactly once"
+            call = calls[0]
+            assert call["kwargs"]["rank"] == 0
+            assert call["kwargs"]["world_size"] == 2
+            ips = call["kwargs"]["ips"]
+            assert ips[0] == manager.settings.data_plane_address
+            assert ips[1] == "10.0.2.2"  # worker's START-ack data-plane addr
+            from omlx.settings import transfer_base_port
+
+            assert call["kwargs"]["base_port"] == transfer_base_port(manager.settings)
+            argv = call["argv"]
+            assert argv[argv.index("--role") + 1] == "src"
+            assert argv[argv.index("--root") + 1] == str(source_dir)
+            assert [e["relative_path"] for e in call["entries"]] == ["config.json"]
+            assert call["session"].stop_called
+        finally:
+            stop.set()
+            await driver
+
+
 # =============================================================================
 # TransferManager.abort_transfer (S5 P2: completes D4's abort mechanism --
 # P1 wired TRANSFER_ABORT's worker-side handling but never a head-side
@@ -1290,7 +1390,7 @@ async def test_abort_transfer_marks_head_and_worker_job_aborted(tmp_path):
         launcher = _fake_session_launcher({"config.json": b"{}"})
         worker = TransferWorkerExecutor(worker_settings, session_launcher=launcher)
 
-        tm = TransferManager(manager)
+        tm = TransferManager(manager, session_launcher=_fake_head_session_launcher())
         manager._transfer = tm
 
         stop = asyncio.Event()
@@ -1330,7 +1430,7 @@ async def test_pending_results_bounded_under_a_flood_of_out_of_range_steps(tmp_p
 
     async with running_manager(_head_settings(tmp_path)) as manager:
         member = await _activate_member(manager)
-        tm = TransferManager(manager)
+        tm = TransferManager(manager, session_launcher=_fake_head_session_launcher())
         tm._jobs["j1"] = TransferJob(
             id="j1", kind="transfer", status="running", created_at=time.time()
         )
@@ -1355,7 +1455,7 @@ async def test_finished_jobs_are_pruned_to_the_cap(tmp_path):
     from omlx.cluster.transfer import MAX_FINISHED_JOBS
 
     async with running_manager(_head_settings(tmp_path)) as manager:
-        tm = TransferManager(manager)
+        tm = TransferManager(manager, session_launcher=_fake_head_session_launcher())
         total = MAX_FINISHED_JOBS + 5
         for i in range(total):
             job_id = f"job-{i}"
@@ -1378,7 +1478,7 @@ async def test_a_still_running_job_is_never_pruned(tmp_path):
     from omlx.cluster.transfer import MAX_FINISHED_JOBS
 
     async with running_manager(_head_settings(tmp_path)) as manager:
-        tm = TransferManager(manager)
+        tm = TransferManager(manager, session_launcher=_fake_head_session_launcher())
         tm._jobs["running"] = TransferJob(
             id="running", kind="transfer", status="running", created_at=0.0
         )

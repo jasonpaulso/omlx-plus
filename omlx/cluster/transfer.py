@@ -346,6 +346,10 @@ class _JobRuntime:
     # (`_build_ips`), since a round session must ring-connect over the data
     # plane, never the join/heartbeat address.
     worker_data_plane_address: str = ""
+    # The resolved model dir the manifest was built over (snapshot dir for
+    # hub-cache sources) -- the head's per-round src session reads entries
+    # relative to this root.
+    source_root: str = ""
     # S5 P2 completion: a RESULT (have/round_done/round_error/done/error)
     # that arrives before `_await_round_result` has registered a future for
     # its step -- an owned round task on the worker can complete faster
@@ -565,7 +569,9 @@ class TransferManager:
             updated_at=time.time(),
         )
         self._jobs[job_id] = job
-        self._runtime[job_id] = _JobRuntime(member_id=member.id)
+        self._runtime[job_id] = _JobRuntime(
+            member_id=member.id, source_root=str(local_path)
+        )
         task = asyncio.create_task(
             self._drive(job_id, member, source, hf_repo_id, hf_revision)
         )
@@ -799,23 +805,51 @@ class TransferManager:
         while have != set(manifest_by_path):
             subset = sorted(set(manifest_by_path) - have)
             step += 1
-            wire = command_to_wire(
-                TransferRoundCommand(
-                    schema_version=PROTOCOL_VERSION,
-                    job_id=job_id,
-                    step=step,
-                    subset=subset,
-                    peers=peers,
-                    base_port=self._round_base_port(),
+            # The head is rank 0 (`--role src`) of the round's 2-rank ring
+            # session; the worker spawns rank 1 (`--role dst`) on receiving
+            # TRANSFER_ROUND. Spawn our side FIRST so rank 0 is joinable the
+            # moment the worker's rank comes up.
+            try:
+                src_session, src_tmp = self._launch_src_session(
+                    job_id, [manifest_by_path[p] for p in subset], peers
                 )
-            )
-            ack = await self._send_and_ack(member, wire)
-            if ack.get("status") == "rejected":
-                self._finish(job_id, "error", error=str(ack.get("detail") or ""))
-                return
-            result = await self._await_round_result(
-                job_id, step, timeout=ROUND_DEADLINE_S + 60.0
-            )
+            except TransferSpawnBoundError:
+                stalled += 1
+                self._jobs[job_id] = replace(
+                    self._jobs[job_id],
+                    rounds_completed=step - 1,
+                    updated_at=time.time(),
+                )
+                if stalled >= ROUND_CAP:
+                    self._finish(
+                        job_id,
+                        "error",
+                        error=f"{ROUND_CAP} consecutive failed/no-progress rounds",
+                    )
+                    return
+                await asyncio.sleep(1.0)
+                continue
+            try:
+                wire = command_to_wire(
+                    TransferRoundCommand(
+                        schema_version=PROTOCOL_VERSION,
+                        job_id=job_id,
+                        step=step,
+                        subset=subset,
+                        peers=peers,
+                        base_port=self._round_base_port(),
+                    )
+                )
+                ack = await self._send_and_ack(member, wire)
+                if ack.get("status") == "rejected":
+                    self._finish(job_id, "error", error=str(ack.get("detail") or ""))
+                    return
+                result = await self._await_round_result(
+                    job_id, step, timeout=ROUND_DEADLINE_S + 60.0
+                )
+            finally:
+                src_session.stop()
+                shutil.rmtree(src_tmp, ignore_errors=True)
             if result is None or result.get("status") == "round_error":
                 stalled += 1
             else:
@@ -904,6 +938,51 @@ class TransferManager:
         from ..settings import transfer_base_port
 
         return transfer_base_port(self._manager.settings)
+
+    def _launch_src_session(
+        self,
+        job_id: str,
+        entries: list[FileManifestEntry],
+        peers: list[str],
+    ) -> tuple[Any, Path]:
+        """Spawn the head's rank-0 ``--role src`` session for one round.
+
+        Returns ``(session, tmp_dir)``; the caller stops the session and
+        removes ``tmp_dir`` (holding the round's subset manifest) when the
+        round ends, success or not.
+        """
+        source_root = self._runtime[job_id].source_root
+        tmp = Path(tempfile.mkdtemp(prefix="omlx-transfer-src-"))
+        manifest_path = tmp / "round-manifest.json"
+        manifest_path.write_text(json.dumps([e.to_dict() for e in entries]))
+
+        def argv_builder(_rank: int) -> list[str]:
+            return [
+                "--role",
+                "src",
+                "--manifest",
+                str(manifest_path),
+                "--root",
+                source_root,
+            ]
+
+        cs = self._manager.settings
+        try:
+            session = self._session_launcher(
+                rank=0,
+                world_size=2,
+                ips=peers,
+                base_port=self._round_base_port(),
+                argv_builder=argv_builder,
+                data_plane_subnet=cs.data_plane_subnet,
+                allow_routable_data_plane=cs.allow_routable_data_plane,
+                allow_loopback=cs.allow_loopback,
+                python=self._python,
+            )
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        return session, tmp
 
 
 # =============================================================================

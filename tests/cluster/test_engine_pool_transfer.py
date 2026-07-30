@@ -125,6 +125,23 @@ def _ju(command, **fields):
     return {"job_id": command["job_id"], "step": command["step"], **fields}
 
 
+def _fake_head_session_launcher():
+    """Mirrors test_transfer.py's head-side fake: a no-op rank-0 src
+    session (the worker-side fake writes the bytes)."""
+
+    class _FakeSrcSession:
+        def stop(self):
+            pass
+
+        def kill(self):
+            pass
+
+    def launcher(**kwargs):
+        return _FakeSrcSession()
+
+    return launcher
+
+
 def _fake_session_launcher(file_contents: dict[str, bytes]):
     """Mirrors test_transfer.py's fake: simulates a completed round by
     writing each round entry's bytes directly into the staging dir the
@@ -291,7 +308,9 @@ async def harness(tmp_path, *, hub_cache: bool = False):
     async with running_manager(settings) as manager:
         member = await _activate_member(manager)
         manager._formation = _formation(manager, pool)
-        manager._transfer = TransferManager(manager)
+        manager._transfer = TransferManager(
+            manager, session_launcher=_fake_head_session_launcher()
+        )
         # NOT set_engine_pool_getter(lambda: pool): these tests call
         # `pool.load_cluster_model(...)` directly (no need for the head's
         # own registry lookup), and the global getter is also what
