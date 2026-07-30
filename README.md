@@ -305,6 +305,71 @@ Models are auto-detected by type. You can also download models directly from the
 | Embedding | BERT, BGE-M3, ModernBERT |
 | Reranker | ModernBERT, XLM-RoBERTa |
 
+## Distributed Serving
+
+Split one model's inference across two Apple Silicon Macs connected over Thunderbolt, for models
+too large to fit in one machine's memory. This is control-plane + tensor-parallel serving, not a
+cache/proxy layer: a `head` node and one or more `worker` nodes form a cluster; a plain model load
+on the head decides (automatically, or per request) whether to serve the model locally or shard it
+across the cluster, transfer the weights to the worker if needed, and stand up a tensor-parallel
+formation over a ring or JACCL/RDMA collective backend on the Thunderbolt link.
+
+**What works today** (measured on a real 2-Mac rig — see `docs/cluster/`):
+
+- **Cluster membership**: a worker joins a head with a short-lived bootstrap token; heartbeats keep
+  membership live; `omlx cluster status` shows members and formation state.
+- **Auto-placement**: a plain `POST /v1/models/{id}/load` (or the admin panel / on-demand load path)
+  decides local-vs-distributed placement from model size, divisibility, and node capacity —
+  distributed load is not a separate API (`docs/cluster/s4-measurements.md`).
+- **Coexistence**: a distributed formation and locally-pinned models share the head's memory
+  accounting and LRU/eviction correctly, verified under a mixed concurrent workload
+  (`docs/cluster/s4-measurements.md`).
+- **Model transfer**: loading a model absent from the worker triggers a resumable, digest-verified
+  file sync (peer-to-peer from the head, or HuggingFace fan-out to both nodes) before formation —
+  file-granular resume after a mid-transfer kill, corruption re-fetch by digest mismatch, zero
+  manual file staging (`docs/cluster/s5-measurements.md`).
+- **Backends**: both `ring` (plain TCP) and `jaccl` (RDMA) collective backends form and serve
+  correctly; per-step coordination tax stays a small fraction of the E4 budget on both
+  (`docs/cluster/bringup.md`, `docs/cluster/s2-measurements.md`).
+
+**Hardening in progress on this branch** (S6): worker rank-death detection with degrade-to-single-node
+instead of a formation hang; head-restart recovery; rejoin dedup so a restarted worker doesn't
+accumulate ghost members. See `docs/cluster/` for the latest measurement doc before relying on any
+of these in a specific commit.
+
+**Recorded, not yet addressed** (v1-deferred; see `docs/cluster/s5-measurements.md` for detail):
+starting a transfer while a formation is already serving the target model is unreachable via the
+only trigger surface (the load path 409s first); presence can be up to ~65s stale after external
+file changes outside the API; the worker's own `/v1/models` listing can lag briefly after a
+transfer even though placement and formation resolve the new model correctly; most local model
+inventory classifies as VLM and is refused distributed placement (a `language_model_only` text
+checkpoint is the exception oMLX recognizes).
+
+**Settings** (`cluster.*`, in `~/.omlx/settings.json` or `--cluster-*` CLI flags — `omlx serve --help`
+is the source of truth for flags):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `role` | `off` | `off` \| `head` \| `worker`. `off` leaves the cluster package entirely inert. `head`/`worker` require `auth.api_key` to be set. |
+| `heartbeat_interval_s` | `5.0` | Worker heartbeat cadence to the head. |
+| `member_timeout_s` | `20.0` | Head marks a member `lost` after this long without a heartbeat. |
+| `bootstrap_token_ttl_s` | `900.0` | Join-token lifetime. |
+| `lost_member_ttl_s` | `86400.0` | A member `lost` (missed heartbeats past `member_timeout_s`) longer than this is pruned and its credential revoked. |
+| `allow_loopback` | `false` | Admit members whose address is loopback (single-host testing only). |
+| `node_name` | `""` | This node's identity, asserted at join. |
+| `data_plane_subnet` | `""` | CIDR of the Thunderbolt link (e.g. `10.0.2.0/24`); formation refuses to start unset. |
+| `data_plane_address` | `""` | This node's own address inside `data_plane_subnet`. |
+| `backend` | `auto` | `ring` \| `jaccl` \| `auto`. |
+| `data_plane_base_port` | `41100` | First ring/JACCL listening port. |
+| `rdma_device` | `""` | RDMA device name for the `jaccl` backend. |
+| `allow_routable_data_plane` | `false` | Accept a data-plane address outside `data_plane_subnet` (dangerous — weakens link scoping; see `docs/cluster/s2-security-notes.md`). |
+| `auto_placement` | `true` | Head-only: run placement on a plain load instead of always serving local-only. |
+| `allow_hf_transfer` | `true` | Allow HuggingFace-sourced transfers to a worker (peer transfers are unaffected when off). |
+
+Full writeup, security notes, and rig measurements for each slice: `docs/cluster/bringup.md`,
+`docs/cluster/s2-measurements.md`, `docs/cluster/s2-security-notes.md`, `docs/cluster/s3-measurements.md`,
+`docs/cluster/s4-measurements.md`, `docs/cluster/s5-measurements.md`.
+
 ## CLI Configuration
 
 ```bash
@@ -340,6 +405,13 @@ omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 # API key authentication
 omlx serve --model-dir ~/models --api-key your-secret-key
 # Localhost-only: skip verification via admin panel global settings
+
+# Distributed serving: join two nodes over a Thunderbolt link (see Distributed Serving above)
+omlx serve --model-dir ~/models --api-key your-secret-key \
+  --cluster-role head --cluster-data-plane-subnet 10.0.2.0/24 --cluster-data-plane-address 10.0.2.1
+omlx serve --model-dir ~/models --api-key your-secret-key \
+  --cluster-role worker --cluster-data-plane-subnet 10.0.2.0/24 --cluster-data-plane-address 10.0.2.2
+omlx join http://10.0.2.1:8899 --token-file ./join.token
 ```
 
 All settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.

@@ -43,6 +43,8 @@ pytest -m slow
 |--------|-------------|
 | `@pytest.mark.slow` | Tests that require loading models |
 | `@pytest.mark.integration` | Tests that require a running server |
+| `@pytest.mark.turboquant` | TurboQuant KV cache tests (run with `pytest -m turboquant`) |
+| `@pytest.mark.cluster` | Two-node distributed-serving tests (run with `pytest -m cluster`) |
 
 **Test file naming:** For a source file `omlx/<module>.py`, the test file should be `tests/test_<module>.py`.
 
