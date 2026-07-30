@@ -353,5 +353,86 @@ def test_launch_transfer_session_refuses_a_second_while_first_is_live(
 
 
 def test_sweep_matches_both_worker_and_transfer_modules():
-    assert launcher.WORKER_MODULE in launcher._SWEEPABLE_MODULES
-    assert launcher.TRANSFER_MODULE in launcher._SWEEPABLE_MODULES
+    assert launcher.WORKER_MODULE in launcher._sweepable_modules()
+    assert launcher.TRANSFER_MODULE in launcher._sweepable_modules()
+
+
+def test_sweep_modules_follow_a_monkeypatched_worker_module():
+    """The sweep set is read live, not frozen at import -- a monkeypatched
+    ``WORKER_MODULE`` (the same pattern ``test_rank_batch.py`` uses to run a
+    test-only entry point) must be reflected the next time the sweep runs."""
+    original = launcher.WORKER_MODULE
+    launcher.WORKER_MODULE = "tests.cluster._s3_rank_worker"
+    try:
+        assert "tests.cluster._s3_rank_worker" in launcher._sweepable_modules()
+        assert original not in launcher._sweepable_modules()
+    finally:
+        launcher.WORKER_MODULE = original
+
+
+# -- S5 fix: `module` resolves at spawn time, not at class-definition time --
+
+
+def test_build_argv_uses_default_worker_module():
+    cluster = LocalCluster(model="m", world_size=1)
+    argv = cluster._build_argv(0, control_r=None)
+    assert argv == [
+        cluster.python,
+        "-m",
+        launcher.WORKER_MODULE,
+        "--model",
+        "m",
+        "--seed",
+        "0",
+    ]
+
+
+def test_build_argv_honors_a_worker_module_patched_after_construction():
+    """Pins the actual defect: a dataclass field default bound to
+    ``WORKER_MODULE`` freezes the ORIGINAL string at class-definition time,
+    so constructing the cluster BEFORE patching (as ``test_rank_batch.py``'s
+    ``formation()`` fixture does -- patch, then construct) previously never
+    reached the patch. The fix resolves ``module`` at ``_build_argv`` time,
+    so the patch takes effect regardless of construction order."""
+    original = launcher.WORKER_MODULE
+    launcher.WORKER_MODULE = "tests.cluster._s3_rank_worker"
+    try:
+        cluster = LocalCluster(model="m", world_size=1)
+        argv = cluster._build_argv(0, control_r=None)
+        assert "tests.cluster._s3_rank_worker" in argv
+        assert original not in argv
+    finally:
+        launcher.WORKER_MODULE = original
+
+
+def test_build_argv_explicit_module_overrides_the_default():
+    cluster = LocalCluster(model="m", world_size=1, module="some.other.module")
+    argv = cluster._build_argv(0, control_r=None)
+    assert "some.other.module" in argv
+
+
+def test_build_argv_argv_builder_path_ignores_control_r():
+    cluster = LocalCluster(
+        model="m",
+        world_size=1,
+        module="pkg.transfer_rank",
+        argv_builder=lambda rank: ["--role", "dst", "--rank", str(rank)],
+    )
+    argv = cluster._build_argv(1, control_r=7)
+    assert argv == [
+        cluster.python,
+        "-m",
+        "pkg.transfer_rank",
+        "--role",
+        "dst",
+        "--rank",
+        "1",
+    ]
+
+
+def test_build_argv_control_fd_only_added_when_provided():
+    cluster = LocalCluster(model="m", world_size=1)
+    argv = cluster._build_argv(0, control_r=9)
+    assert argv[-2:] == ["--control-fd", "9"]
+    argv_no_control = cluster._build_argv(1, control_r=None)
+    assert "--control-fd" not in argv_no_control

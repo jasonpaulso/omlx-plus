@@ -13,18 +13,22 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
+import types
 from pathlib import Path
 
 import pytest
 
 from omlx.cluster.manifest import ManifestError
 from omlx.cluster.protocol import parse_command
-from omlx.cluster.state import Member
+from omlx.cluster.state import FileManifestEntry, Member, TransferJob
 from omlx.cluster.transfer import (
     TransferError,
     TransferManager,
     TransferWorkerExecutor,
+    _JobRuntime,
+    _WorkerTransferJob,
     resolve_transfer_destination,
 )
 from omlx.cluster.versions import collect_versions
@@ -410,6 +414,297 @@ async def test_round_rejects_out_of_scope_peer(tmp_path):
 
 
 # =============================================================================
+# CL5-08: symlinked-ancestor destination is refused BEFORE os.replace
+# =============================================================================
+
+
+def test_finalize_round_refuses_symlinked_ancestor_before_replace(tmp_path):
+    """Pins the actual defect: the pre-fix code called `os.replace` before
+    validating containment, so `rename(2)`'s own directory-component symlink
+    following would already have written the file OUTSIDE the model root by
+    the time the (post-replace-only) check ran. The fix validates realpath
+    containment before `os.replace`, so a pre-planted symlinked ancestor is
+    refused before anything is written through it."""
+    final_dir = tmp_path / "final"
+    final_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.symlink(outside, final_dir / "evil")  # "evil" resolves OUTSIDE final_dir
+
+    staging_dir = tmp_path / "staging"
+    content = b"{}"
+    staged = staging_dir / "evil" / "payload.json"
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(content)
+
+    entry = FileManifestEntry(
+        relative_path="evil/payload.json", size=len(content), sha256=_sha(content)
+    )
+    settings = _worker_settings(tmp_path)
+    executor = TransferWorkerExecutor(settings)
+    job = _WorkerTransferJob(
+        job_id="j1",
+        model_id="m",
+        manifest=(entry,),
+        source="peer",
+        epoch="",
+        final_dir=final_dir,
+    )
+
+    newly_have = executor._finalize_round(job, [entry], staging_dir)
+
+    assert newly_have == []
+    assert not (outside / "payload.json").exists()  # never wrote outside the root
+    assert not staged.exists()  # staged copy was cleaned up, never moved
+
+
+# =============================================================================
+# CL5-11: staging volume guards (free space, total quota, orphan sweep)
+# =============================================================================
+
+
+async def test_round_rejects_when_staging_volume_lacks_free_space(
+    tmp_path, monkeypatch
+):
+    from omlx.cluster import transfer as transfer_mod
+
+    settings = _worker_settings(tmp_path)
+    executor = TransferWorkerExecutor(settings)
+    await executor.dispatch(parse_command(_start_command()))
+
+    monkeypatch.setattr(
+        transfer_mod.shutil,
+        "disk_usage",
+        lambda _path: types.SimpleNamespace(total=0, used=0, free=1),
+    )
+    ack = await executor.dispatch(parse_command(_round_command()))
+    assert ack["status"] == "rejected"
+    assert "CL5-11" in ack["detail"]
+
+
+async def test_round_rejects_when_total_staging_quota_exceeded(tmp_path, monkeypatch):
+    from omlx.cluster import transfer as transfer_mod
+
+    settings = _worker_settings(tmp_path)
+    executor = TransferWorkerExecutor(settings)
+    await executor.dispatch(parse_command(_start_command()))
+
+    monkeypatch.setattr(transfer_mod, "MAX_TOTAL_STAGING_BYTES", 1)
+    ack = await executor.dispatch(parse_command(_round_command()))
+    assert ack["status"] == "rejected"
+    assert "quota" in ack["detail"]
+
+
+def test_sweep_orphaned_staging_dirs_removes_only_stale_ones(tmp_path, monkeypatch):
+    from omlx.cluster import transfer as transfer_mod
+
+    monkeypatch.setattr(transfer_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    stale = tmp_path / "omlx-transfer-staging-stale"
+    stale.mkdir()
+    stale_file = stale / "f.bin"
+    stale_file.write_bytes(b"x")
+    old = time.time() - 10_000
+    os.utime(stale_file, (old, old))
+
+    fresh = tmp_path / "omlx-transfer-hf-staging-fresh"
+    fresh.mkdir()
+    (fresh / "f.bin").write_bytes(b"x")
+
+    unrelated = tmp_path / "not-a-staging-dir"
+    unrelated.mkdir()
+
+    removed = transfer_mod.sweep_orphaned_staging_dirs(older_than_s=60.0)
+
+    assert removed == 1
+    assert not stale.exists()
+    assert fresh.exists()
+    assert unrelated.exists()
+
+
+def test_executor_construction_sweeps_orphaned_staging_dirs(tmp_path, monkeypatch):
+    from omlx.cluster import transfer as transfer_mod
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        transfer_mod,
+        "sweep_orphaned_staging_dirs",
+        lambda **kw: calls.append(kw) or 0,
+    )
+    TransferWorkerExecutor(_worker_settings(tmp_path))
+    assert len(calls) == 1
+
+
+# =============================================================================
+# CL5-11: worker-side new-job rate limit
+# =============================================================================
+
+
+async def test_new_transfer_job_is_rate_limited(tmp_path):
+    settings = _worker_settings(tmp_path)
+    root = settings.get_effective_model_dirs()[0]
+    root.mkdir(parents=True, exist_ok=True)
+    executor = TransferWorkerExecutor(settings)
+
+    first = await executor.dispatch(parse_command(_start_command(job_id="j1")))
+    assert first["status"] == "accepted"
+
+    second = await executor.dispatch(parse_command(_start_command(job_id="j2")))
+    assert second["status"] == "rejected"
+    assert "rate limited" in second["detail"]
+
+
+async def test_redelivered_start_for_the_same_job_is_exempt_from_the_rate_limit(
+    tmp_path,
+):
+    settings = _worker_settings(tmp_path)
+    root = settings.get_effective_model_dirs()[0]
+    root.mkdir(parents=True, exist_ok=True)
+    executor = TransferWorkerExecutor(settings)
+
+    first = await executor.dispatch(parse_command(_start_command(job_id="j1")))
+    assert first["status"] == "accepted"
+
+    # A redelivered START for the SAME job_id must never be rejected as a
+    # rate-limited "new" job -- idempotent redelivery is exempt.
+    again = await executor.dispatch(parse_command(_start_command(job_id="j1")))
+    assert again["status"] == "accepted"
+
+
+async def test_rate_limit_clears_after_the_window(tmp_path, monkeypatch):
+    from omlx.cluster import transfer as transfer_mod
+
+    monkeypatch.setattr(transfer_mod, "NEW_JOB_RATE_LIMIT_S", 0.01)
+    settings = _worker_settings(tmp_path)
+    root = settings.get_effective_model_dirs()[0]
+    root.mkdir(parents=True, exist_ok=True)
+    executor = TransferWorkerExecutor(settings)
+
+    first = await executor.dispatch(parse_command(_start_command(job_id="j1")))
+    assert first["status"] == "accepted"
+
+    await asyncio.sleep(0.02)
+    second = await executor.dispatch(parse_command(_start_command(job_id="j2")))
+    assert second["status"] == "accepted"
+
+
+# =============================================================================
+# CL5-16: minimum-progress watchdog
+# =============================================================================
+
+
+class _BoundedBlockingProcess:
+    """Stands in for a wedged rank process: `.wait()` blocks well past any
+    watchdog under test, but is bounded so a leaked background thread (the
+    watchdog's `run_in_executor` call cannot truly cancel a blocking
+    syscall) does not hang the test session."""
+
+    def wait(self, timeout=None):
+        import threading
+
+        threading.Event().wait(timeout=0.3)
+        return None
+
+
+class _FakeTransferSession:
+    def __init__(self, process):
+        self.leader = types.SimpleNamespace(process=process)
+        self.kill_called = False
+        self.stop_called = False
+
+    def kill(self):
+        self.kill_called = True
+
+    def stop(self):
+        self.stop_called = True
+
+
+async def test_progress_watchdog_kills_a_stalled_round(tmp_path, monkeypatch):
+    from omlx.cluster import transfer as transfer_mod
+
+    monkeypatch.setattr(transfer_mod, "MIN_PROGRESS_INTERVAL_S", 0.02)
+    monkeypatch.setattr(transfer_mod, "MIN_PROGRESS_STRIKES", 2)
+
+    settings = _worker_settings(tmp_path)
+    executor = TransferWorkerExecutor(settings)
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()  # never grows -- zero progress every poll
+
+    cluster = _FakeTransferSession(_BoundedBlockingProcess())
+    start = time.monotonic()
+    await executor._wait_round_deadline(cluster, staging_dir)
+    elapsed = time.monotonic() - start
+
+    assert cluster.kill_called is True
+    assert elapsed < 1.0  # event-driven -- nowhere near ROUND_DEADLINE_S
+
+
+async def test_progress_watchdog_does_not_kill_a_growing_round(tmp_path, monkeypatch):
+    from omlx.cluster import transfer as transfer_mod
+
+    monkeypatch.setattr(transfer_mod, "MIN_PROGRESS_INTERVAL_S", 0.02)
+    monkeypatch.setattr(transfer_mod, "MIN_PROGRESS_STRIKES", 2)
+
+    settings = _worker_settings(tmp_path)
+    executor = TransferWorkerExecutor(settings)
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    class _GrowsThenExitsProcess:
+        def wait(self, timeout=None):
+            import time as time_mod
+
+            for i in range(20):
+                time_mod.sleep(0.01)
+                (staging_dir / f"chunk-{i}").write_bytes(b"x" * 4096)
+            return 0
+
+    cluster = _FakeTransferSession(_GrowsThenExitsProcess())
+    await executor._wait_round_deadline(cluster, staging_dir)
+
+    assert cluster.kill_called is False
+
+
+async def test_watchdog_kill_still_releases_the_session_via_finally(
+    tmp_path, monkeypatch
+):
+    """End-to-end through `_run_round`: the watchdog firing must still hit
+    `_run_round`'s `finally: cluster.stop()` (the single-active gate release
+    on the worker side) and let the round complete with a terminal update,
+    never leaving the job hung."""
+    from omlx.cluster import transfer as transfer_mod
+
+    monkeypatch.setattr(transfer_mod, "MIN_PROGRESS_INTERVAL_S", 0.02)
+    monkeypatch.setattr(transfer_mod, "MIN_PROGRESS_STRIKES", 2)
+
+    settings = _worker_settings(tmp_path)
+    root = settings.get_effective_model_dirs()[0]
+    root.mkdir(parents=True, exist_ok=True)
+
+    session = _FakeTransferSession(_BoundedBlockingProcess())
+
+    def launcher(*, rank, world_size, ips, base_port, argv_builder, **kwargs):
+        argv_builder(rank)  # discover the staging dir/manifest path; write nothing
+        return session
+
+    executor = TransferWorkerExecutor(settings, session_launcher=launcher)
+    await executor.dispatch(parse_command(_start_command()))
+    await executor.dispatch(parse_command(_round_command()))
+
+    for _ in range(200):
+        updates = executor.pending_transfer_updates()
+        done = [u for u in updates if u.get("status") == "round_done"]
+        if done:
+            break
+        await asyncio.sleep(0.005)
+    else:
+        pytest.fail("round never completed after the watchdog fired")
+
+    assert session.kill_called is True
+    assert session.stop_called is True
+
+
+# =============================================================================
 # TRANSFER_ABORT
 # =============================================================================
 
@@ -786,3 +1081,79 @@ async def test_abort_transfer_marks_head_and_worker_job_aborted(tmp_path):
         with pytest.raises(TransferError) as excinfo:
             await tm.abort_transfer("no-such-job")
         assert excinfo.value.status_code == 404
+
+
+# =============================================================================
+# CL5-04/05: head-side unbounded growth (pending_results, _jobs/_runtime)
+# =============================================================================
+
+
+async def test_pending_results_bounded_under_a_flood_of_out_of_range_steps(tmp_path):
+    from omlx.cluster.transfer import MAX_PENDING_RESULTS_PER_JOB
+
+    async with running_manager(_head_settings(tmp_path)) as manager:
+        member = await _activate_member(manager)
+        tm = TransferManager(manager)
+        tm._jobs["j1"] = TransferJob(
+            id="j1", kind="transfer", status="running", created_at=time.time()
+        )
+        tm._runtime["j1"] = _JobRuntime(member_id=member.id)
+
+        # The verifier's probe shape: 200 ordinary updates + 50 out-of-range
+        # steps, none of which anyone is awaiting -- every one lands in
+        # `pending_results`.
+        updates = [
+            {"job_id": "j1", "step": step, "status": "have", "have": []}
+            for step in range(1, 201)
+        ] + [
+            {"job_id": "j1", "step": step, "status": "have", "have": []}
+            for step in range(10_000, 10_050)
+        ]
+        tm.record_transfer_updates(member, updates)
+
+        assert len(tm._runtime["j1"].pending_results) <= MAX_PENDING_RESULTS_PER_JOB
+
+
+async def test_finished_jobs_are_pruned_to_the_cap(tmp_path):
+    from omlx.cluster.transfer import MAX_FINISHED_JOBS
+
+    async with running_manager(_head_settings(tmp_path)) as manager:
+        tm = TransferManager(manager)
+        total = MAX_FINISHED_JOBS + 5
+        for i in range(total):
+            job_id = f"job-{i}"
+            tm._jobs[job_id] = TransferJob(
+                id=job_id, kind="transfer", status="running", created_at=float(i)
+            )
+            tm._runtime[job_id] = _JobRuntime(member_id="m")
+            tm._finish(job_id, "done")
+
+        assert len(tm._jobs) == MAX_FINISHED_JOBS
+        assert len(tm._runtime) == MAX_FINISHED_JOBS
+        # Oldest (lowest created_at) are the ones pruned; most recent kept.
+        assert "job-0" not in tm._jobs
+        assert f"job-{total - 1}" in tm._jobs
+
+
+async def test_a_still_running_job_is_never_pruned(tmp_path):
+    """Only TERMINAL jobs count against the cap -- a job still in flight
+    must never be evicted just because many older finished jobs exist."""
+    from omlx.cluster.transfer import MAX_FINISHED_JOBS
+
+    async with running_manager(_head_settings(tmp_path)) as manager:
+        tm = TransferManager(manager)
+        tm._jobs["running"] = TransferJob(
+            id="running", kind="transfer", status="running", created_at=0.0
+        )
+        tm._runtime["running"] = _JobRuntime(member_id="m")
+
+        for i in range(MAX_FINISHED_JOBS + 5):
+            job_id = f"job-{i}"
+            tm._jobs[job_id] = TransferJob(
+                id=job_id, kind="transfer", status="running", created_at=float(i + 1)
+            )
+            tm._runtime[job_id] = _JobRuntime(member_id="m")
+            tm._finish(job_id, "done")
+
+        assert "running" in tm._jobs
+        assert tm._jobs["running"].status == "running"

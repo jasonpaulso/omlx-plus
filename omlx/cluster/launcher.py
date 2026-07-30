@@ -41,7 +41,16 @@ WORKER_MODULE = "omlx.cluster.rank_worker"
 # S5: the per-round transfer rank script (D1/R3c) -- a distinct entry point,
 # never rank_worker, spawned by `launch_transfer_session`.
 TRANSFER_MODULE = "omlx.cluster.transfer_rank"
-_SWEEPABLE_MODULES = (WORKER_MODULE, TRANSFER_MODULE)
+
+
+def _sweepable_modules() -> tuple[str, str]:
+    """``(WORKER_MODULE, TRANSFER_MODULE)``, read live rather than frozen at
+    import time -- a module-level constant tuple built once would bake in
+    whatever these two names pointed to at import, and a caller that
+    monkeypatches ``WORKER_MODULE`` (e.g. tests, to run a test-only entry
+    point) would never see the sweep follow it."""
+    return (WORKER_MODULE, TRANSFER_MODULE)
+
 
 # init() blocks until the whole world joins; past this we assume someone never
 # arrives and tear the run down rather than hanging forever.
@@ -230,9 +239,10 @@ def sweep_orphaned_ranks() -> int:
 
     ours = os.getpid()
     killed = 0
+    sweepable = _sweepable_modules()
     for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
         cmdline = proc.info.get("cmdline") or []
-        if not any(module in cmdline for module in _SWEEPABLE_MODULES):
+        if not any(module in cmdline for module in sweepable):
             continue
         parent = proc.info.get("ppid")
         if parent == ours:
@@ -464,7 +474,15 @@ class LocalCluster:
     # `--model`/`--seed`/`--control-fd`/`--metrics-path`); a non-default
     # `module` is never used without a matching `argv_builder` (transfer
     # sessions run `transfer_rank`, whose argv shape is unrelated).
-    module: str = WORKER_MODULE
+    #
+    # Defaults to None, resolved to `WORKER_MODULE` at spawn time by
+    # `_resolve_module`, rather than binding `WORKER_MODULE` directly here:
+    # a dataclass field's plain-value default is captured once, at class
+    # definition (import) time. A caller that monkeypatches the module-level
+    # `WORKER_MODULE` afterwards (tests run a test-only entry point this
+    # way) would never reach an already-baked default -- resolving at use
+    # time is what makes the patch effective.
+    module: str | None = None
     argv_builder: Callable[[int], list[str]] | None = None
     ranks: list[RankProcess] = field(default_factory=list)
     _workdir: Path | None = None
@@ -581,6 +599,48 @@ class LocalCluster:
                     "spawn peers against a dead listener"
                 )
 
+    def _resolve_module(self) -> str:
+        """The rank entry-point module, resolved at spawn time (S5 fix).
+
+        See the ``module`` field's docstring: resolving here rather than
+        reading a frozen dataclass default is what makes a monkeypatched
+        ``WORKER_MODULE`` actually take effect.
+        """
+        return self.module if self.module is not None else WORKER_MODULE
+
+    def _build_argv(self, rank: int, *, control_r: int | None) -> list[str]:
+        """The spawned rank's argv, apart from actually spawning it.
+
+        Factored out of ``_spawn_one`` so the module-resolution/argv shape
+        is assertable without spawning a subprocess or opening a pipe --
+        ``control_r`` is the (already-opened, or ``None``) read end of the
+        control pipe rank 0 gets; the caller decides whether to open one.
+        """
+        module = self._resolve_module()
+        if self.argv_builder is not None:
+            # A non-rank_worker entry point (e.g. transfer_rank): the caller
+            # owns the whole argv shape, including any inheritable fds it
+            # wants -- rank_worker's control-pipe convention is specific to
+            # its own daemon-abort protocol and does not apply generically.
+            return [self.python, "-m", module, *self.argv_builder(rank)]
+        argv = [
+            self.python,
+            "-m",
+            module,
+            "--model",
+            self.model,
+            "--seed",
+            str(self.seed),
+        ]
+        if self.metrics_dir is not None:
+            argv += [
+                "--metrics-path",
+                str(Path(self.metrics_dir) / f"rank-{rank}.json"),
+            ]
+        if control_r is not None:
+            argv += ["--control-fd", str(control_r)]
+        return argv
+
     def _spawn_one(self, rank: int) -> None:
         env = hostfile.local_worker_env(
             dict(os.environ),
@@ -591,32 +651,10 @@ class LocalCluster:
             ibv_devices=self._ibv_path,
         )
         control_r = control_w = None
-        if self.argv_builder is not None:
-            # A non-rank_worker entry point (e.g. transfer_rank): the caller
-            # owns the whole argv shape, including any inheritable fds it
-            # wants -- rank_worker's control-pipe convention is specific to
-            # its own daemon-abort protocol and does not apply generically.
-            argv = [self.python, "-m", self.module, *self.argv_builder(rank)]
-        else:
-            argv = [
-                self.python,
-                "-m",
-                self.module,
-                "--model",
-                self.model,
-                "--seed",
-                str(self.seed),
-            ]
-            if self.metrics_dir is not None:
-                argv += [
-                    "--metrics-path",
-                    str(Path(self.metrics_dir) / f"rank-{rank}.json"),
-                ]
-
-            if rank == 0:
-                control_r, control_w = os.pipe()
-                os.set_inheritable(control_r, True)
-                argv += ["--control-fd", str(control_r)]
+        if self.argv_builder is None and rank == 0:
+            control_r, control_w = os.pipe()
+            os.set_inheritable(control_r, True)
+        argv = self._build_argv(rank, control_r=control_r)
 
         try:
             process = subprocess.Popen(

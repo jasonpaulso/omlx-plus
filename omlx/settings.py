@@ -583,7 +583,8 @@ VALID_CLUSTER_BACKENDS = {"ring", "jaccl", "auto"}
 # transfer session never collides with a live formation's ports. Duplicated
 # from `cluster.manager.MAX_WORLD_SIZE` (settings.py cannot import
 # manager.py -- manager.py imports settings.py) -- kept honest by
-# `assert_transfer_ports_non_overlapping`, exercised by the unit gate.
+# `assert_transfer_ports_non_overlapping`, exercised by
+# `tests/cluster/test_transfer_ports.py`.
 TRANSFER_PORT_RANGE_OFFSET = 64  # == cluster.manager.MAX_WORLD_SIZE
 
 

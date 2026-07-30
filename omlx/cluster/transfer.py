@@ -57,6 +57,18 @@ logger = logging.getLogger(__name__)
 
 # D2: give up after this many consecutive failed/no-progress rounds.
 ROUND_CAP = 3
+# CL5-04/05: head-side unbounded-growth bounds. `pending_results` buffers a
+# RESULT that arrived before `_await_round_result` registered a future for
+# its step (S5 P2 completion, see `_JobRuntime`); a flood of updates for
+# steps nobody is waiting on (bogus or a stale worker) would otherwise grow
+# it forever. Evict-oldest on overflow, same discipline as
+# `WorkerCommandExecutor.MAX_TRACKED_JOBS`'s LRU (manager.py).
+MAX_PENDING_RESULTS_PER_JOB = 64
+# `_jobs`/`_runtime` themselves are the second half of the same gap: a
+# long-lived head daemon never drops a finished job's record, so its history
+# grows without bound. Mirrors `FormationManager.snapshot`'s last-10
+# convention -- only TERMINAL jobs are ever pruned, oldest-finished-first.
+MAX_FINISHED_JOBS = 10
 # S5 P2/D4: the step number a head-initiated TRANSFER_ABORT always uses.
 # `WorkerCommandExecutor.MAX_STEPS_PER_JOB` (manager.py) is 4096; this sits
 # right at that ceiling (still accepted -- the worker only rejects a step
@@ -65,15 +77,57 @@ ROUND_CAP = 3
 # round step.
 ABORT_STEP = 4096
 # D1b/CL5-16: wall-clock deadline for one round + the daemon-side watchdog
-# that kills a session past it, releasing the gate in `finally`.
+# that kills a session past it, releasing the gate in `finally`. A SECOND,
+# tighter watchdog rides the same poll: a round with zero staging-dir growth
+# for `MIN_PROGRESS_STRIKES` consecutive polls is declared stalled (not
+# merely slow) and killed well before the wall clock -- a wedged-but-silent
+# peer would otherwise run the full deadline before anything notices.
 ROUND_DEADLINE_S = 1800.0
 MIN_PROGRESS_INTERVAL_S = 5.0
+MIN_PROGRESS_STRIKES = 6  # 6 * MIN_PROGRESS_INTERVAL_S == 30s of zero progress
 
 # CL5-14, mirrored from the manifest builder's ignore precedent: the HF
 # path's DETERMINISTIC ignore list (D3a/CL5-01) -- never the
 # `model_info`-conditional one `hf_downloader.start_download` computes for
 # the admin UI (which vanishes on a metadata failure).
 HF_IGNORE_PATTERNS = ["*.bin", "original/**", "consolidated.*.pth"]
+
+# -- CL5-11: staging exhaustion bounds ----------------------------------------
+#
+# Every one of these guards the SAME resource -- the worker's local staging
+# volume -- from three different angles: not enough room for what's about to
+# land (free-space precheck), too much already sitting there across every
+# job at once (a hard total cap, independent of how much free space there
+# happens to be), and stale directories nobody is coming back to (a crashed
+# process, or a head that went silent for good).
+
+# Headroom kept beyond the round/job's own byte cost: catches "wrote 99% of
+# a shard, then ENOSPC mid-file" at admission instead of partway through a
+# multi-GB write. Not derived from the model -- a generous constant is the
+# point, not exact accounting.
+STAGING_FREE_SPACE_MARGIN_BYTES = 1 * 1024**3  # 1 GiB
+# Ceiling on bytes any staging directory tree may hold at once, across every
+# job this worker is running. A spacious disk should not let a single
+# misbehaving or greedy head balloon local staging without bound.
+MAX_TOTAL_STAGING_BYTES = 200 * 1024**3  # 200 GiB
+# A staging dir untouched for longer than this is assumed orphaned -- either
+# the worker restarted mid-round (in-memory job state lost, so nothing will
+# ever finish or clean it up) or the head that owned it went silent well
+# past any live round's own deadline. Comfortably longer than
+# ROUND_DEADLINE_S so a slow-but-live round is never swept.
+STAGING_ORPHAN_AGE_S = ROUND_DEADLINE_S + 300.0
+# The two staging-directory prefixes this worker ever creates (peer rounds,
+# HF fan-out) -- the only directories the orphan sweep and the quota scan
+# will ever touch.
+_STAGING_DIR_PREFIXES = ("omlx-transfer-staging-", "omlx-transfer-hf-staging-")
+
+# CL5-11: minimal worker-side flood guard -- a genuinely new transfer job
+# (never one already known, so an idempotent redelivery is exempt) is
+# refused when the last ACCEPTED new job landed less than this many seconds
+# ago. One node forming/tearing down transfer sessions in a tight loop is
+# exactly the exhaustion CL2-09's formation bound already guards against for
+# formations; this is the same discipline for transfers.
+NEW_JOB_RATE_LIMIT_S = 5.0
 
 _MODEL_ID_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 MAX_MODEL_ID_LENGTH = 200
@@ -99,6 +153,106 @@ def _sha256_file(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# -- CL5-11: staging volume guards (free space, total quota, orphan sweep) ---
+
+
+def _staging_dirs() -> list[Path]:
+    """Every one of this worker's own staging directories currently on
+    disk, matched by prefix under the system temp dir -- the same location
+    `tempfile.mkdtemp` uses for both round and HF-fan-out staging."""
+    tmp = Path(tempfile.gettempdir())
+    try:
+        entries = list(tmp.iterdir())
+    except OSError:
+        return []
+    return [
+        entry
+        for entry in entries
+        if entry.is_dir() and entry.name.startswith(_STAGING_DIR_PREFIXES)
+    ]
+
+
+def _dir_bytes(path: Path) -> int:
+    total = 0
+    try:
+        for file_path in path.rglob("*"):
+            if file_path.is_file():
+                with contextlib.suppress(OSError):
+                    total += file_path.stat().st_size
+    except OSError:
+        return total
+    return total
+
+
+def _total_staging_bytes() -> int:
+    """Bytes currently sitting in every one of this worker's staging
+    directories, across every job -- read straight off disk rather than
+    tracked in memory, so it stays honest across process restarts and
+    partial writes."""
+    return sum(_dir_bytes(entry) for entry in _staging_dirs())
+
+
+def _check_staging_capacity(required_bytes: int) -> None:
+    """CL5-11: refuse to stage more bytes than the volume can hold, or more
+    than this worker's total staging quota allows.
+
+    Two independent guards checked together before staging begins for one
+    round or one HF fan-out: free space on the staging volume (with a
+    margin, so a full disk fails loudly at admission rather than partway
+    through a multi-GB write), and a hard ceiling on the total this worker
+    will ever stage across every job at once (a spacious disk should not
+    let a single misbehaving or greedy head balloon staging without bound).
+    """
+    usage = shutil.disk_usage(tempfile.gettempdir())
+    needed = required_bytes + STAGING_FREE_SPACE_MARGIN_BYTES
+    if usage.free < needed:
+        raise ManifestError(
+            f"staging volume has {usage.free} bytes free, need {needed} "
+            f"({required_bytes} for this transfer + "
+            f"{STAGING_FREE_SPACE_MARGIN_BYTES} margin) (CL5-11)"
+        )
+    in_flight = _total_staging_bytes()
+    if in_flight + required_bytes > MAX_TOTAL_STAGING_BYTES:
+        raise ManifestError(
+            f"staging quota exceeded: {in_flight} bytes already staged + "
+            f"{required_bytes} for this transfer > {MAX_TOTAL_STAGING_BYTES} "
+            "cap (CL5-11)"
+        )
+
+
+def sweep_orphaned_staging_dirs(*, older_than_s: float | None = None) -> int:
+    """Remove staging directories nobody is coming back to (CL5-11).
+
+    Age-based rather than liveness-based -- a staging directory is not a
+    process, so there is nothing to poll the way `launcher.sweep_orphaned_
+    ranks` polls the process table. A directory whose newest file is older
+    than the threshold is assumed to belong to either a worker that
+    restarted mid-round (in-memory job state lost, so nothing will ever
+    finish or clean it up) or a round whose head went silent well past its
+    own deadline. Safe to call at any time, including concurrently with a
+    genuinely live round elsewhere on the same machine: the threshold is
+    comfortably longer than any live round's own deadline, so a directory
+    still being written to is never mistaken for an orphan.
+    """
+    threshold = STAGING_ORPHAN_AGE_S if older_than_s is None else older_than_s
+    now = time.time()
+    removed = 0
+    for entry in _staging_dirs():
+        try:
+            newest = max(
+                (p.stat().st_mtime for p in entry.rglob("*") if p.is_file()),
+                default=entry.stat().st_mtime,
+            )
+        except OSError:
+            continue
+        if now - newest < threshold:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        removed += 1
+        logger.warning("cluster: swept orphaned transfer staging dir %s", entry)
+    return removed
 
 
 def resolve_transfer_destination(model_id: str, root: Path) -> Path:
@@ -313,7 +467,26 @@ class TransferManager:
             if round_future is not None and not round_future.done():
                 round_future.set_result(update)
             else:
-                runtime.pending_results[step] = update
+                pending = runtime.pending_results
+                is_new_step = step not in pending
+                pending[step] = update
+                # CL5-04: bound the buffer -- a flood of results for steps
+                # nobody is awaiting (bogus or a stale/misbehaving worker)
+                # would otherwise grow this without limit. Evict the oldest
+                # buffered step (dict insertion order); overwriting an
+                # already-buffered step never grows the dict, so it never
+                # evicts.
+                if is_new_step and len(pending) > MAX_PENDING_RESULTS_PER_JOB:
+                    oldest_step = next(iter(pending))
+                    if oldest_step != step:
+                        del pending[oldest_step]
+                        logger.warning(
+                            "cluster: transfer job %s pending_results exceeded "
+                            "%d; evicted step %d",
+                            job_id,
+                            MAX_PENDING_RESULTS_PER_JOB,
+                            oldest_step,
+                        )
 
     # ---- job creation (E6 queue, D4 gate) ----------------------------------
 
@@ -606,6 +779,25 @@ class TransferManager:
         self._jobs[job_id] = replace(
             job, status=status, error=error, updated_at=time.time()
         )
+        self._prune_finished()
+
+    def _prune_finished(self) -> None:
+        """CL5-04/05: cap retained job records so ``_jobs``/``_runtime``
+        don't grow without bound across a long-lived daemon's history --
+        mirrors ``FormationManager``'s last-10 convention. Only TERMINAL
+        jobs (``done``/``error``/``aborted``) are ever pruned; a job still
+        running is never touched no matter how old."""
+        terminal = [
+            job
+            for job in self._jobs.values()
+            if job.status in ("done", "error", "aborted")
+        ]
+        if len(terminal) <= MAX_FINISHED_JOBS:
+            return
+        terminal.sort(key=lambda job: job.created_at)
+        for job in terminal[: len(terminal) - MAX_FINISHED_JOBS]:
+            self._jobs.pop(job.id, None)
+            self._runtime.pop(job.id, None)
 
     def _round_peers(self, job_id: str) -> list[str] | None:
         """``[head_data_plane_address, worker_data_plane_address]`` -- NEVER
@@ -672,6 +864,14 @@ class TransferWorkerExecutor:
         self._jobs: dict[str, _WorkerTransferJob] = {}
         self._updates: list[dict[str, Any]] = []
         self._current_epoch: str | None = None
+        # CL5-11: last time a genuinely NEW job was accepted -- the flood
+        # guard `_do_start` checks new job_ids against.
+        self._last_new_job_at: float = 0.0
+        # CL5-11: a fresh executor is this worker's "just (re)started" point
+        # -- sweep whatever staging directories survived a prior crash. Age-
+        # gated (see `sweep_orphaned_staging_dirs`), so this is safe even
+        # though tests construct many executors sharing the same temp dir.
+        sweep_orphaned_staging_dirs()
 
     def set_epoch(self, epoch: str) -> None:
         self._current_epoch = epoch
@@ -703,6 +903,20 @@ class TransferWorkerExecutor:
     # ---- TRANSFER_START -----------------------------------------------
 
     def _do_start(self, command: TransferStartCommand) -> dict[str, Any]:
+        is_new_job = command.job_id not in self._jobs
+        if is_new_job:
+            elapsed = time.time() - self._last_new_job_at
+            if elapsed < NEW_JOB_RATE_LIMIT_S:
+                return make_job_update(
+                    command.job_id,
+                    command.step,
+                    status="rejected",
+                    detail=(
+                        f"a new transfer job was accepted {elapsed:.1f}s ago; "
+                        f"rate limited to one new job per {NEW_JOB_RATE_LIMIT_S:.0f}s "
+                        "(CL5-11)"
+                    ),
+                )
         if (
             self._current_epoch is not None
             and command.epoch
@@ -750,6 +964,16 @@ class TransferWorkerExecutor:
                     status="rejected",
                     detail="cluster.allow_hf_transfer is disabled on this node",
                 )
+            # CL5-11: the HF fan-out stages the whole manifest in one shot
+            # (no round-by-round subsetting), so the capacity check runs
+            # against the full manifest total here rather than at round
+            # start the way the peer path's `_do_round` does.
+            try:
+                _check_staging_capacity(sum(entry.size for entry in manifest))
+            except ManifestError as exc:
+                return make_job_update(
+                    command.job_id, command.step, status="rejected", detail=str(exc)
+                )
 
         job = _WorkerTransferJob(
             job_id=command.job_id,
@@ -762,6 +986,8 @@ class TransferWorkerExecutor:
             hf_revision=command.hf_revision,
         )
         self._jobs[command.job_id] = job
+        if is_new_job:
+            self._last_new_job_at = time.time()
         if command.source == TransferSource.HF:
             job.task = asyncio.create_task(self._run_hf_download(job, command.step))
         else:
@@ -868,6 +1094,12 @@ class TransferWorkerExecutor:
                 status="rejected",
                 detail="round subset references entries outside the job's manifest",
             )
+        try:
+            _check_staging_capacity(sum(entry.size for entry in subset_entries))
+        except ManifestError as exc:
+            return make_job_update(
+                command.job_id, command.step, status="rejected", detail=str(exc)
+            )
         job.task = asyncio.create_task(
             self._run_round(job, command.step, subset_entries, peers, command.base_port)
         )
@@ -930,7 +1162,7 @@ class TransferWorkerExecutor:
             return
 
         try:
-            await self._wait_round_deadline(cluster)
+            await self._wait_round_deadline(cluster, staging_dir)
         finally:
             cluster.stop()
 
@@ -948,22 +1180,57 @@ class TransferWorkerExecutor:
             transferred=newly_have,
         )
 
-    async def _wait_round_deadline(self, cluster: Any) -> None:
-        """CL5-16: a wall-clock deadline that kills a wedged session; the
-        gate release happens in ``finally`` regardless (`_run_round`'s
-        ``cluster.stop()``, `_drive`'s gate release on the head side)."""
+    async def _wait_round_deadline(self, cluster: Any, staging_dir: Path) -> None:
+        """CL5-16: two watchdogs guard one round, either one killing the
+        session; the gate release happens in ``finally`` regardless
+        (`_run_round`'s ``cluster.stop()``, `_drive`'s gate release on the
+        head side).
+
+        The wall-clock ceiling (``ROUND_DEADLINE_S``) alone leaves a round
+        that is merely SILENT -- not exited, just stuck -- running the full
+        30 minutes before anything notices. The minimum-progress watchdog
+        polls every ``MIN_PROGRESS_INTERVAL_S`` and tracks the staging
+        directory's total bytes: ``MIN_PROGRESS_STRIKES`` consecutive polls
+        with zero growth declares the round stalled and kills it, well
+        before the wall clock would.
+        """
         leader = cluster.leader
         if leader is None:
             return
         loop = asyncio.get_running_loop()
+        wait_task = loop.run_in_executor(None, leader.process.wait)
+        deadline = loop.time() + ROUND_DEADLINE_S
+        last_bytes = -1
+        stalled_polls = 0
         try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, leader.process.wait),
-                timeout=ROUND_DEADLINE_S,
-            )
-        except TimeoutError:
-            logger.warning("cluster: transfer round exceeded its deadline; killing")
-            cluster.kill()
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.warning(
+                        "cluster: transfer round exceeded its deadline; killing"
+                    )
+                    cluster.kill()
+                    return
+                done, _pending = await asyncio.wait(
+                    {wait_task}, timeout=min(MIN_PROGRESS_INTERVAL_S, remaining)
+                )
+                if wait_task in done:
+                    return
+                current_bytes = _dir_bytes(staging_dir)
+                if current_bytes > last_bytes:
+                    last_bytes = current_bytes
+                    stalled_polls = 0
+                    continue
+                stalled_polls += 1
+                if stalled_polls >= MIN_PROGRESS_STRIKES:
+                    logger.warning(
+                        "cluster: transfer round made no progress for %.0fs; killing",
+                        MIN_PROGRESS_INTERVAL_S * MIN_PROGRESS_STRIKES,
+                    )
+                    cluster.kill()
+                    return
+        finally:
+            wait_task.cancel()
 
     def _finalize_round(
         self,
@@ -988,6 +1255,16 @@ class TransferWorkerExecutor:
                         staged.unlink()
                     continue
                 final_path = manifest_mod.resolve_under(entry, job.final_dir)
+                # CL5-08: validate BEFORE touching the destination -- a
+                # symlinked ancestor already in place (planted before this
+                # round even started) must be refused before `mkdir` walks
+                # through it and before `os.replace` writes through it, not
+                # merely detected after the fact. The leaf write itself
+                # stays `os.replace` (never an open()-based copy), which
+                # does not follow a symlink AT the final component even if
+                # one is raced in later; the second check below still
+                # guards that narrower TOCTOU window.
+                manifest_mod.assert_realpath_contained(final_path, job.final_dir)
                 final_path.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(staged, final_path)
                 manifest_mod.assert_realpath_contained(final_path, job.final_dir)
@@ -1067,6 +1344,9 @@ class TransferWorkerExecutor:
                     missing.add(entry.relative_path)
                     continue
                 final_path = manifest_mod.resolve_under(entry, job.final_dir)
+                # CL5-08: same pre-replace validation as `_finalize_round` --
+                # see its comment.
+                manifest_mod.assert_realpath_contained(final_path, job.final_dir)
                 final_path.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(staged, final_path)
                 manifest_mod.assert_realpath_contained(final_path, job.final_dir)
