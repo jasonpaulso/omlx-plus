@@ -570,10 +570,31 @@ except ImportError:
 # Include cluster control-plane routes. The router is always mounted; every
 # route answers 404 while cluster.role is "off" and no cluster state or
 # credential is reachable (the paths do remain visible in /openapi.json).
-from .cluster.engine import ClusterNonGoalError  # noqa: E402
+from .cluster.engine import (  # noqa: E402
+    ClusterEngine,
+    ClusterNonGoalError,
+    raise_if_multimodal_messages,
+)
 from .cluster.routes import router as cluster_router  # noqa: E402
 
 app.include_router(cluster_router)
+
+
+def _reject_cluster_multimodal(engine: Any, raw_messages: Any) -> None:
+    """S6 fork ruling (P1c item 6): an image/audio-bearing request against a
+    cluster-formed model must error clearly (400), never be silently served
+    as text. The non-VLM message conversions strip multimodal parts before
+    ``preflight_chat`` runs, so the engine's own guard cannot see them —
+    each route calls this on the RAW request payload first.
+    """
+    if not isinstance(engine, ClusterEngine):
+        return
+    msgs = []
+    for m in raw_messages or []:
+        if hasattr(m, "model_dump"):
+            m = m.model_dump()
+        msgs.append(m)
+    raise_if_multimodal_messages(msgs)
 
 # Include admin routes
 from .admin.auth import _RedirectToLogin
@@ -3378,6 +3399,7 @@ async def create_chat_completion(
         is_dflash_vlm = not is_vlm and getattr(
             engine, "supports_multimodal_fallback", False
         )
+        _reject_cluster_multimodal(engine, request.messages)
         extractor = getattr(engine, "message_extractor", None)
         merge_system_fallback_roles = not (is_vlm or is_dflash_vlm)
         if extractor is not None:
@@ -5306,6 +5328,7 @@ async def create_anthropic_message(
                 else None
             ),
         )
+        _reject_cluster_multimodal(engine, request.messages)
         if engine.model_type == "gpt_oss":
             messages = convert_anthropic_to_internal_harmony(
                 request,
@@ -5762,6 +5785,9 @@ async def create_response(
 
         resolved_model = resolve_model_id(request.model) or request.model
 
+        _reject_cluster_multimodal(
+            engine, request.input if isinstance(request.input, list) else None
+        )
         current_input_messages = convert_responses_input_to_messages(
             request.input,
             consolidate_system_messages=False,

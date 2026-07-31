@@ -236,6 +236,11 @@ def compute_placement_preview(
         head=head,
         workers=workers,
         prefer=prefer,
+        # Same flag the real load paths pass (engine_pool.py) — omitting it
+        # here made the preview report "vlm is not eligible" for a model the
+        # load path would happily text-only-distribute under the opt-in,
+        # breaking the S4 preview==decision invariant on that domain.
+        allow_text_only_distribution=(manager.settings.allow_text_only_distribution),
     )
     return decision.to_dict()
 

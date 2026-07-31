@@ -150,3 +150,82 @@ async def test_zero_side_effects(tmp_path, pool_getter):
             )
         assert manager.state == before
         assert pool_getter.get_entry("model-a").engine is None
+
+
+@pytest.fixture
+def vlm_model_dir(tmp_path):
+    """A 'vlm'-classified checkpoint (carries vision_config) with divisible
+    text_config heads -- the text-only-distribution opt-in domain."""
+    model_dir = tmp_path / "models" / "vlm-a"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_vl",
+                "vision_config": {"depth": 1},
+                "text_config": {
+                    "num_attention_heads": 24,
+                    "num_key_value_heads": 4,
+                },
+            }
+        )
+    )
+    (model_dir / "model.safetensors").write_bytes(b"0" * 1024)
+    return tmp_path / "models"
+
+
+@pytest.fixture
+def vlm_pool_getter(vlm_model_dir):
+    pool = EnginePool()
+    pool._get_final_ceiling = lambda: 10 * 1024**3
+    pool.discover_models(str(vlm_model_dir))
+    set_engine_pool_getter(lambda: pool)
+    try:
+        yield pool
+    finally:
+        set_engine_pool_getter(None)
+
+
+async def test_preview_honors_text_only_opt_in(tmp_path, vlm_pool_getter):
+    """Preview must pass cluster.allow_text_only_distribution to
+    plan_placement like the real load paths do (engine_pool.py). Pre-fix the
+    preview hardcoded the default (False) and reported
+    "model_type='vlm' is not eligible for distributed placement" for a model
+    the load path would text-only-distribute -- breaking the S4
+    preview==decision invariant on the opt-in domain (observed live
+    2026-07-31 against the formed rig)."""
+    settings = make_settings(
+        tmp_path / "h", role="head", allow_text_only_distribution=True
+    )
+    async with running_manager(settings):
+        app = build_app()
+        async with http_client(app) as client:
+            resp = await client.get(
+                PLACEMENT,
+                params={"model": "vlm-a", "prefer": "distributed"},
+                headers=bearer(MAIN_API_KEY),
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert not any(
+                "not eligible" in reason for reason in body.get("reasons", [])
+            ), body
+
+
+async def test_preview_default_off_still_reports_ineligible(tmp_path, vlm_pool_getter):
+    """Polarity guard for the test above: with the opt-in at its default
+    (False) the same preview must still name the vlm ineligibility."""
+    settings = make_settings(tmp_path / "h", role="head")
+    async with running_manager(settings):
+        app = build_app()
+        async with http_client(app) as client:
+            resp = await client.get(
+                PLACEMENT,
+                params={"model": "vlm-a", "prefer": "distributed"},
+                headers=bearer(MAIN_API_KEY),
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert any(
+                "not eligible" in reason for reason in body.get("reasons", [])
+            ), body

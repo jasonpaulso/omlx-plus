@@ -83,6 +83,20 @@ def _reject_if_multimodal(messages: list[dict[str, Any]]) -> None:
                 )
 
 
+def raise_if_multimodal_messages(messages: list[dict[str, Any]]) -> None:
+    """Route-level entry for the S3/S6 multimodal non-goal guard.
+
+    The server's non-VLM message conversion (``extract_text_content``,
+    ``convert_anthropic_to_internal(preserve_images=False)``,
+    ``convert_responses_input_to_messages``) strips image/audio parts BEFORE
+    ``ClusterEngine.preflight_chat`` runs, so the preflight guard alone can
+    never see them — a vision request against a text-only-distributed model
+    would be silently served as text. Routes must call this on the RAW
+    request messages when the resolved engine is a ClusterEngine.
+    """
+    _reject_if_multimodal(messages)
+
+
 def _reject_if_specprefill(kwargs: dict[str, Any]) -> None:
     if kwargs.get("specprefill"):
         raise ClusterNonGoalError(
