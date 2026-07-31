@@ -4,6 +4,7 @@
 import asyncio
 import ipaddress
 import json
+import time
 from dataclasses import replace
 
 import pytest
@@ -29,6 +30,19 @@ def local_versions() -> dict:
 async def admit(manager, *, host="10.0.0.9", port=8000, name="worker-a"):
     return await manager.join(
         peer_host=host, port=port, name=name, versions=local_versions()
+    )
+
+
+def backdate_join(manager, member_id: str, joined_at: float) -> None:
+    """Rewrite a persisted member's ``joined_at`` (the member-age clock)."""
+    manager._persist(
+        replace(
+            manager.state,
+            members=tuple(
+                replace(m, joined_at=joined_at) if m.id == member_id else m
+                for m in manager.state.members
+            ),
+        )
     )
 
 
@@ -304,14 +318,15 @@ class TestSupersedeOnRejoin:
                 await admit(manager, host="10.0.0.10", name="rack-1")
 
             assert exc.value.status_code == 409
-            assert "has been up less than" in exc.value.detail
+            assert "has not reported liveness yet" in exc.value.detail
             assert [m.id for m in manager.state.members] == [first["member_id"]]
 
     async def test_an_unstarted_head_never_supersedes(self, head_settings):
-        """Fail closed: the boot-window clock is 0.0 until start(), and an
-        epoch-zero clock would read as "up forever". join() cannot reach this
-        (the command queue refuses submissions before start()), so this pins
-        the direction rather than a reachable path."""
+        """Fail closed: the head clock is 0.0 until start(), and an epoch-zero
+        clock would read as "up forever". join() cannot reach this (the
+        command queue refuses submissions before start()), so this pins the
+        direction rather than a reachable path. The member's own clock is set
+        well past the window so the head's zero is the only thing refusing."""
         unstarted = ClusterManager(head_settings)
         member = Member(
             id="deadbeefdeadbeef",
@@ -319,19 +334,63 @@ class TestSupersedeOnRejoin:
             port=8000,
             name="rack-1",
             versions=collect_versions(),
-            joined_at=0.0,
+            joined_at=time.time() - 7200.0,
         )
         assert unstarted._supersede_refusal(member) is not None
+
+    async def test_a_member_with_no_joined_at_is_never_superseded(self, tmp_path):
+        """The same fail-closed direction on the other clock: state written
+        without a joined_at loads it as 0.0, and a zero there would read as
+        "joined at the epoch" — old enough to evict. Only reachable through a
+        stale state file, so the head clock is put well past the window to
+        leave joined_at as the sole gate."""
+        settings = make_settings(tmp_path / "head", member_timeout_s=3600.0)
+        async with running_manager(settings) as manager:
+            first = await admit(manager, name="rack-1")
+            backdate_join(manager, first["member_id"], 0.0)
+            manager._head_started_at = time.time() - 7200.0
+
+            with pytest.raises(ClusterError) as exc:
+                await admit(manager, host="10.0.0.10", name="rack-1")
+
+            assert exc.value.status_code == 409
+            assert [m.id for m in manager.state.members] == [first["member_id"]]
+
+    async def test_a_freshly_joined_member_is_refused_on_a_long_up_head(self, tmp_path):
+        """The amended rule's whole point: head uptime is not member age. On a
+        head up far longer than member_timeout_s, a member that joined seconds
+        ago and has not had time to send its first beat must not be evictable
+        by a same-name join under a reusable bootstrap token."""
+        settings = make_settings(tmp_path / "head", member_timeout_s=3600.0)
+        async with running_manager(settings) as manager:
+            first = await admit(manager, name="rack-1")
+            member = manager.state.member(first["member_id"])
+            # Head up 2h, member joined just now, no liveness at all.
+            manager._head_started_at = time.time() - 7200.0
+            assert manager.liveness(member.id) is None
+
+            with pytest.raises(ClusterError) as exc:
+                await admit(manager, host="10.0.0.10", name="rack-1")
+
+            assert exc.value.status_code == 409
+            assert "has not reported liveness yet" in exc.value.detail
+            # The member and its credential are untouched by the refused join.
+            assert [m.id for m in manager.state.members] == [first["member_id"]]
+            assert verify_secret(
+                first["member_secret"], manager.state.member_digests[member.id]
+            )
 
     async def test_liveness_less_member_past_the_boot_window_is_superseded(
         self, tmp_path
     ):
-        """The identical join, once the head has been up longer than
-        member_timeout_s: a member that has had time to beat and did not is
-        genuinely gone."""
+        """The identical join, once BOTH clocks are past member_timeout_s: a
+        member that has had time to beat and did not is genuinely gone. The
+        sleep carries the head clock; joined_at is backdated so the member's
+        own age is past the window by a margin rather than by a hair."""
         settings = make_settings(tmp_path / "head", member_timeout_s=0.05)
         async with running_manager(settings) as manager:
             first = await admit(manager, name="rack-1")
+            backdate_join(manager, first["member_id"], time.time() - 7200.0)
             await asyncio.sleep(0.1)
 
             second = await admit(manager, host="10.0.0.10", name="rack-1")
@@ -400,6 +459,32 @@ class TestLostMemberExpiry:
             assert manager.state.member_digests == {}
             assert manager.liveness(member.id) is None
             assert load_state(cluster_state_path(settings.base_path)).members == ()
+
+    async def test_a_non_positive_ttl_expires_nothing(self, tmp_path):
+        """``ClusterSettings`` is a plain mutable dataclass, so a zero can be
+        written straight onto the instance. It must disable expiry, not read
+        as "every lost member is past the TTL" — this member is lost with an
+        ancient lost_since, so any positive TTL would prune it."""
+        settings = self.expiry_settings(tmp_path, lost_member_ttl_s=0.0)
+        async with running_manager(settings) as manager:
+            joined = await admit(manager, name="rack-1")
+            member = manager.state.member(joined["member_id"])
+            manager._liveness[member.id] = MemberLiveness(
+                epoch="e1", last_seq=1, last_heartbeat_at=0.0, status="lost"
+            )
+            manager._lost_since[member.id] = time.time() - 86400.0
+
+            await manager.scrub()
+
+            assert manager.state.member(member.id) is not None
+            assert verify_secret(
+                joined["member_secret"], manager.state.member_digests[member.id]
+            )
+            # The zero is what spared it, not an unrelated skip: the identical
+            # state prunes on the next sweep once the TTL is positive.
+            manager.settings.lost_member_ttl_s = 3600.0
+            await manager.scrub()
+            assert manager.state.member(member.id) is None
 
     async def test_an_active_member_is_never_expired(self, tmp_path):
         settings = self.expiry_settings(tmp_path, member_timeout_s=3600.0)

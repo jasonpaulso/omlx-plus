@@ -985,11 +985,15 @@ class ClusterManager:
     def _supersede_refusal(self, member: Member) -> str | None:
         """Why ``member`` may not be superseded by a same-name rejoin, or None.
 
-        D3-sec condition (iii): a ``lost`` member may be replaced, and a
-        member with no liveness at all only once the head has been up longer
-        than ``member_timeout_s``. Right after a head restart EVERY persisted
-        member is liveness-less, so without that boot window a bootstrap-token
-        bearer could evict a live member during it.
+        D3-sec condition (iii), as amended: a ``lost`` member may be
+        replaced, and a member with no liveness at all only once BOTH clocks
+        are past ``member_timeout_s`` -- the head's uptime and the member's
+        own age. Right after a head restart EVERY persisted member is
+        liveness-less, so without the head clock a bootstrap-token bearer
+        could evict a live member during the boot window; but the property
+        being defended is that the member has had time to beat and did not,
+        and a member that joined seconds ago has not, however long the head
+        has been up. Hence ``now - max(head start, joined_at)``.
 
         The two branches also give the plan's "ANY same-name member inside
         the boot window is refused" for free: liveness only becomes ``lost``
@@ -1011,17 +1015,25 @@ class ClusterManager:
                 f"it is active (a member becomes replaceable after {timeout:g}s "
                 "of silence)"
             )
-        # `_head_started_at` is 0.0 until `start()` sets it, and an epoch-zero
-        # clock would read as "up forever" — the one direction this gate must
-        # never fail in. `join` is unreachable before `start()` anyway (the
-        # command queue refuses submissions until then), so this only pins
-        # the direction.
+        # Both clocks fail closed when unset. `_head_started_at` is 0.0 until
+        # `start()` sets it, and `Member.joined_at` loads as 0.0 when a
+        # persisted entry omits it (`state.py`) — an epoch-zero clock would
+        # read as "up forever", the one direction this gate must never fail
+        # in. Neither zero is reachable through `join` (the command queue
+        # refuses submissions before `start()`, and every minted member
+        # stamps `joined_at`), so this pins the direction against stale
+        # state files rather than a live path.
         started_at = self._head_started_at
-        if started_at > 0.0 and time.time() - started_at > timeout:
+        joined_at = member.joined_at
+        if (
+            started_at > 0.0
+            and joined_at > 0.0
+            and time.time() - max(started_at, joined_at) > timeout
+        ):
             return None
         return (
-            f"the head has been up less than {timeout:g}s and this member has "
-            "not reported liveness yet"
+            f"it has not reported liveness yet and less than {timeout:g}s have "
+            "passed since the head started or since it joined"
         )
 
     async def remove_member(self, member_id: str) -> dict[str, Any]:
