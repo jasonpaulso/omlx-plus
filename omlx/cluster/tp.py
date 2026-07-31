@@ -215,6 +215,53 @@ def missing_weight_files(model_dir: Any) -> list[str]:
     return []
 
 
+# S6 P1c/D0: the `self.<name> = ...` vision-submodule attributes actually
+# used across mlx_vlm's installed model architectures (grepped from the
+# dependency this fork loads through, not guessed) -- `vision_tower`/
+# `vision_model` cover the large majority (Qwen's family among them, which
+# is what the `language_model_only` eligibility flag exists for);
+# `vision_encoder`/`visual`/`vision` cover the rest.
+VISION_WEIGHT_PREFIXES = (
+    "vision_tower.",
+    "vision_model.",
+    "vision_encoder.",
+    "visual.",
+    "vision.",
+)
+
+
+def has_vision_tower_weights(model_dir: Any) -> bool:
+    """Does this model dir's own weight index actually SHIP vision-tower
+    parameters, regardless of what its config declares?
+
+    S6 D0's `language_model_only: true` eligibility flag claims the vision
+    tower was stripped before distribution; this is the cross-check that
+    catches a MISLABELED checkpoint (flag true, weights say otherwise) --
+    something `plan_placement` alone (pure, config-only) cannot see.
+    Existence/name check only, mirroring :func:`missing_weight_files`'s
+    shape exactly: reads the safetensors index's ``weight_map`` KEYS (the
+    parameter names, never the shard filenames) and never loads a weight.
+    False (not eligible-by-omission) when there is no index to check --
+    the loader's own missing-file guard is what surfaces that case.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    root = _Path(model_dir)
+    index = root / "model.safetensors.index.json"
+    if not index.is_file():
+        return False
+    try:
+        weight_map = _json.loads(index.read_text()).get("weight_map", {})
+    except (OSError, ValueError):
+        return False
+    return any(
+        name.startswith(prefix)
+        for name in weight_map
+        for prefix in VISION_WEIGHT_PREFIXES
+    )
+
+
 def shard_and_load(model_path: str, group: Any) -> ShardResult:
     """Load only this rank's tensor-parallel slice of ``model_path``.
 

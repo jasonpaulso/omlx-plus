@@ -272,6 +272,177 @@ class TestLanguageModelOnlyEligibility:
             assert decision.mode == "local"
 
 
+class TestD0EvidenceCrossCheck:
+    """S6 P1c item 5 (P2-exec catch): a MISLABELED checkpoint -- declares
+    `language_model_only: true` while its own weight index still ships a
+    vision tower -- must not be silently trusted on the DECLARED boolean
+    alone. `resolve_placement_inputs` folds the real evidence
+    (`has_vision_tower_weights`) into the config it returns; `plan_placement`
+    reads that evidence, never a file itself (it stays pure).
+    """
+
+    TEXT_CONFIG = {"num_attention_heads": 24, "num_key_value_heads": 4}
+
+    def test_declared_true_no_vision_weights_present_is_eligible(self):
+        config = {
+            "language_model_only": True,
+            "text_config": self.TEXT_CONFIG,
+            "_language_model_only_vision_weights_present": False,
+        }
+        decision = _plan(est_size=150, model_type="vlm", model_config=config)
+        assert decision.mode == "distributed"
+
+    def test_declared_true_vision_weights_present_is_refused_by_default(self):
+        config = {
+            "language_model_only": True,
+            "text_config": self.TEXT_CONFIG,
+            "_language_model_only_vision_weights_present": True,
+        }
+        decision = _plan(est_size=150, model_type="vlm", model_config=config)
+        assert decision.mode == "local"
+        assert any("vision-tower parameters" in r for r in decision.reasons)
+
+    def test_declared_true_vision_weights_present_rejects_under_distributed(self):
+        config = {
+            "language_model_only": True,
+            "text_config": self.TEXT_CONFIG,
+            "_language_model_only_vision_weights_present": True,
+        }
+        decision = _plan(
+            est_size=150, model_type="vlm", model_config=config, prefer="distributed"
+        )
+        assert decision.mode == "reject"
+
+    def test_declared_false_is_unchanged(self):
+        # No cross-check evidence key at all is consulted when the flag
+        # itself is false -- exactly today's plain-vlm-refused behaviour.
+        config = {
+            "language_model_only": False,
+            "vision_config": {"some": "tower"},
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+        }
+        decision = _plan(est_size=150, model_type="vlm", model_config=config)
+        assert decision.mode == "local"
+        assert any("not eligible" in r for r in decision.reasons)
+
+    def test_resolve_placement_inputs_folds_in_the_real_evidence(self, tmp_path):
+        """The actual I/O boundary, not a hand-built config dict: a
+        `language_model_only: true` config.json paired with a real
+        vision-tower-carrying safetensors index must come back MISLABELED,
+        and `plan_placement` must refuse it on the default path."""
+        config = {"language_model_only": True, "text_config": self.TEXT_CONFIG}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"0" * 500)
+        (tmp_path / "model-00002-of-00002.safetensors").write_bytes(b"0" * 500)
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "language_model.layers.0.weight": (
+                            "model-00001-of-00002.safetensors"
+                        ),
+                        "vision_tower.blocks.0.weight": (
+                            "model-00002-of-00002.safetensors"
+                        ),
+                    }
+                }
+            )
+        )
+
+        _est, read_config = resolve_placement_inputs(str(tmp_path))
+
+        assert read_config is not None
+        assert read_config["_language_model_only_vision_weights_present"] is True
+        decision = _plan(est_size=150, model_type="vlm", model_config=read_config)
+        assert decision.mode == "local"
+        assert any("vision-tower parameters" in r for r in decision.reasons)
+
+    def test_resolve_placement_inputs_leaves_declared_false_configs_untouched(
+        self, tmp_path
+    ):
+        config = {"model_type": "qwen3", "num_attention_heads": 8}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "model.safetensors").write_bytes(b"0" * 1000)
+
+        _est, read_config = resolve_placement_inputs(str(tmp_path))
+
+        assert read_config == config  # byte for byte -- no evidence key added
+
+
+class TestTextOnlyDistributionOptIn:
+    """S6 P1c item 6 (Qwen-anchor fork, user-decided 2026-07-30):
+    `allow_text_only_distribution=True` -- eligibility for a "vlm"-classified
+    model no longer hinges on `language_model_only` at all. Default (False,
+    the value every OTHER test in this module implicitly exercises via
+    `_plan`'s default) is byte-for-byte item 5's behaviour.
+    """
+
+    def test_off_by_default_leaves_a_plain_vlm_refused(self):
+        config = {"num_attention_heads": 24, "num_key_value_heads": 4}
+        decision = _plan(est_size=150, model_type="vlm", model_config=config)
+        assert decision.mode == "local"
+
+    def test_on_makes_a_plain_vlm_eligible(self):
+        # The real Qwen3.6-27B-bf16 shape: `language_model_only: FALSE`,
+        # genuinely multimodal, divisible via text_config.
+        config = {
+            "language_model_only": False,
+            "vision_config": {"some": "tower"},
+            "text_config": {"num_attention_heads": 24, "num_key_value_heads": 4},
+        }
+        decision = _plan(
+            est_size=150,
+            model_type="vlm",
+            model_config=config,
+            allow_text_only_distribution=True,
+        )
+        assert decision.mode == "distributed"
+
+    def test_on_still_enforces_divisibility_via_text_config(self):
+        config = {
+            "language_model_only": False,
+            "vision_config": {"some": "tower"},
+            "text_config": {"num_attention_heads": 7},
+        }
+        decision = _plan(
+            est_size=150,
+            model_type="vlm",
+            model_config=config,
+            allow_text_only_distribution=True,
+            prefer="distributed",
+        )
+        assert decision.mode == "reject"
+        assert any("not divisible" in r for r in decision.reasons)
+
+    def test_on_leaves_llm_eligibility_untouched(self):
+        decision = _plan(
+            est_size=150, model_type="llm", allow_text_only_distribution=True
+        )
+        assert decision.mode == "distributed"
+
+    def test_on_does_not_make_non_vlm_non_llm_types_eligible(self):
+        config = {"num_attention_heads": 24, "num_key_value_heads": 4}
+        decision = _plan(
+            est_size=150,
+            model_type="embedding",
+            model_config=config,
+            allow_text_only_distribution=True,
+        )
+        assert decision.mode == "local"
+
+    def test_single_node_prefer_local_is_untouched_by_the_opt_in(self):
+        config = {"vision_config": {"some": "tower"}}
+        decision = _plan(
+            est_size=1000,
+            model_type="vlm",
+            model_config=config,
+            prefer="local",
+            allow_text_only_distribution=True,
+        )
+        assert decision.mode == "local"
+
+
 class TestDecisionRoundTrip:
     def test_to_dict_from_dict_round_trips(self):
         decision = _plan(est_size=150)

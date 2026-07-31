@@ -15,6 +15,7 @@ from omlx.cluster.rank_worker import _tax_summary
 from omlx.cluster.tp import (
     TPDivisibilityError,
     check_divisibility,
+    has_vision_tower_weights,
     missing_weight_files,
     supports_tensor_parallel,
     tensor_parallel_architectures,
@@ -169,3 +170,68 @@ def test_missing_weight_files_config_only_dir_is_incomplete(tmp_path):
 def test_missing_weight_files_unreadable_index_defers_to_loader(tmp_path):
     (tmp_path / "model.safetensors.index.json").write_text("{not json")
     assert missing_weight_files(tmp_path) == []
+
+
+# -- S6 P1c/D0 evidence cross-check: vision-tower weights in the model's own
+# -- index (existence/name check only, never a weight load) -----------------
+
+
+def test_has_vision_tower_weights_true_for_the_real_prefix(tmp_path):
+    # The real anchor checkpoint's (mlx-community/Qwen3.6-27B-bf16) actual
+    # on-disk safetensors index -- confirmed by reading it directly, not
+    # guessed: top-level `vision_tower.*` alongside `language_model.*`.
+    _write_index(
+        tmp_path,
+        {
+            "language_model.layers.0.weight": "model-00001-of-00002.safetensors",
+            "vision_tower.blocks.0.attn.qkv.weight": (
+                "model-00002-of-00002.safetensors"
+            ),
+        },
+    )
+    assert has_vision_tower_weights(tmp_path) is True
+
+
+def test_has_vision_tower_weights_false_for_a_text_only_index(tmp_path):
+    _write_index(
+        tmp_path,
+        {
+            "language_model.layers.0.weight": "model-00001-of-00001.safetensors",
+            "language_model.norm.weight": "model-00001-of-00001.safetensors",
+        },
+    )
+    assert has_vision_tower_weights(tmp_path) is False
+
+
+def test_has_vision_tower_weights_checks_weight_map_keys_not_values(tmp_path):
+    # A shard FILENAME that happens to contain "vision" must not trip this --
+    # only the parameter NAMES (weight_map keys) count.
+    _write_index(
+        tmp_path,
+        {"language_model.layers.0.weight": "vision-shard-00001.safetensors"},
+    )
+    assert has_vision_tower_weights(tmp_path) is False
+
+
+def test_has_vision_tower_weights_no_index_is_false(tmp_path):
+    assert has_vision_tower_weights(tmp_path) is False
+
+
+def test_has_vision_tower_weights_unreadable_index_is_false(tmp_path):
+    (tmp_path / "model.safetensors.index.json").write_text("{not json")
+    assert has_vision_tower_weights(tmp_path) is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "vision_tower.blocks.0.weight",
+        "vision_model.encoder.layer.0.weight",
+        "vision_encoder.blocks.0.weight",
+        "visual.blocks.0.weight",
+        "vision.blocks.0.weight",
+    ],
+)
+def test_has_vision_tower_weights_covers_every_derived_prefix(tmp_path, name):
+    _write_index(tmp_path, {name: "model-00001-of-00001.safetensors"})
+    assert has_vision_tower_weights(tmp_path) is True

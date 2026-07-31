@@ -24,7 +24,7 @@ from typing import Any, Literal
 
 from ..model_discovery import estimate_model_size
 from .state import MemberNodeState
-from .tp import TPDivisibilityError, check_divisibility
+from .tp import TPDivisibilityError, check_divisibility, has_vision_tower_weights
 
 PlacementMode = Literal["local", "distributed", "reject"]
 Prefer = Literal["auto", "local", "distributed"]
@@ -34,6 +34,12 @@ Prefer = Literal["auto", "local", "distributed"]
 # this predicate a too-big VLM would form a resident formation that can
 # serve nothing.
 _ELIGIBLE_MODEL_TYPES = frozenset({"llm"})
+
+# S6 P1c/D0: a synthetic key `resolve_placement_inputs` (the I/O boundary)
+# folds into the returned config when `language_model_only` is declared --
+# the REAL cross-checked evidence `plan_placement` (pure) reads instead of
+# trusting the declared boolean alone. Never present in a raw config.json.
+_VISION_WEIGHTS_PRESENT_KEY = "_language_model_only_vision_weights_present"
 
 # S2-measured 0.538x params/rank for dense bf16; MoE-3-bit measured only
 # operationally. Deliberately conservative, revisited only with a
@@ -165,6 +171,47 @@ def _local_fit(head: NodeCapacity, est_size: int) -> dict[str, NodeFit]:
     }
 
 
+def _distributed_eligibility(
+    model_type: str,
+    model_config: dict[str, Any] | None,
+    *,
+    allow_text_only_distribution: bool,
+) -> tuple[bool, bool]:
+    """S6 D0 (+ P1c items 5/6): ``(eligible, mislabeled)``. Pure.
+
+    A `language_model_only: true` checkpoint (vision tower shipped off) is
+    text-eligible for distributed placement even though discovery classifies
+    it "vlm" (it still carries a vision_config) -- PLACEMENT layer only;
+    model_discovery's classification and single-node serving are untouched.
+
+    ``mislabeled``: the config claims ``language_model_only`` but
+    :func:`resolve_placement_inputs` (the I/O boundary) found real
+    vision-tower weights in the checkpoint's own index anyway -- surfaced
+    separately so a REJECT decision can name the real reason.
+
+    ``allow_text_only_distribution`` (S6 item 6, the Qwen opt-in, default
+    OFF elsewhere): ON, eligibility for a "vlm"-classified model no longer
+    hinges on the declared boolean at all -- ANY such checkpoint may
+    distribute text-only. Divisibility is still enforced separately
+    (`check_divisibility`'s existing `text_config` fallback); the caller
+    that turns this decision into an actually-served model is responsible
+    for refusing image-bearing requests against it (never a silent
+    single-node fallback for images).
+    """
+    if model_type in _ELIGIBLE_MODEL_TYPES:
+        return True, False
+    if model_type != "vlm":
+        return False, False
+    declared_text_only = bool(model_config and model_config.get("language_model_only"))
+    vision_weights_present = bool(
+        model_config and model_config.get(_VISION_WEIGHTS_PRESENT_KEY)
+    )
+    mislabeled = declared_text_only and vision_weights_present
+    if allow_text_only_distribution:
+        return True, mislabeled
+    return declared_text_only and not mislabeled, mislabeled
+
+
 def plan_placement(
     model_id: str,
     model_type: str,
@@ -173,6 +220,8 @@ def plan_placement(
     head: NodeCapacity,
     workers: list[NodeCapacity],
     prefer: Prefer,
+    *,
+    allow_text_only_distribution: bool = False,
 ) -> PlacementDecision:
     """Decide local vs distributed vs reject for one model. Pure, no I/O.
 
@@ -195,14 +244,10 @@ def plan_placement(
     presence = {
         node.node_id: model_id in node.models_present for node in [head, *workers]
     }
-    # S6 D0: a `language_model_only: true` checkpoint (vision tower shipped
-    # off) is text-eligible for distributed placement even though discovery
-    # classifies it "vlm" (it still carries a vision_config) -- PLACEMENT
-    # layer only; model_discovery's classification and single-node serving
-    # are untouched. A plain vlm config (no language_model_only) stays
-    # refused.
-    eligible = model_type in _ELIGIBLE_MODEL_TYPES or bool(
-        model_config and model_config.get("language_model_only")
+    eligible, mislabeled = _distributed_eligibility(
+        model_type,
+        model_config,
+        allow_text_only_distribution=allow_text_only_distribution,
     )
 
     def local_decision(reasons: list[str]) -> PlacementDecision:
@@ -222,7 +267,20 @@ def plan_placement(
         return local_decision([])
 
     if not eligible:
-        reason = f"model_type={model_type!r} is not eligible for distributed placement"
+        if mislabeled:
+            reason = (
+                f"model {model_id!r} declares language_model_only=true but its "
+                "own weight index carries vision-tower parameters; refusing "
+                "distribution on the default path (a mislabeled checkpoint "
+                "would otherwise silently drop served vision capability) -- "
+                "see cluster.allow_text_only_distribution for the explicit "
+                "opt-in"
+            )
+        else:
+            reason = (
+                f"model_type={model_type!r} is not eligible for distributed "
+                "placement"
+            )
         if prefer == "distributed":
             return PlacementDecision(
                 mode="reject",
@@ -352,6 +410,15 @@ def resolve_placement_inputs(model_path: str) -> tuple[int, dict[str, Any] | Non
     :func:`~omlx.cluster.tp.check_divisibility` needs — cheap, no model
     instantiation. A missing/unreadable config returns ``None`` rather than
     raising; the caller then sees ``divisible=False`` with a clear reason.
+
+    S6 P1c/D0 evidence cross-check: when the config declares
+    ``language_model_only``, this also inspects the model's own
+    safetensors index (existence/name check only, never loads a weight —
+    :func:`~omlx.cluster.tp.has_vision_tower_weights`) and folds the result
+    into the returned config under ``_VISION_WEIGHTS_PRESENT_KEY`` so
+    :func:`plan_placement` (pure) never has to trust the declared boolean
+    alone. Skipped entirely when the flag is absent/false — declared-false
+    configs are unaffected, byte for byte.
     """
     path = Path(model_path)
     est_size = estimate_model_size(path)
@@ -361,6 +428,11 @@ def resolve_placement_inputs(model_path: str) -> tuple[int, dict[str, Any] | Non
             config = json.load(f)
     except (OSError, ValueError):
         config = None
+    if config is not None and config.get("language_model_only"):
+        config = {
+            **config,
+            _VISION_WEIGHTS_PRESENT_KEY: has_vision_tower_weights(path),
+        }
     return est_size, config
 
 

@@ -263,6 +263,51 @@ class TestBackoff:
         finally:
             await beat.stop()
 
+    async def test_loop_drives_the_real_retry_sleep_through_backoff_and_reset(
+        self, monkeypatch
+    ):
+        """S6 P1c/R2: the arithmetic-only tests above (`_next_delay()` called
+        directly) cannot catch a call-site unwiring -- a narrow revert that
+        keeps `_next_delay()` correct but sleeps something ELSE at the
+        actual retry call site (`_loop`'s ``await asyncio.sleep(...)``)
+        stays green against them. This drives the REAL loop through four
+        failures then a success and asserts the delays it ACTUALLY
+        requested: 5, 10, 20, 20, then reset to 5 (negotiated interval 5s).
+        """
+        delays: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(seconds: float) -> None:
+            delays.append(seconds)
+            await real_sleep(0)  # yield control -- a real checkpoint
+
+        monkeypatch.setattr("omlx.cluster.heartbeat.asyncio.sleep", fake_sleep)
+
+        call_count = {"n": 0}
+
+        def scripted_reply(payload):
+            call_count["n"] += 1
+            if call_count["n"] <= 4:
+                raise ClusterClientError("down")
+            return {"status": "active"}
+
+        client = FakeClusterClient(
+            "http://10.0.0.1:8000", {"/v1/cluster/heartbeat": scripted_reply}
+        )
+        beat = HeartbeatSender(
+            IDENTITY, interval_s=5.0, client_factory=lambda url: client
+        )
+        await beat.start()
+        try:
+            deadline = asyncio.get_event_loop().time() + 2.0
+            while len(delays) < 5 and asyncio.get_event_loop().time() < deadline:
+                await real_sleep(0.001)
+        finally:
+            await beat.stop()
+
+        assert len(delays) >= 5, f"the loop never reached 5 sleeps: {delays}"
+        assert delays[:5] == [5.0, 10.0, 20.0, 20.0, 5.0]
+
     @pytest.mark.parametrize("interval", [0.5, 1.0, 5.0, 5.01, 10.0, 30.0, 100.0])
     def test_the_cap_never_exceeds_the_real_command_timeout(self, interval):
         """rev4's provable invariant: `4i < max(30, 6i)` for any interval --

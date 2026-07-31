@@ -85,6 +85,10 @@ MAX_HEARTBEAT_INTERVAL_S = 3600.0
 # CL2-10: an upper bound on a head-commanded world size — each rank loads a
 # multi-GB shard, so an unbounded world is machine-level exhaustion.
 MAX_WORLD_SIZE = 64
+# S6 P1c/R1: bounds the ranks heartbeat field's formation-identity string --
+# job ids are `secrets.token_hex(6)` (12 chars); generous margin, not a real
+# limit on job id shape.
+MAX_RANKS_JOB_ID_LENGTH = 128
 
 _cluster_manager: ClusterManager | None = None
 
@@ -210,6 +214,11 @@ class WorkerCommandExecutor:
         self._job_order: OrderedDict[str, None] = OrderedDict()  # CL5-05 LRU
         self._updates: list[dict[str, Any]] = []
         self._cluster: Any = None
+        # S6 P1c/R1: the job that spawned `self._cluster` -- rides every
+        # ranks heartbeat so the head can tell a stale (already
+        # killed/torn-down) formation's report apart from a report about
+        # whichever formation is actually current.
+        self._cluster_job_id: str | None = None
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
         if transfer_executor is None:
@@ -318,13 +327,30 @@ class WorkerCommandExecutor:
         notices a dead rank in seconds (`launcher.py`'s `DeathWatch`); this
         is what carries that fact to the head, which otherwise learns
         nothing until its own rank 0 idle-times out.
+
+        S6 P1c/R1: the payload names the formation it is ABOUT (`job_id`) so
+        the head can ignore a report about a formation it has already moved
+        past. And once every local rank is dead there is nothing left this
+        formation could ever report again -- the reference is dropped right
+        here (self-clearing, not inside `LocalCluster.kill()`: the
+        deathwatch's poll can fire well inside one heartbeat interval, so
+        clearing there risks the death being killed off before the ONE
+        heartbeat that must carry it ever reads `.ranks`). This is what
+        closes "SWEEP/kill never clears" for the steady-state path; the
+        pre-spawn SWEEP dispatch below closes the mid-`_load` race.
         """
         cluster = self._cluster
         if cluster is None:
             return None
         alive = [rank.rank for rank in cluster.ranks if rank.alive]
         dead = [rank.rank for rank in cluster.ranks if not rank.alive]
-        return {"alive": alive, "dead": dead}
+        payload: dict[str, Any] = {"alive": alive, "dead": dead}
+        if self._cluster_job_id is not None:
+            payload["job_id"] = self._cluster_job_id
+        if dead and not alive:
+            self._cluster = None
+            self._cluster_job_id = None
+        return payload
 
     def _channel_for_raw(self, raw: dict[str, Any]) -> str:
         kind = raw.get("kind")
@@ -397,6 +423,14 @@ class WorkerCommandExecutor:
         if isinstance(command, SweepCommand):
             from .launcher import sweep_orphaned_ranks
 
+            # S6 P1c/R1: SWEEP is always issued right before a fresh SPAWN
+            # (`FormationManager._load` step 2); a dead, no-longer-useful
+            # formation's reference is dropped here so it cannot keep
+            # bleeding its job id/dead ranks into heartbeats sent after the
+            # NEW formation starts spawning.
+            if self._cluster is not None and not self._cluster.any_alive():
+                self._cluster = None
+                self._cluster_job_id = None
             killed = sweep_orphaned_ranks()
             return make_job_update(
                 command.job_id, command.step, status="swept", killed=killed
@@ -438,6 +472,7 @@ class WorkerCommandExecutor:
         loop = asyncio.get_running_loop()
         cluster = await loop.run_in_executor(None, spawn, prepared)
         self._cluster = cluster
+        self._cluster_job_id = command.job_id
         return make_job_update(
             command.job_id,
             command.step,
@@ -579,6 +614,7 @@ class WorkerCommandExecutor:
 
     async def _teardown_local(self) -> None:
         cluster, self._cluster = self._cluster, None
+        self._cluster_job_id = None
         if cluster is None:
             return
         await asyncio.get_running_loop().run_in_executor(None, cluster.stop)
@@ -1135,15 +1171,21 @@ class ClusterManager:
                     member.id,
                 )
             else:
-                _alive, dead = parsed_ranks
+                _alive, dead, ranks_job_id = parsed_ranks
                 # S6 D1: react immediately and directly (never through the
                 # E6 queue) -- a formation blocked inside `wait_ready` holds
                 # the queue across the await, so a queued reaction here would
                 # deadlock (rev3/B1). `handle_dead_rank` itself decides
                 # in-progress (direct kill) vs serving (queued teardown).
+                # S6 P1c/R1: the report carries the formation it is ABOUT, so
+                # a report about a formation the head already moved past
+                # (killed, torn down, superseded by a freshly re-issued one)
+                # cannot reach into and abort the CURRENT formation.
                 if dead and self._formation is not None:
                     self._formation.handle_dead_rank(
-                        member.id, f"worker reported dead rank(s) {dead}"
+                        member.id,
+                        f"worker reported dead rank(s) {dead}",
+                        job_id=ranks_job_id,
                     )
 
         if job_updates and self._formation is not None:
@@ -1651,7 +1693,7 @@ def _bound_transfer_updates(
     return raw
 
 
-def _parse_ranks_status(raw: Any) -> tuple[list[int], list[int]] | None:
+def _parse_ranks_status(raw: Any) -> tuple[list[int], list[int], str | None] | None:
     """S6 D1: parse a worker's bounded ``ranks`` heartbeat field.
 
     Leniently rejects (returns ``None`` for the whole field) anything
@@ -1659,6 +1701,12 @@ def _parse_ranks_status(raw: Any) -> tuple[list[int], list[int]] | None:
     whole-batch rejection posture rather than partially trusting a shape it
     cannot bound. World size is already capped at ``MAX_WORLD_SIZE``, so
     that is this field's bound too.
+
+    S6 P1c/R1: the optional ``job_id`` is the formation the report is ABOUT
+    (``WorkerCommandExecutor.ranks_status``'s formation-scoping) -- a
+    missing/malformed value parses to ``None`` (permissive: an older worker
+    or a report with no identity is not itself malformed) rather than
+    rejecting the whole payload.
     """
     if not isinstance(raw, dict):
         return None
@@ -1673,7 +1721,13 @@ def _parse_ranks_status(raw: Any) -> tuple[list[int], list[int]] | None:
         dead = [int(x) for x in dead_raw]
     except (TypeError, ValueError):
         return None
-    return alive, dead
+    job_id_raw = raw.get("job_id")
+    job_id = (
+        job_id_raw
+        if isinstance(job_id_raw, str) and len(job_id_raw) <= MAX_RANKS_JOB_ID_LENGTH
+        else None
+    )
+    return alive, dead, job_id
 
 
 # S5 P2: a status-surface summary of one TransferJob. Deliberately drops the

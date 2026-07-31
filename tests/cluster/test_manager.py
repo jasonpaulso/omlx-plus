@@ -623,10 +623,12 @@ class _FakeFormationForRanks:
     calls `stop()` -- a bare `handle_dead_rank`-only stub breaks both."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, str | None]] = []
 
-    def handle_dead_rank(self, member_id: str, reason: str) -> None:
-        self.calls.append((member_id, reason))
+    def handle_dead_rank(
+        self, member_id: str, reason: str, *, job_id: str | None = None
+    ) -> None:
+        self.calls.append((member_id, reason, job_id))
 
     def commands_for(self, member_id: str) -> list:
         return []
@@ -669,6 +671,44 @@ class TestRanksStatus:
             assert len(fake_formation.calls) == 1
             assert fake_formation.calls[0][0] == member.id
             assert "1" in fake_formation.calls[0][1]
+
+    async def test_dead_rank_report_carries_the_reporting_jobs_id(self, head_settings):
+        """S6 P1c/R1: the ranks payload's `job_id` (the formation-scoping
+        evidence) must reach `handle_dead_rank`, not be dropped on the way."""
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+            fake_formation = _FakeFormationForRanks()
+            manager._formation = fake_formation
+
+            manager.record_heartbeat(
+                member,
+                seq=1,
+                epoch="e1",
+                ranks={"alive": [], "dead": [1], "job_id": "job-abc"},
+            )
+
+            assert len(fake_formation.calls) == 1
+            assert fake_formation.calls[0][2] == "job-abc"
+
+    async def test_dead_rank_report_with_no_job_id_passes_none_through(
+        self, head_settings
+    ):
+        """No `job_id` in the payload (an older worker, or a malformed/
+        absent value) parses to `None` rather than rejecting the report --
+        `FormationManager.handle_dead_rank` treats `None` as unscoped."""
+        async with running_manager(head_settings) as manager:
+            joined = await admit(manager)
+            member = manager.state.member(joined["member_id"])
+            fake_formation = _FakeFormationForRanks()
+            manager._formation = fake_formation
+
+            manager.record_heartbeat(
+                member, seq=1, epoch="e1", ranks={"alive": [], "dead": [1]}
+            )
+
+            assert len(fake_formation.calls) == 1
+            assert fake_formation.calls[0][2] is None
 
     async def test_malformed_ranks_is_dropped_but_liveness_still_records(
         self, head_settings

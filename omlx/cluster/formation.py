@@ -17,6 +17,7 @@ the documented, detectable residual of on-path teardown suppression.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 import time
@@ -125,6 +126,13 @@ class FormationManager:
         # `_degrade_and_teardown` marks "degraded", distinct from the fresh
         # job `_unload` creates for the teardown itself.
         self._active_job: FormationJob | None = None
+        # S6 P1c/R1: the job id `handle_dead_rank` compares an incoming
+        # report against -- set when a load attempt starts spawning
+        # (`_form_once`) and cleared in `_abort_formation`. Formation-scoped
+        # so a report about a formation this head has already moved past
+        # (killed, torn down, superseded by a fresh load) cannot reach the
+        # CURRENT one.
+        self._current_job_id: str | None = None
         # S6 D1: model ids currently being auto-torn-down after a dead-rank
         # signal -- a heartbeat report and an engine EOF can both fire for
         # the same model; this makes the teardown idempotent.
@@ -196,7 +204,9 @@ class FormationManager:
 
     # ---- S6 D1: rank-death propagation + degrade -------------------------
 
-    def handle_dead_rank(self, member_id: str, reason: str) -> None:
+    def handle_dead_rank(
+        self, member_id: str, reason: str, *, job_id: str | None = None
+    ) -> None:
         """Synchronous, direct reaction to a dead-rank signal (rev2/D1).
 
         Called from the heartbeat handler (`ClusterManager.record_heartbeat`,
@@ -214,7 +224,25 @@ class FormationManager:
         * SERVING (`_active_model` set): torn down through the EXISTING S4
           unload driver (`EnginePool.request_unload`), scheduled as a
           background task since this method cannot await it.
+
+        S6 P1c/R1: ``job_id`` (from the worker's ranks heartbeat field) names
+        the formation the report is ABOUT. A report naming a job that is not
+        `_current_job_id` is about a formation this head has already moved
+        past (killed, torn down, superseded by a freshly re-issued one) and
+        must never reach into and abort whatever is current instead --
+        exactly the "stale report kills a fresh formation" failure this
+        closes. A report with no job id (older worker, or a caller that
+        doesn't track one -- e.g. direct engine-EOF callers) stays
+        unscoped/permissive, matching pre-R1 behaviour.
         """
+        if job_id is not None and job_id != self._current_job_id:
+            logger.debug(
+                "cluster: ignoring dead-rank report for stale formation job "
+                "%s (current=%s)",
+                job_id,
+                self._current_job_id,
+            )
+            return
         if self._local is not None and self._active_model is None:
             logger.error(
                 "cluster: FORMATION ALARM: dead rank reported by %s (%s) while "
@@ -256,6 +284,20 @@ class FormationManager:
         accounting restore are `EnginePool`'s machinery, not reimplemented
         here. Idempotent: a heartbeat dead-rank report and an engine EOF can
         both fire for the same SERVING model; the second is a no-op.
+
+        S6 P1c (P1a residual): if the pool is unavailable, or its
+        `request_unload` itself raises, the pool-side rollback never ran --
+        left alone, this manager's OWN bookkeeping (`_active_model`,
+        `_engines[model_id]`) would still say the model is servable over
+        ranks that are already gone. Either case is loud (a real alarm, not
+        a bare log line) and forces this formation's LOCAL state out of
+        service directly -- dropping the engine and running
+        `_abort_formation` ourselves, bypassing the E6 operation gate on
+        purpose: that gate serialises the POOL's own formation/transfer
+        ops, and by the time we are here the pool's path already either
+        never started or already unwound its own gate hold; this is just
+        discarding this manager's in-memory references to a formation that
+        is, factually, already dead.
         """
         if model_id in self._degrading:
             return
@@ -269,21 +311,26 @@ class FormationManager:
                 f"formation for {model_id!r} degraded ({reason}); tearing down"
             )
             pool = get_engine_pool()
+            unload_failure: str | None = None
             if pool is None:
-                logger.warning(
-                    "cluster: cannot auto-teardown %r after degrade -- engine "
-                    "pool unavailable",
-                    model_id,
+                unload_failure = "engine pool unavailable"
+            else:
+                try:
+                    await pool.request_unload(model_id)
+                except Exception as exc:  # noqa: BLE001 - forced local fallback below
+                    unload_failure = str(exc)
+            if unload_failure is not None:
+                self._raise_alarm(
+                    f"auto-teardown after degrade failed for {model_id!r}: "
+                    f"{unload_failure} -- forcing the formation out of service "
+                    "locally so it is not left claiming to be servable"
                 )
-                return
-            try:
-                await pool.request_unload(model_id)
-            except Exception as exc:  # noqa: BLE001 - best-effort auto-teardown
-                logger.warning(
-                    "cluster: auto-teardown after degrade failed for %r: %s",
-                    model_id,
-                    exc,
-                )
+                engine = self._engines.pop(model_id, None)
+                if engine is not None:
+                    with contextlib.suppress(Exception):
+                        await engine.stop()
+                if self._active_model == model_id:
+                    await self._abort_formation()
         finally:
             self._degrading.discard(model_id)
 
@@ -659,6 +706,11 @@ class FormationManager:
         backend: str,
     ) -> None:
         """One formation attempt on ``backend`` (steps 3-5). Raises on failure."""
+        # S6 P1c/R1: from this point a dead-rank report naming THIS job is
+        # the one `handle_dead_rank` should act on, for every attempt this
+        # job makes across the D7 fallback (`_abort_formation` clears it
+        # between attempts; each retry through here re-sets it).
+        self._current_job_id = job.id
         ibv = self._ibv_matrix(backend, worker_rdma)
         # Step 3: spawn rank 0 (head child) and wait until it is listening.
         self._local = await self._run_blocking(
@@ -721,6 +773,7 @@ class FormationManager:
         local, self._local = self._local, None
         self._active_model = None
         self._active_job = None
+        self._current_job_id = None
         if local is not None:
             await self._run_blocking(local.stop)
 

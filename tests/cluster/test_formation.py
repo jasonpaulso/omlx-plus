@@ -730,6 +730,173 @@ async def test_dead_rank_report_is_idempotent_for_a_serving_model(tmp_path):
             await driver
 
 
+# -- S6 P1c/R1: stale post-kill ranks payload must not kill a fresh formation
+
+
+async def test_stale_dead_rank_heartbeat_does_not_abort_a_reissued_formation(
+    tmp_path,
+):
+    """The exact reported bug: worker `kill()` never cleared its ranks
+    state, so a worker heartbeat could keep reporting an OLD, already
+    torn-down formation's dead rank for several beats. If a FRESH formation
+    is re-issued and reaches the in-progress state (`_local` set,
+    `_active_model` still None) before the stale heartbeat lands, the head's
+    old dead-rank handler had no way to tell the report was about a
+    formation it had already moved past -- it aborted the fresh one anyway.
+
+    Drives the REAL end-to-end wire path (`ClusterManager.record_heartbeat`
+    -> `FormationManager.handle_dead_rank`), not a shortcut call, so this
+    reproduces the bug exactly as the worker's heartbeat provider would
+    have produced it and exactly as the fix (formation-scoped `job_id`)
+    closes it.
+    """
+    settings = _head_settings(tmp_path, backend="ring")
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        fm = _formation(manager, spawns)
+        manager._formation = fm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(fm, member, stop, present=True))
+        try:
+            # Formation A: forms cleanly, then torn down -- the SAME shape
+            # a rank-death kill leaves behind (dead ranks, no longer
+            # current on the head).
+            result_a = await fm.load("target")
+            job_id_a = result_a["job_id"]
+            await fm.unload("target")
+
+            # Formation B: re-issued, blocked in wait_ready (IN PROGRESS --
+            # `_local` set, `_active_model` still None).
+            leader_b = _BlockingLeader()
+            fm._spawn_leader_fn = lambda **kwargs: (spawns.append(kwargs) or leader_b)
+            load_task = asyncio.create_task(fm.load("target"))
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if fm._local is not None and fm._active_model is None:
+                    break
+                await asyncio.sleep(0.005)
+            assert fm._local is leader_b, "formation B never reached in-progress"
+            # `_jobs` (not the new `_current_job_id`) so this setup step
+            # itself runs unchanged against pre-fix source -- the point
+            # where pre/post-fix behaviour actually diverges is the
+            # record_heartbeat call below, not here.
+            job_id_b = fm._jobs[-1].id
+            assert job_id_b is not None and job_id_b != job_id_a
+
+            # The stale heartbeat: still carrying job A's identity and dead
+            # rank, arriving while B is mid-formation.
+            manager.record_heartbeat(
+                member,
+                seq=2,
+                epoch="ep",
+                ranks={"alive": [], "dead": [1], "job_id": job_id_a},
+            )
+            await asyncio.sleep(0.05)
+            assert fm._local is leader_b, "a stale report killed the fresh formation"
+            assert not load_task.done()
+
+            # A report naming the CURRENT job still aborts it -- D1 unbroken.
+            manager.record_heartbeat(
+                member,
+                seq=3,
+                epoch="ep",
+                ranks={"alive": [], "dead": [1], "job_id": job_id_b},
+            )
+            with pytest.raises((RuntimeError, ClusterError)):
+                await asyncio.wait_for(load_task, timeout=5.0)
+            assert fm._local is None  # the pool's rollback guard ran
+        finally:
+            stop.set()
+            await driver
+
+
+# -- S6 P1c (P1a residual): request_unload failure must not leave the model
+# -- present-but-dead ------------------------------------------------------
+
+
+class _RaisingRequestUnloadPool:
+    """Stands in for `EnginePool.request_unload` when the pool-side unload
+    itself blows up (a genuinely dead formation's teardown hitting some
+    other failure) -- distinct from `_RequestUnloadStubPool`, which always
+    succeeds."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def request_unload(self, model_id: str) -> None:
+        self.calls.append(model_id)
+        raise RuntimeError("pool teardown exploded")
+
+
+async def test_degrade_forces_the_formation_out_of_service_when_unload_raises(
+    tmp_path,
+):
+    """A `request_unload` failure must not leave the model present-but-dead
+    -- the pool's entry (and this manager's own `_active_model`/engine
+    bookkeeping) still claiming servable over ranks that are already gone.
+    """
+    settings = _head_settings(tmp_path, backend="ring")
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        fm = _formation(manager, spawns)
+        manager._formation = fm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(fm, member, stop, present=True))
+        raising_pool = _RaisingRequestUnloadPool()
+        set_engine_pool_getter(lambda: raising_pool)
+        try:
+            result = await fm.load("target")
+            assert result["status"] == "ready"
+            assert fm.active_engine("target") is not None
+
+            await fm._degrade_and_teardown("target", "test: rank 1 process exited")
+
+            assert raising_pool.calls == ["target"]
+            assert fm.active_engine("target") is None
+            assert fm._active_model is None
+            assert any("degraded" in alarm for alarm in fm.alarms())
+            assert any(
+                "auto-teardown after degrade failed" in alarm for alarm in fm.alarms()
+            )
+        finally:
+            set_engine_pool_getter(None)
+            stop.set()
+            await driver
+
+
+async def test_degrade_forces_the_formation_out_of_service_when_pool_is_unavailable(
+    tmp_path,
+):
+    """Same residual, the other precondition: the pool is gone entirely
+    (never reaches `request_unload` at all)."""
+    settings = _head_settings(tmp_path, backend="ring")
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        fm = _formation(manager, spawns)
+        manager._formation = fm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(fm, member, stop, present=True))
+        set_engine_pool_getter(lambda: None)
+        try:
+            result = await fm.load("target")
+            assert result["status"] == "ready"
+
+            await fm._degrade_and_teardown("target", "test: rank 1 process exited")
+
+            assert fm.active_engine("target") is None
+            assert fm._active_model is None
+        finally:
+            set_engine_pool_getter(None)
+            stop.set()
+            await driver
+
+
 class _CapturingEngine(FakeEngine):
     """Records the `on_rank_death` callback `_load` wired in, so a test can
     invoke it exactly as `ClusterEngine`'s reader loop would."""

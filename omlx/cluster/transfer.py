@@ -34,7 +34,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import manifest as manifest_mod
-from .launcher import TransferSpawnBoundError, launch_transfer_session
+from .launcher import (
+    DEFAULT_STOP_GRACE_S,
+    TransferSpawnBoundError,
+    launch_transfer_session,
+)
 from .manifest import ManifestError
 from .protocol import (
     PROTOCOL_VERSION,
@@ -58,13 +62,14 @@ logger = logging.getLogger(__name__)
 # D2: give up after this many consecutive failed/no-progress rounds.
 ROUND_CAP = 3
 # S6 rider: a killed/wedged round's session is stopped with
-# `LocalCluster.stop()`'s own default grace (launcher.py, 10s) before it
-# escalates to SIGKILL and the OS actually releases the round's ring port. A
-# respawn sleep shorter than that grace races the still-closing predecessor
-# for the same port -- the S5 rig lost 3 join-timeout rounds in ~60s to
-# exactly this collision. The retry sleep must exceed it.
-_ROUND_STOP_GRACE_S = 10.0  # LocalCluster.stop()'s own default `timeout`
-ROUND_RETRY_BACKOFF_S = _ROUND_STOP_GRACE_S + 2.0
+# `LocalCluster.stop()`'s own default grace before it escalates to SIGKILL
+# and the OS actually releases the round's ring port. A respawn sleep
+# shorter than that grace races the still-closing predecessor for the same
+# port -- the S5 rig lost 3 join-timeout rounds in ~60s to exactly this
+# collision. The retry sleep must exceed it -- pinned to the SAME constant
+# `LocalCluster.stop()` defaults to (S6 P1c/R3), not a second literal that
+# could silently drift from it.
+ROUND_RETRY_BACKOFF_S = DEFAULT_STOP_GRACE_S + 2.0
 # CL5-04/05: head-side unbounded-growth bounds. `pending_results` buffers a
 # RESULT that arrived before `_await_round_result` registered a future for
 # its step (S5 P2 completion, see `_JobRuntime`); a flood of updates for

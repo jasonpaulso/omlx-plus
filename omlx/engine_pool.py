@@ -1460,6 +1460,9 @@ class EnginePool:
                     head=self.head_capacity(),
                     workers=workers,
                     prefer=prefer,
+                    allow_text_only_distribution=(
+                        manager.settings.allow_text_only_distribution
+                    ),
                 )
                 if decision.mode != "distributed":
                     raise ClusterError(
@@ -1936,6 +1939,9 @@ class EnginePool:
                 head=self.head_capacity(),
                 workers=workers,
                 prefer="auto",
+                allow_text_only_distribution=(
+                    cluster_manager.settings.allow_text_only_distribution
+                ),
             )
             if decision.mode == "reject":
                 raise InsufficientMemoryError(

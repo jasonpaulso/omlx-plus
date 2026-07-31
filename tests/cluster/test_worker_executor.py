@@ -269,6 +269,111 @@ def test_ranks_status_reports_a_dead_rank(tmp_path):
     assert executor.ranks_status() == {"alive": [], "dead": [1]}
 
 
+# -- S6 P1c/R1: formation-scoped ranks + self-clearing once fully dead -------
+
+
+def test_ranks_status_includes_job_id_when_a_cluster_was_spawned(tmp_path):
+    executor = _executor(tmp_path, [])
+    executor._cluster = _FakeFormedCluster([_FakeRank(1, True)])
+    executor._cluster_job_id = "job-a"
+    assert executor.ranks_status() == {"alive": [1], "dead": [], "job_id": "job-a"}
+
+
+async def test_spawn_records_the_spawning_jobs_id(tmp_path):
+    spawns: list = []
+    executor = _executor(tmp_path, spawns)
+    update = await executor._apply(_spawn_cmd(job_id="job-xyz"))
+    assert update["status"] == "spawned"
+    assert executor._cluster_job_id == "job-xyz"
+
+
+def test_ranks_status_self_clears_once_every_local_rank_is_dead(tmp_path):
+    """S6 P1c/R1 (the exact reported bug): worker `kill()` (fired by the
+    deathwatch on a rank death) never cleared the executor's `_cluster`
+    reference, so every SUBSEQUENT heartbeat kept reporting the SAME dead
+    formation forever -- long after the head had already reacted to it, and
+    right through a freshly re-issued formation's own heartbeat window.
+    Once every local rank is dead there is nothing left to report a SECOND
+    time; the reference is dropped right after the one report that carries
+    it.
+    """
+    executor = _executor(tmp_path, [])
+    executor._cluster = _FakeFormedCluster([_FakeRank(1, False)])
+    executor._cluster_job_id = "job-a"
+
+    first = executor.ranks_status()
+    assert first == {"alive": [], "dead": [1], "job_id": "job-a"}
+
+    # Pre-fix, this repeats the SAME dead report forever; post-fix, nothing
+    # is left to report.
+    assert executor.ranks_status() is None
+
+
+def test_ranks_status_does_not_self_clear_while_some_rank_is_still_alive(tmp_path):
+    """The self-clear is specific to "every local rank is dead" -- a
+    partially-dead formation (some ranks still alive) keeps reporting."""
+    executor = _executor(tmp_path, [])
+    executor._cluster = _FakeFormedCluster([_FakeRank(0, True), _FakeRank(1, False)])
+    executor._cluster_job_id = "job-a"
+
+    assert executor.ranks_status() == {
+        "alive": [0],
+        "dead": [1],
+        "job_id": "job-a",
+    }
+    assert executor.ranks_status() == {
+        "alive": [0],
+        "dead": [1],
+        "job_id": "job-a",
+    }
+
+
+async def test_sweep_clears_a_dead_clusters_reference(tmp_path, monkeypatch):
+    """SWEEP is always issued right before a fresh SPAWN
+    (`FormationManager._load` step 2) -- a dead, no-longer-useful
+    formation's reference must not survive it to bleed its job id/dead
+    ranks into heartbeats sent after the NEW formation starts spawning."""
+    executor = _executor(tmp_path, [])
+    dead_cluster = FakeCluster()
+    dead_cluster._alive = False
+    executor._cluster = dead_cluster
+    executor._cluster_job_id = "job-a"
+    monkeypatch.setattr("omlx.cluster.launcher.sweep_orphaned_ranks", lambda: 0)
+
+    update = await executor._apply(
+        {
+            "kind": "sweep",
+            "schema_version": PROTOCOL_VERSION,
+            "job_id": "job-b",
+            "step": 1,
+        }
+    )
+
+    assert update["status"] == "swept"
+    assert executor._cluster is None
+    assert executor._cluster_job_id is None
+
+
+async def test_sweep_leaves_a_live_clusters_reference_alone(tmp_path, monkeypatch):
+    executor = _executor(tmp_path, [])
+    live_cluster = FakeCluster()  # any_alive() -> True by default
+    executor._cluster = live_cluster
+    executor._cluster_job_id = "job-a"
+    monkeypatch.setattr("omlx.cluster.launcher.sweep_orphaned_ranks", lambda: 0)
+
+    await executor._apply(
+        {
+            "kind": "sweep",
+            "schema_version": PROTOCOL_VERSION,
+            "job_id": "job-b",
+            "step": 1,
+        }
+    )
+
+    assert executor._cluster is live_cluster
+    assert executor._cluster_job_id == "job-a"
+
+
 # -- CL2-09: one live formation per worker ------------------------------------
 
 

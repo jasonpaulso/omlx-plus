@@ -551,6 +551,16 @@ class ClusterSettings:
     # S5 D7 low: default-on switch to disable HF-source cluster transfers
     # (peer transfers are unaffected).
     allow_hf_transfer: bool = True
+    # S6 P1c item 6 (Qwen-anchor fork, user-decided 2026-07-30): default OFF.
+    # A multimodal ("vlm") checkpoint is normally refused distributed
+    # placement unless it honestly declares `language_model_only: true`
+    # (D0) -- with THIS on, eligibility no longer hinges on that boolean at
+    # all, and a vlm checkpoint may form TEXT-ONLY across the pair
+    # (divisibility is still checked via its text_config). Vision requests
+    # against a model served this way are refused with a named error, never
+    # silently degraded -- proper multimodal distribution (vision tower
+    # whole on the head, only the text decoder sharded) is v-next, not this.
+    allow_text_only_distribution: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -579,6 +589,9 @@ class ClusterSettings:
             ),
             auto_placement=bool(data.get("auto_placement", True)),
             allow_hf_transfer=bool(data.get("allow_hf_transfer", True)),
+            allow_text_only_distribution=bool(
+                data.get("allow_text_only_distribution", False)
+            ),
         )
 
 

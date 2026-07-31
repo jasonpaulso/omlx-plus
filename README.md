@@ -342,8 +342,22 @@ starting a transfer while a formation is already serving the target model is unr
 only trigger surface (the load path 409s first); presence can be up to ~65s stale after external
 file changes outside the API; the worker's own `/v1/models` listing can lag briefly after a
 transfer even though placement and formation resolve the new model correctly; most local model
-inventory classifies as VLM and is refused distributed placement (a `language_model_only` text
-checkpoint is the exception oMLX recognizes).
+inventory classifies as VLM and is refused distributed placement by default (a `language_model_only`
+text checkpoint is the exception oMLX recognizes; `cluster.allow_text_only_distribution` below is
+the explicit opt-in for the rest). Proper multimodal distribution — the vision tower whole on the
+head rank, only the text decoder sharded — is out of scope for this release entirely (v-next).
+
+**`cluster.allow_text_only_distribution` (opt-in, default off — read this before turning it on):**
+a genuinely multimodal checkpoint (its own weight index carries vision-tower parameters, regardless
+of what `language_model_only` declares) is refused distributed placement by default — distributing
+it text-only would silently drop the vision capability it was shipped with. Turning this setting on
+removes that refusal: any such checkpoint may form a TEXT-ONLY distributed formation across the
+pair (divisibility is still checked via its `text_config`). **A vision-bearing request against a
+model served this way is refused with a clear `400` naming the reason — never a silent
+degrade to text, and never dropped as an unhandled `500`.** A checkpoint that honestly declares
+`language_model_only: true` and truly ships no vision weights was already eligible before this
+setting existed and is unaffected by it either way. Single-node serving of any of these checkpoints
+is completely unaffected by this setting.
 
 **Settings** (`cluster.*`, in `~/.omlx/settings.json` or `--cluster-*` CLI flags — `omlx serve --help`
 is the source of truth for flags):
@@ -365,6 +379,7 @@ is the source of truth for flags):
 | `allow_routable_data_plane` | `false` | Accept a data-plane address outside `data_plane_subnet` (dangerous — weakens link scoping; see `docs/cluster/s2-security-notes.md`). |
 | `auto_placement` | `true` | Head-only: run placement on a plain load instead of always serving local-only. |
 | `allow_hf_transfer` | `true` | Allow HuggingFace-sourced transfers to a worker (peer transfers are unaffected when off). |
+| `allow_text_only_distribution` | `false` | Opt-in: let a genuinely multimodal checkpoint form a TEXT-ONLY distributed formation. See the caveat above before turning this on. |
 
 Full writeup, security notes, and rig measurements for each slice: `docs/cluster/bringup.md`,
 `docs/cluster/s2-measurements.md`, `docs/cluster/s2-security-notes.md`, `docs/cluster/s3-measurements.md`,

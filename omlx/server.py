@@ -570,6 +570,7 @@ except ImportError:
 # Include cluster control-plane routes. The router is always mounted; every
 # route answers 404 while cluster.role is "off" and no cluster state or
 # credential is reachable (the paths do remain visible in /openapi.json).
+from .cluster.engine import ClusterNonGoalError  # noqa: E402
 from .cluster.routes import router as cluster_router  # noqa: E402
 
 app.include_router(cluster_router)
@@ -700,6 +701,34 @@ async def invalid_request_error_handler(
     )
     if _is_api_route(request):
         content = _openai_error_body(str(exc), 400, param=exc.field)
+    else:
+        content = {"detail": str(exc)}
+    return JSONResponse(status_code=400, content=content)
+
+
+@app.exception_handler(ClusterNonGoalError)
+async def cluster_non_goal_error_handler(
+    request: FastAPIRequest, exc: ClusterNonGoalError
+):
+    """Map a distributed-serving non-goal (S3: no VLM/SpecPrefill on a
+    cluster-formed model) to a clean 4xx.
+
+    S6 P1c item 6: this is what a vision request against a
+    text-only-distributed (``cluster.allow_text_only_distribution``) model
+    hits (`_reject_if_multimodal`, unconditional for every cluster-formed
+    model) -- without this handler it fell through to the catch-all
+    `Exception` handler below and surfaced as an unhandled 500, never
+    "silently degrade" but also never the clear, named error the request
+    actually deserves.
+    """
+    logger.warning(
+        "%s %s → 400: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(str(exc), 400, code="cluster_non_goal")
     else:
         content = {"detail": str(exc)}
     return JSONResponse(status_code=400, content=content)

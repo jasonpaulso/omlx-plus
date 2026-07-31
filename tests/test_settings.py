@@ -2297,6 +2297,9 @@ class TestClusterSettings:
         assert cluster.lost_member_ttl_s == 86400.0
         # S4 D5: on by default -- meaningful only when role="head".
         assert cluster.auto_placement is True
+        # S6 P1c item 6 (Qwen-anchor fork): opt-in text-only distribution of
+        # a multimodal checkpoint is OFF unless explicitly turned on.
+        assert cluster.allow_text_only_distribution is False
 
     def test_round_trip_preserves_every_field(self):
         """The lifespan re-saves settings.json, so a dropped field would
@@ -2310,6 +2313,7 @@ class TestClusterSettings:
             allow_loopback=True,
             node_name="studio",
             auto_placement=False,
+            allow_text_only_distribution=True,
         )
         assert ClusterSettings.from_dict(original.to_dict()) == original
 

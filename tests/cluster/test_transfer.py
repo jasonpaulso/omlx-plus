@@ -1306,6 +1306,29 @@ async def test_round_cap_gives_up_after_no_progress(tmp_path, monkeypatch):
 # -- S6 rider: round-retry backoff exceeds the session kill grace ------------
 
 
+def test_round_stop_grace_has_a_single_source_of_truth():
+    """S6 P1c/R3: a 12.0s literal (`ROUND_RETRY_BACKOFF_S`) duplicated
+    `LocalCluster.stop()`'s 10.0s default grace as an independent hardcoded
+    literal (`_ROUND_STOP_GRACE_S`) rather than importing it -- two numbers
+    that happened to agree today but had nothing keeping them that way.
+
+    Structural, not behavioral: the two literals never actually drifted
+    apart in practice (both were 10.0), so there is no runtime divergence to
+    reproduce here -- this pins the single-source-of-truth SHAPE itself
+    (the private duplicate is gone; both modules read the SAME object).
+    """
+    import inspect
+
+    from omlx.cluster import transfer as transfer_mod
+    from omlx.cluster.launcher import DEFAULT_STOP_GRACE_S, LocalCluster
+
+    assert not hasattr(transfer_mod, "_ROUND_STOP_GRACE_S")
+    assert transfer_mod.DEFAULT_STOP_GRACE_S is DEFAULT_STOP_GRACE_S
+    real_default = inspect.signature(LocalCluster.stop).parameters["timeout"].default
+    assert real_default == DEFAULT_STOP_GRACE_S
+    assert transfer_mod.ROUND_RETRY_BACKOFF_S == DEFAULT_STOP_GRACE_S + 2.0
+
+
 async def test_round_retry_after_spawn_bound_waits_out_the_stop_grace(tmp_path):
     """The head's own spawn-bound refusal (a lingering session on this
     machine) must wait out `LocalCluster.stop()`'s own grace (10s) before

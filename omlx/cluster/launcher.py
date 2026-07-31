@@ -63,6 +63,12 @@ DEFAULT_JOIN_TIMEOUT_S = 120
 DEATHWATCH_INTERVAL_S = 2.0
 DEATHWATCH_STRIKES = 5
 
+# S6 P1c/R3: `LocalCluster.stop()`'s own default polite-then-kill grace --
+# named so callers that must reason about it (`transfer.py`'s round-retry
+# backoff) reference this constant instead of a second hardcoded literal
+# that can silently drift from the real default.
+DEFAULT_STOP_GRACE_S = 10.0
+
 
 class SpawnBoundError(RuntimeError):
     """A spawn was refused because a formation is already live (CL2-09)."""
@@ -906,7 +912,7 @@ class LocalCluster:
         _release_formation(self)
         _release_transfer_session(self)
 
-    def stop(self, *, timeout: float = 10.0) -> None:
+    def stop(self, *, timeout: float = DEFAULT_STOP_GRACE_S) -> None:
         """Shut every local rank down, politely then not.
 
         A rank blocked in a collective waiting for a peer that will never
