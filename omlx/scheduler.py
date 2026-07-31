@@ -34,7 +34,6 @@ from mlx_lm.generate import (
     GenerationBatch,
     PromptProcessingBatch,
     SequenceStateMachine,
-    generation_stream,
 )
 from mlx_lm.models.cache import (
     KVCache as _MLXKVCache,
@@ -63,13 +62,14 @@ from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
 from .utils.fatal import FATAL_TEARDOWN_TIMEOUT_S, fatal_exit
 from .utils.generation_config import load_generation_config_token_ids
 from .utils.hardware import format_bytes
+from .utils.metal_sync import (
+    _default_generation_stream,
+    _mx_buffer_access_lock,
+    _sync_and_clear_cache,
+)
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
 from .utils.tokenizer import create_streaming_detokenizer
-
-# Module-level alias so Scheduler.__init__ can fall back to mlx-lm's default
-# stream when no per-engine stream is provided.
-_default_generation_stream = generation_stream
 
 
 def _apply_suppress_token_ids(logits: Any, suppress_token_ids: tuple[int, ...]) -> Any:
@@ -87,6 +87,11 @@ def _make_suppress_logits_processor(
 
     def _suppress_logits(tokens: Any, logits: Any) -> Any:
         return _apply_suppress_token_ids(logits, suppress_tuple)
+
+    # Marker for _route_to_vlm_mtp: this model-level processor is the one
+    # kind the vlm_mtp path reproduces on its own (folded into the sampler
+    # via _make_suppressing_sampler), so it must not block routing.
+    _suppress_logits._omlx_suppress_processor = True  # type: ignore[attr-defined]
 
     return _suppress_logits
 
@@ -179,43 +184,12 @@ class _VLMMTPResponse:
     prompt_cache: Any = None
 
 
-# Serializes Metal buffer-protocol access from the async store-cache worker
-# against inference-thread mx.clear_cache / mx.synchronize calls that can
-# invalidate the underlying buffer pool. Closes a SIGABRT path where
-# _async_store_cache_worker reads tensor bytes via memoryview while the
-# inference thread concurrently issues a reclaim-triggering mx op.
-# See: https://github.com/jundot/omlx/issues/1106
-_mx_buffer_access_lock = threading.RLock()
+@dataclass
+class _StopOutputState:
+    """Request-local output held while it can still match a stop string."""
 
-
-def _sync_and_clear_cache(stream=None):
-    """Synchronize in-flight GPU work before clearing the Metal buffer cache.
-
-    Without synchronization, mx.clear_cache() can release Metal buffers that
-    are still referenced by in-flight command buffers submitted via
-    mx.async_eval(). This causes the GPU driver to hit a
-    'completeMemory() prepare count underflow' kernel panic on M4 hardware
-    (and SIGSEGV/SIGABRT on M3).
-
-    Held under _mx_buffer_access_lock so the async store-cache worker cannot
-    observe a half-reclaimed Metal buffer pool while it is in the middle of
-    reading tensor bytes via the Python buffer protocol (#1106).
-
-    See: https://github.com/jundot/omlx/issues/300, #888, #1106
-    """
-    with _mx_buffer_access_lock:
-        # The engine stream may not have in-flight work on the current thread
-        # (for example, during teardown before that thread submits work). On
-        # some MLX builds mx.synchronize raises "There is no Stream(gpu, 0) in
-        # current thread" in that case; swallow it since there is nothing to
-        # drain.
-        target = stream if stream is not None else _default_generation_stream
-        try:
-            mx.synchronize(target)
-        except RuntimeError:
-            pass
-        mx.synchronize()  # default stream
-        mx.clear_cache()
+    strings: dict[tuple[int, ...], str]
+    pending: deque[tuple[int, RequestOutput]] = field(default_factory=deque)
 
 
 def _safe_sync_stream(stream=None):
@@ -2975,6 +2949,24 @@ class Scheduler:
             if class_name in ("MiniMaxM3KVCache", "MiniMaxM3BatchKVCache"):
                 return False
             if isinstance(c, CacheList):
+                # A KVCache member inside a CacheList converts fine at
+                # runtime, but the prefix/SSD store paths dispatch on the
+                # layer class ("CacheList") and have no TurboQuant
+                # sub-state serialization: the converted member's
+                # NamedTuple state is flattened to an anonymous tuple on
+                # store and rebuilt as a corrupt dense cache on restore.
+                # Until CacheList-level TQ serialization exists, exclude
+                # composite layers that contain a convertible KVCache
+                # (e.g. inkling's CacheList(KVCache, ArraysCache)).
+                if any(type(inner) is KVCache for inner in c.caches):
+                    if not getattr(self, "_tq_cachelist_guard_logged", False):
+                        self._tq_cachelist_guard_logged = True
+                        logger.info(
+                            "TurboQuant KV disabled: composite CacheList "
+                            "layers with KVCache members have no TQ "
+                            "store/restore path yet"
+                        )
+                    return False
                 return all(_ok(inner) for inner in c.caches)
             return False
 
@@ -3279,6 +3271,7 @@ class Scheduler:
                 request_id=request.request_id,
                 loop_label="external",
                 kv_len=base_size + processed_tokens,
+                requested_step=prefill_step_size,
             )
             self._maybe_record_fixed_state_bytes(prompt_cache)
             # Enforcer-requested hard-pressure drain. The flag's normal
@@ -3359,7 +3352,15 @@ class Scheduler:
                         _abort / 1024**3,
                     )
                 elif current > self._memory_limit_bytes:
-                    logger.warning(
+                    # Speed priority runs full chunks through this caution
+                    # band by design — the per-chunk notice is DEBUG there,
+                    # not a warning about an unexpected state.
+                    _log = (
+                        logger.debug
+                        if self._prefill_speed_priority
+                        else logger.warning
+                    )
+                    _log(
                         f"Prefill above max_bytes at "
                         f"{processed_tokens} tokens: "
                         f"{current / 1024**3:.1f}GB > "
@@ -4217,6 +4218,7 @@ class Scheduler:
         request_id: str,
         loop_label: str,
         kv_len: int = 0,
+        requested_step: int | None = None,
     ) -> None:
         """Feed one chunk's measured transient into the EWMA tracker.
 
@@ -4230,6 +4232,13 @@ class Scheduler:
         better per-chunk signal was found, and anything sized from this number
         has to stay conservative. Keeping kv_len in the log is what made that
         analysis possible.
+
+        Under speed priority, only a complete requested step is representative
+        of the full-size chunks used for admission. A shorter tail or
+        boundary-alignment chunk must not replace the last full-step sample:
+        scaling its fixed/pool-heavy delta up to ``prefill_step_size`` can turn
+        a small residual allocation into a false multi-gigabyte admission
+        charge.
         """
         delta = post_bytes - pre_bytes
         min_chunk = max(1, self._prefill_min_chunk_tokens)
@@ -4251,6 +4260,21 @@ class Scheduler:
                 request_id,
                 n_tokens,
                 delta,
+            )
+            return
+        if (
+            getattr(self, "_prefill_speed_priority", False)
+            and requested_step is not None
+            and n_tokens < requested_step
+        ):
+            logger.debug(
+                "[throttle:%s] measure rid=%s n=%d delta=%.2fMB "
+                "(skipped: speed partial < requested_step=%d)",
+                loop_label,
+                request_id,
+                n_tokens,
+                delta / 1024**2,
+                requested_step,
             )
             return
         self._prefill_transient_tracker.update(
@@ -4498,6 +4522,7 @@ class Scheduler:
             request_id=state.request.request_id,
             loop_label="chunked_step",
             kv_len=state.base_size + state.tokens_processed,
+            requested_step=prefill_step_size,
         )
         self._maybe_record_fixed_state_bytes(state.cache)
         state.tokens_processed += n
@@ -4578,7 +4603,13 @@ class Scheduler:
                     _abort / 1024**3,
                 )
             elif current > self._memory_limit_bytes:
-                logger.warning(
+                # Speed priority runs full chunks through this caution band
+                # by design — the per-chunk notice is DEBUG there, not a
+                # warning about an unexpected state.
+                _log = (
+                    logger.debug if self._prefill_speed_priority else logger.warning
+                )
+                _log(
                     f"Chunked prefill above max_bytes at "
                     f"{state.tokens_processed} tokens: "
                     f"{current / 1024**3:.1f}GB > "
@@ -4635,10 +4666,45 @@ class Scheduler:
 
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
         """
-        self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
-
         if request.sampling_params.seed is not None:
             mx.random.seed(request.sampling_params.seed)
+
+        # #2219: both chunked-completion paths (inline first chunk and
+        # _advance_chunked_prefills) funnel through here, but external VLM MTP
+        # routing only existed on the non-chunked prefill exit -- so any prompt
+        # long enough to be chunk-prefilled silently bypassed VLM MTP. Re-apply
+        # the decision at this shared choke point, BEFORE the TurboQuant convert
+        # below, so the drafter's final forward sees the un-quantized cache. A
+        # declined route (e.g. the single-in-flight drafter is busy) falls
+        # through to BatchGenerator, matching short-prompt behaviour.
+        if self._vlm_mtp_drafter is not None and state.cache is not None:
+            vlm_mtp_uid = self._route_to_vlm_mtp(
+                request,
+                state.cache,
+                state.last_token,
+                state.sampler,
+                state.sm,
+                logits_processors=state.per_row_lps,
+            )
+            if vlm_mtp_uid is not None:
+                self.request_id_to_uid[request.request_id] = vlm_mtp_uid
+                self.uid_to_request_id[vlm_mtp_uid] = request.request_id
+                now = time.monotonic()
+                request.batch_uid = vlm_mtp_uid
+                request.status = RequestStatus.RUNNING
+                request.generation_started_at = now
+                request.last_activity_at = now
+                self.running[request.request_id] = request
+                scheduled.append(request)
+                self.total_prompt_tokens += request.num_prompt_tokens
+                logger.debug(
+                    "Scheduled chunked-prefill request %s via vlm_mtp (uid=%d)",
+                    request.request_id,
+                    vlm_mtp_uid,
+                )
+                return
+
+        self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
 
         per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
         # insert() merges the prompt cache into the batch KV caches with lazy
@@ -4743,7 +4809,7 @@ class Scheduler:
                 self.requests.pop(rid, None)
                 self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
-                _sync_and_clear_cache()
+                _sync_and_clear_cache(self._stream)
                 rejected.append(_prefill_memory_exception_output(rid, e))
                 continue
             except RuntimeError as e:
@@ -4756,7 +4822,7 @@ class Scheduler:
                 # Drop Metal cache pool buffers held by the aborted chunk's
                 # forward / mx.eval transients. Without this, enforcer keeps
                 # seeing the burst footprint until the next mx.clear_cache().
-                _sync_and_clear_cache()
+                _sync_and_clear_cache(self._stream)
                 # Try a bounded requeue before surfacing the failure: a
                 # memory-pressure prefill gets a fresh, better-throttled
                 # attempt. Only after the retry budget is exhausted (or for
@@ -4820,6 +4886,7 @@ class Scheduler:
         transitions: dict[str, list] = {
             "normal": [([t], None) for t in stop_tokens_set]
         }
+        stop_sequence_strings: dict[tuple[int, ...], str] = {}
 
         # Tokenize stop strings into token sequences. mlx-lm's
         # SequenceStateMachine uses Aho-Corasick, so per-token match
@@ -4834,11 +4901,119 @@ class Scheduler:
             except TypeError:
                 seq = self.tokenizer.encode(stop_str)
             if seq:
-                transitions["normal"].append((list(seq), None))
+                token_sequence = tuple(int(token) for token in seq)
+                transitions["normal"].append((list(token_sequence), None))
+                stop_sequence_strings[token_sequence] = stop_str
+
+        # Response-side buffering is request-local so normal completion,
+        # retry, and cleanup paths do not need any new scheduler lifecycle.
+        request._stop_output_state = _StopOutputState(  # type: ignore[attr-defined]
+            strings=stop_sequence_strings
+        )
 
         if transitions["normal"]:
             return SequenceStateMachine(transitions, initial="normal")
         return SequenceStateMachine({}, initial="normal")
+
+    def _buffer_stop_sequence_output(
+        self,
+        request: "Request",
+        response: Any,
+        output: RequestOutput,
+    ) -> list[RequestOutput]:
+        """Suppress every output chunk belonging to a matched stop sequence.
+
+        mlx-lm reports the full ``match_sequence`` but marks only its final
+        token as ``finish_reason=stop``.  Keep only a suffix that is a token
+        prefix of a configured stop string, then discard that suffix when the
+        full sequence matches.  All other output is released immediately.
+        """
+        state = getattr(request, "_stop_output_state", None)
+        if state is None or not state.strings:
+            return [output]
+
+        pending = state.pending
+        pending.append((int(response.token), output))
+
+        pending_tokens = tuple(token for token, _ in pending)
+        reported_match = tuple(
+            int(token)
+            for token in (getattr(response, "match_sequence", None) or ())
+        )
+        matched_sequence = (
+            reported_match
+            if output.finish_reason == "stop" and reported_match in state.strings
+            else None
+        )
+        if matched_sequence is not None:
+            terminal_output = output
+            matched_outputs = []
+            for _ in matched_sequence:
+                _, matched_output = pending.pop()
+                matched_outputs.append(matched_output)
+            matched_outputs.reverse()
+
+            stop_string = state.strings[matched_sequence]
+
+            def strip_matched_prefix(text: str) -> str:
+                for prefix_len in range(len(stop_string), 0, -1):
+                    if text.endswith(stop_string[:prefix_len]):
+                        return text[:-prefix_len]
+                return text
+
+            matched_stream_text = "".join(
+                matched_output.new_text for matched_output in matched_outputs
+            )
+            safe_stream_text = strip_matched_prefix(matched_stream_text)
+            suppressed_stream_text = matched_stream_text[len(safe_stream_text) :]
+            if suppressed_stream_text and terminal_output.output_text.endswith(
+                suppressed_stream_text
+            ):
+                terminal_output.output_text = terminal_output.output_text[
+                    :-len(suppressed_stream_text)
+                ]
+            else:
+                matched_prefix_tokens = matched_sequence[:-1]
+                output_token_ids = terminal_output.output_token_ids
+                if (
+                    matched_prefix_tokens
+                    and len(output_token_ids) >= len(matched_prefix_tokens)
+                    and tuple(output_token_ids[-len(matched_prefix_tokens) :])
+                    == matched_prefix_tokens
+                    and request.request_id not in self._output_parser_sessions
+                ):
+                    terminal_output.output_text = self.tokenizer.decode(
+                        output_token_ids[:-len(matched_prefix_tokens)]
+                    )
+            request.output_text = terminal_output.output_text
+
+            terminal_output.new_text = safe_stream_text
+            terminal_output.new_token_ids = []
+            if safe_stream_text and matched_outputs:
+                terminal_output.generated_at = matched_outputs[0].generated_at
+            pending.append((int(response.token), terminal_output))
+            ready = [pending_output for _, pending_output in pending]
+            pending.clear()
+            return ready
+
+        if output.finished:
+            ready = [pending_output for _, pending_output in pending]
+            pending.clear()
+            return ready
+
+        keep = 0
+        for sequence in state.strings:
+            max_prefix = min(len(sequence), len(pending_tokens))
+            for prefix_len in range(max_prefix, keep, -1):
+                if pending_tokens[-prefix_len:] == sequence[:prefix_len]:
+                    keep = prefix_len
+                    break
+
+        ready = []
+        while len(pending) > keep:
+            _, pending_output = pending.popleft()
+            ready.append(pending_output)
+        return ready
 
     def _emit_prefill_boundary_snapshot(
         self,
@@ -5406,17 +5581,13 @@ class Scheduler:
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
             else:
-                # In-memory fallback: this snapshot will be sliced later on the
-                # store-cache worker thread (via _BoundarySnapshotProvider ->
-                # _extract_cache_states). MLX streams are thread-local, so the
-                # worker cannot materialize a lazy op bound to THIS (owner) thread's
-                # stream. Force it concrete now, on the capturing thread, so the
-                # worker only ever slices already-evaluated buffers.
-                self._eval_snapshot_cache(snapshot_cache)
-                self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+                self._boundary_cache_snapshots[request_id][token_count] = (
+                    self._prefill_snapshot_value(snapshot_cache)
+                )
         else:
-            self._eval_snapshot_cache(snapshot_cache)
-            self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+            self._boundary_cache_snapshots[request_id][token_count] = (
+                self._prefill_snapshot_value(snapshot_cache)
+            )
 
         self._boundary_snapshot_required = True
         logger.debug(
@@ -5424,6 +5595,85 @@ class Scheduler:
             request_id,
             token_count,
         )
+
+    _PREFILL_SNAPSHOT_MARKER = "__prefill_extracted__"
+
+    def _prefill_snapshot_value(self, snapshot_cache: list[Any]) -> Any:
+        """In-memory snapshot value: pre-extracted states when possible.
+
+        Falls back to the raw cache objects when extraction fails (stub or
+        unknown cache classes). The raw fallback cannot alias-corrupt: the
+        consumer runs the same extraction and skips the snapshot on the
+        same failure, while every extractable cache is decoupled here.
+        """
+        extracted = self._extract_prefill_snapshot_states(snapshot_cache)
+        if extracted is not None:
+            return extracted
+        self._eval_snapshot_cache(snapshot_cache)
+        return snapshot_cache
+
+    def _extract_prefill_snapshot_states(
+        self, snapshot_cache: list[Any]
+    ) -> tuple[str, list[dict[str, Any]]] | None:
+        """Extract-and-eval boundary states captured mid-prefill.
+
+        The prefill path snapshots the request's LIVE per-layer cache
+        objects (the request has no BatchGenerator uid yet, so there is no
+        ``extract_cache`` copy to take). Storing those objects aliases
+        every boundary to the prefill's final state — KVCache mutates its
+        preallocated buffer in place, so a later ``.state`` read returns
+        the newest content for every recorded boundary. Extract the state
+        eagerly on the capturing thread instead, and evaluate the leaves
+        so the async store-cache worker never re-dispatches a lazy op to
+        this thread's stream (#1568). Consumers accept the resulting
+        pre-extracted marker alongside raw decode-path snapshots (those
+        are already decoupled copies from ``extract_cache``).
+        """
+        def _copy_containers(value: Any) -> Any:
+            # ArraysCache.state returns its live slot LIST (not a copy);
+            # the model rebinds slots in place, so container structure
+            # must be copied at the boundary. The arrays themselves are
+            # safe to share: slot updates rebind, and buffer setitem
+            # copies on write once a second reference exists.
+            if isinstance(value, list):
+                return [_copy_containers(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(_copy_containers(v) for v in value)
+            return value
+
+        try:
+            stream = getattr(self, "_stream", None) or mx.default_stream(
+                mx.default_device()
+            )
+            with mx.stream(stream):
+                extracted, _ = self._extract_cache_states(snapshot_cache)
+                if not extracted:
+                    return None
+                for layer_state in extracted:
+                    layer_state["state"] = _copy_containers(layer_state.get("state"))
+                    layer_state["meta_state"] = _copy_containers(
+                        layer_state.get("meta_state")
+                    )
+                leaves: list[Any] = []
+
+                def _collect(value: Any) -> None:
+                    if isinstance(value, mx.array):
+                        leaves.append(value)
+                    elif isinstance(value, (list, tuple)):
+                        for item in value:
+                            _collect(item)
+                    elif isinstance(value, dict):
+                        for item in value.values():
+                            _collect(item)
+
+                for layer_state in extracted:
+                    _collect(layer_state.get("state"))
+                if leaves:
+                    mx.eval(leaves)
+            return (self._PREFILL_SNAPSHOT_MARKER, extracted)
+        except Exception as e:
+            logger.debug("Failed to extract prefill boundary snapshot: %s", e)
+            return None
 
     def _detect_boundary_snapshot_need(self) -> bool:
         """
@@ -5680,9 +5930,21 @@ class Scheduler:
                 self.requests.get(request_id), "_model_cache_config", None
             )
         elif latest_snapshot is not None:
-            extracted_cache, model_cache_config = self._extract_cache_states(
-                latest_snapshot
-            )
+            if (
+                isinstance(latest_snapshot, tuple)
+                and len(latest_snapshot) == 2
+                and latest_snapshot[0] == self._PREFILL_SNAPSHOT_MARKER
+            ):
+                # Pre-extracted prefill snapshot (states were captured and
+                # evaluated at the boundary; the live caches have moved on).
+                extracted_cache = latest_snapshot[1]
+                model_cache_config = getattr(
+                    self.requests.get(request_id), "_model_cache_config", None
+                )
+            else:
+                extracted_cache, model_cache_config = self._extract_cache_states(
+                    latest_snapshot
+                )
             if not extracted_cache:
                 return None
         else:
@@ -5699,6 +5961,15 @@ class Scheduler:
             if snap is None:
                 if self._boundary_snapshot_store is not None:
                     provider_tcs.append(tc)
+                continue
+
+            if (
+                isinstance(snap, tuple)
+                and len(snap) == 2
+                and snap[0] == self._PREFILL_SNAPSHOT_MARKER
+            ):
+                extracted_in_memory[tc] = snap[1]
+                provider_tcs.append(tc)
                 continue
 
             extracted_snapshot, _ = self._extract_cache_states(snap)
@@ -6294,6 +6565,11 @@ class Scheduler:
                                         sub_class_names,
                                         sub_meta_states,
                                     ),
+                                    # prefix_cache's store path reads this to
+                                    # tag __nstate__ markers and to record
+                                    # per-sub class names in SSD metadata;
+                                    # without it both stay unnamed.
+                                    "sub_class_names": sub_class_names,
                                     "class_name": "CacheList",
                                     "cache_type": "CacheList",
                                 }
@@ -6323,6 +6599,7 @@ class Scheduler:
                             {
                                 "state": sub_states,
                                 "meta_state": (sub_class_names, sub_meta_states),
+                                "sub_class_names": sub_class_names,
                                 "class_name": "CacheList",
                                 "cache_type": "CacheList",
                             }
@@ -7062,6 +7339,7 @@ class Scheduler:
         last_tokens: list[int],
         sampler: Callable[[Any], Any],
         state_machine: Any,
+        logits_processors: list[Any] | None = None,
     ) -> int | None:
         """Bypass BatchGenerator and stand up a vlm_mtp generator instead.
 
@@ -7076,6 +7354,28 @@ class Scheduler:
         """
         drafter = self._vlm_mtp_drafter
         if drafter is None:
+            return None
+
+        # Per-request logits processors (grammar constraints, thinking
+        # budget, repetition/presence/frequency penalties) have no
+        # application point on this path: run_vlm_mtp_decode threads only a
+        # sampler into mlx-vlm's _mtp_rounds, and a sampler sees logits
+        # without the token history processors need. Model-level suppress
+        # tokens are the one exception, reproduced below via
+        # _make_suppressing_sampler. Same convention as Lightning MTP,
+        # which declines activation when grammar processors are present:
+        # fall back to BatchGenerator so every processor is enforced
+        # (#2399).
+        if logits_processors and any(
+            not getattr(proc, "_omlx_suppress_processor", False)
+            for proc in logits_processors
+        ):
+            logger.info(
+                "vlm_mtp routing skipped for %s: request carries per-request "
+                "logits processors (grammar / thinking budget / penalties); "
+                "falling back to BatchGenerator",
+                request.request_id,
+            )
             return None
 
         # Gemma4AssistantDraftModel keeps ``_shared_kv`` / ``_input_embed`` on
@@ -8899,7 +9199,7 @@ class Scheduler:
                         self.requests.pop(request.request_id, None)
                         self._clear_request_admission_bookkeeping(request.request_id)
                         get_prefill_tracker().remove(request.request_id)
-                        _sync_and_clear_cache()
+                        _sync_and_clear_cache(self._stream)
                         rejected_outputs.append(
                             _prefill_memory_exception_output(request.request_id, e)
                         )
@@ -8922,7 +9222,7 @@ class Scheduler:
                         get_prefill_tracker().remove(request.request_id)
                         # Drop Metal cache pool buffers held by the aborted
                         # first chunk's forward / mx.eval transients.
-                        _sync_and_clear_cache()
+                        _sync_and_clear_cache(self._stream)
                         if self._requeue_or_fail_prefill(request, e):
                             continue
                         rejected_outputs.append(
@@ -8982,7 +9282,7 @@ class Scheduler:
                     self.requests.pop(request.request_id, None)
                     self._clear_request_admission_bookkeeping(request.request_id)
                     get_prefill_tracker().remove(request.request_id)
-                    _sync_and_clear_cache()
+                    _sync_and_clear_cache(self._stream)
                     rejected_outputs.append(
                         _prefill_memory_exception_output(request.request_id, e)
                     )
@@ -9004,7 +9304,7 @@ class Scheduler:
                     get_prefill_tracker().remove(request.request_id)
                     # Drop Metal cache pool buffers held by the aborted
                     # chunk's forward / mx.eval transients.
-                    _sync_and_clear_cache()
+                    _sync_and_clear_cache(self._stream)
                     if self._requeue_or_fail_prefill(request, e):
                         continue
                     rejected_outputs.append(
@@ -9063,7 +9363,12 @@ class Scheduler:
             # eligibility issue so other speculative paths stay intact.
             if self._vlm_mtp_drafter is not None and cache_to_use is not None:
                 vlm_mtp_uid = self._route_to_vlm_mtp(
-                    request, cache_to_use, tokens_to_process, sampler, sm
+                    request,
+                    cache_to_use,
+                    tokens_to_process,
+                    sampler,
+                    sm,
+                    logits_processors=logits_processors,
                 )
                 if vlm_mtp_uid is not None:
                     self.request_id_to_uid[request.request_id] = vlm_mtp_uid
@@ -9388,7 +9693,7 @@ class Scheduler:
                     5, "Request %s generated text:\n%s", request_id, output.output_text
                 )
 
-            outputs.append(output)
+            outputs.extend(self._buffer_stop_sequence_output(request, response, output))
 
         return outputs, finished_ids
 
@@ -10913,6 +11218,25 @@ class Scheduler:
                 # Fixed recurrent state (GDN/Mamba) can only be measured from
                 # a live cache after the first forward; arm a one-shot probe.
                 self._fixed_state_measure_armed = arrays_cache_layers > 0
+
+                # Inkling builds its banded relative-position bias as a full
+                # [H, LQ, S] tensor before SDPA; register the transient so
+                # prefill admission prices it (cleared for other models —
+                # the registry is process-wide across model swaps).
+                try:
+                    from .memory_monitor import register_attention_bias_transient
+
+                    model_type = str(getattr(self.model, "model_type", "") or "")
+                    register_attention_bias_transient(
+                        base_dtype_size
+                        if model_type in ("inkling", "inkling_mm_model")
+                        else None
+                    )
+                except Exception:
+                    logger.debug(
+                        "attention-bias transient registration failed",
+                        exc_info=True,
+                    )
                 logger.debug(
                     f"Model info for memory estimation: "
                     f"layers={num_layers} ({num_kv_cache_layers} KVCache, "
@@ -10932,13 +11256,15 @@ class Scheduler:
 
     def _infer_live_layer_cache_types(
         self,
-    ) -> tuple[list[str], float | None] | None:
+    ) -> tuple[list[str], float | None, dict[str, list[str]] | None] | None:
         """Infer the layer-cache signature that future SSD saves will use.
 
-        Returns ``(layer_cache_types, turboquant_kv_bits)`` — the predicted
-        per-layer type names plus the depth requests will quantize at (None
-        when TurboQuant is inactive or ineligible) — or None when no
-        signature can be inferred.
+        Returns ``(layer_cache_types, turboquant_kv_bits,
+        cachelist_subtypes)`` — the predicted per-layer type names, the
+        depth requests will quantize at (None when TurboQuant is inactive
+        or ineligible), and the sub composition of mixed CacheList layers
+        (None when the model has none) — or None when no signature can be
+        inferred.
         """
         if not HAS_CACHE_TYPE_HANDLERS or ModelCacheConfig is None:
             return None
@@ -10972,8 +11298,16 @@ class Scheduler:
         if not layer_cache_types:
             return None
 
+        try:
+            from .cache.paged_ssd_cache import cachelist_subtypes_from_cache_list
+
+            cachelist_subtypes = cachelist_subtypes_from_cache_list(cache_list)
+        except Exception as e:
+            logger.debug("Failed to infer CacheList sub composition: %s", e)
+            cachelist_subtypes = None
+
         if self._turboquant_kv_bits is None:
-            return layer_cache_types, None
+            return layer_cache_types, None, cachelist_subtypes
 
         try:
             eligible = self._turboquant_eligible(cache_list)
@@ -10984,7 +11318,7 @@ class Scheduler:
             logger.debug("Failed to evaluate TurboQuant SSD signature: %s", e)
             return None
         if not eligible:
-            return layer_cache_types, None
+            return layer_cache_types, None, cachelist_subtypes
 
         kv_indices = [
             i for i, c in enumerate(cache_list) if _is_turboquant_kv_family_cache(c)
@@ -11000,7 +11334,7 @@ class Scheduler:
         # inside CacheList layers report bare "CacheList" names at every
         # depth, so the bits field is the only signature discriminator for
         # them (#2045).
-        return layer_cache_types, float(self._turboquant_kv_bits)
+        return layer_cache_types, float(self._turboquant_kv_bits), cachelist_subtypes
 
     def refresh_ssd_layer_signature(self) -> list[str] | None:
         """Set the SSD manager's live layer signature before prefix lookup."""
@@ -11017,7 +11351,7 @@ class Scheduler:
                     "for this session (stale-depth blocks are not swept)."
                 )
             return None
-        layer_cache_types, turboquant_kv_bits = inferred
+        layer_cache_types, turboquant_kv_bits, cachelist_subtypes = inferred
 
         try:
             set_signature = getattr(manager, "set_expected_layer_signature", None)
@@ -11025,6 +11359,7 @@ class Scheduler:
                 set_signature(
                     layer_cache_types,
                     turboquant_kv_bits=turboquant_kv_bits,
+                    cachelist_subtypes=cachelist_subtypes,
                 )
             else:
                 manager.adopt_layer_signature_if_unset(layer_cache_types)

@@ -87,6 +87,7 @@ class QuantTask:
     imatrix_strict: bool = False
     imatrix_num_samples: int = 128
     imatrix_seq_length: int = 512
+    mtp_assistant_model_path: str = ""
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -225,6 +226,9 @@ class OQManager:
                                 # mm_vision_tower). Same predicate as model_discovery.
                                 "is_vlm": _has_vision_subconfig(config),
                                 "has_mtp_heads": has_mtp,
+                                "hidden_size": tc.get("hidden_size")
+                                or config.get("hidden_size")
+                                or 0,
                             }
                             all_models.append(info)
                             if validate_quantizable(config):
@@ -259,6 +263,7 @@ class OQManager:
         imatrix_strict: bool = False,
         imatrix_num_samples: int = 128,
         imatrix_seq_length: int = 512,
+        mtp_assistant_model_path: str = "",
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -267,6 +272,11 @@ class OQManager:
             oq_level: oQ level from OQ_LEVELS.
             dtype: Target fp dtype for non-quantized weights and quant
                 scales/biases. "bfloat16" (default) or "float16".
+            mtp_assistant_model_path: Optional checkpoint whose MTP head is
+                merged into the output. A gemma4_assistant donor uses the
+                assistant merge; any other donor grafts its native
+                Qwen3.5/3.6 mtp.* head (same-geometry, same-tokenizer
+                pairs only). Validated at submission.
 
         Returns:
             The created QuantTask.
@@ -279,6 +289,8 @@ class OQManager:
             OQ_LEVELS,
             _validate_oq_dtype_for_model,
             resolve_output_name,
+            validate_gemma4_assistant_pair,
+            validate_mtp_donor_pair,
         )
         from ..utils.model_loading import _checkpoint_has_mtp_weights
 
@@ -305,6 +317,31 @@ class OQManager:
             )
             preserve_mtp = False
 
+        if preserve_mtp and mtp_assistant_model_path:
+            raise ValueError(
+                "Choose either 'Preserve MTP weights' or 'Combine MTP head', "
+                "not both"
+            )
+        if mtp_assistant_model_path:
+            assistant = Path(mtp_assistant_model_path)
+            if not assistant.exists() or not (assistant / "config.json").exists():
+                raise ValueError(
+                    f"Assistant model not found: {mtp_assistant_model_path}"
+                )
+            with open(assistant / "config.json") as f:
+                assistant_config = json.load(f)
+            if assistant_config.get("model_type") == "gemma4_assistant":
+                validate_gemma4_assistant_pair(config, assistant_config)
+            else:
+                validate_mtp_donor_pair(source, assistant)
+                if _checkpoint_has_mtp_weights(source):
+                    logger.warning(
+                        "Recipient %s ships its own MTP head; it will be "
+                        "stripped and replaced by the donor head from %s",
+                        source.name,
+                        assistant.name,
+                    )
+
         model_name = source.name
         output_name = resolve_output_name(
             model_name,
@@ -313,6 +350,8 @@ class OQManager:
             preserve_mtp=preserve_mtp,
             enhanced=enhanced,
         )
+        if mtp_assistant_model_path and not output_name.endswith("-mtp"):
+            output_name += "-mtp"
         output_path = self._output_dir / output_name
 
         if output_path.exists():
@@ -377,6 +416,7 @@ class OQManager:
             imatrix_strict=imatrix_strict,
             imatrix_num_samples=imatrix_num_samples,
             imatrix_seq_length=imatrix_seq_length,
+            mtp_assistant_model_path=mtp_assistant_model_path,
         )
         self._tasks[task_id] = task
 
@@ -557,6 +597,19 @@ class OQManager:
                     imatrix_num_samples=task.imatrix_num_samples,
                     imatrix_seq_length=task.imatrix_seq_length,
                 )
+
+                if task_id in self._cancelled:
+                    return
+
+                if task.mtp_assistant_model_path:
+                    from ..oq import combine_mtp_into_output
+
+                    _progress_cb("saving", 97.0, "Merging MTP head...")
+                    await asyncio.to_thread(
+                        combine_mtp_into_output,
+                        task.output_path,
+                        task.mtp_assistant_model_path,
+                    )
 
                 if task_id in self._cancelled:
                     return

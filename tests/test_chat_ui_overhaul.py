@@ -76,7 +76,7 @@ def test_wheel_listener_is_registered_only_during_scroll_setup():
 def test_chat_history_is_sorted_before_it_is_trimmed():
     save = _section(
         _template(),
-        "    saveCurrentChat(chatId = this.currentChatId",
+        "    saveCurrentChat(",
         "    startRenamingChat(chat)",
     )
 
@@ -84,6 +84,26 @@ def test_chat_history_is_sorted_before_it_is_trimmed():
         "this.chatHistory.slice(0, MAX_CHAT_HISTORY_SIZE)"
     )
     assert "this.saveChatHistory()" in save
+
+
+def test_chat_navigation_preserves_the_previous_chat_timestamp():
+    html = _template()
+    start_new = _section(html, "    async startNewChat()", "    async loadChat(chatId)")
+    load = _section(
+        html,
+        "    async loadChat(chatId)",
+        "    saveCurrentChat(",
+    )
+    save = _section(
+        html,
+        "    saveCurrentChat(",
+        "    startRenamingChat(chat)",
+    )
+
+    assert "{ touchUpdatedAt: false }" in start_new
+    assert "{ touchUpdatedAt: false }" in load
+    assert "options.touchUpdatedAt === false && existingChat?.updatedAt" in save
+    assert "? existingChat.updatedAt" in save
 
 
 def test_new_chat_strings_exist_in_every_locale():
@@ -99,3 +119,39 @@ def test_tailwind_contains_new_chat_ui_utilities():
 
     assert ".max-h-40{" in css
     assert ".z-\\[200\\]{" in css
+
+
+def test_empty_thinking_content_is_not_rendered_or_replayed():
+    html = _template()
+    helper = _section(
+        html,
+        "            hasVisibleThinking(thinking) {",
+        "            snapshotGenerationSettings()",
+    )
+    message_builder = _section(
+        html,
+        "            buildMessagesForApi(messages, systemPrompt, opts = {})",
+        "            buildChatCompletionBody(messages, context, depth)",
+    )
+    renderer = _section(
+        html,
+        "    extractThinking(text) {",
+        "    // Efficiently update streaming DOM",
+    )
+    stream = _section(
+        html,
+        "async streamResponse(streamContext = null, depth = 0)",
+        "stopStreaming()",
+    )
+
+    assert "thinking.trim().length > 0" in helper
+    assert "this.hasVisibleThinking(thinking) ? thinking : null" in helper
+    assert "this.hasVisibleThinking(msg.reasoning_content)" in message_builder
+    assert "this.hasVisibleThinking(msg._thinking)" in message_builder
+    assert "if (content)" in renderer
+    assert "if (!this.hasVisibleThinking(content)) return '';" in renderer
+    assert "if (this.hasVisibleThinking(thinkingContent))" in renderer
+    assert "&& this.hasVisibleThinking(stream.streamingThinking)" in stream
+    assert "reasoning_content: this.hasVisibleThinking(stream.streamingThinking)" in stream
+    assert 'x-if="hasVisibleThinking(msg._thinking)"' in html
+    assert 'x-show="hasVisibleThinking(currentStream()?.streamingThinking)"' in html

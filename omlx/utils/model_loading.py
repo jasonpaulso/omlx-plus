@@ -216,6 +216,9 @@ def maybe_apply_pre_load_patches(
       ``deepseek_v4*`` model_type.
     - Step 3.7 Flash text-only wrapper (PR 1325) when ``config.json``
       declares ``model_type == "step3p7"``.
+    - MiMo V2.5 text backbone (PR 1219) when ``config.json`` declares
+      ``model_type == "mimo_v2"``. The vendored model intentionally ignores
+      the base checkpoint's vision, audio, speech, and MTP weights.
     - Llama 4 attention offset patch when ``config.json`` declares
       ``model_type == "llama4"`` directly or under ``text_config``.
     - GLM-5.2 ``glm_moe_dsa`` patch (mlx-lm PR 1410) when ``config.json``
@@ -260,6 +263,13 @@ def maybe_apply_pre_load_patches(
 
     if apply_m5_gather_qmm_workaround():
         logger.info("M5 sorted gather_qmm reroute installed (issue #2267)")
+
+    # Model-independent: ArraysCache.extract lacks the None-slot guard its
+    # filter/extend/merge siblings have; early-aborted requests on
+    # CacheList(KVCache, ArraysCache) models crash without it.
+    from ..patches.arrays_cache_extract import apply_arrays_cache_extract_guard
+
+    apply_arrays_cache_extract_guard()
 
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
@@ -322,6 +332,12 @@ def maybe_apply_pre_load_patches(
 
         if apply_step3p7_patch():
             logger.info("Step 3.7 pre-load patch applied for %s", model_name)
+
+    if model_type == "mimo_v2":
+        from ..patches.mimo_v2 import apply_mimo_v2_patch
+
+        if apply_mimo_v2_patch():
+            logger.info("MiMo V2.5 text pre-load patch applied for %s", model_name)
 
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured
@@ -388,6 +404,17 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type in ("inkling", "inkling_mm_model"):
+        from ..patches.mlx_vlm_inkling_compat import (
+            apply_mlx_vlm_inkling_compat_patch,
+        )
+
+        if apply_mlx_vlm_inkling_compat_patch():
+            logger.info(
+                "Inkling mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
     # for *sanitize correctness*: stock mlx-lm Model.sanitize triggers a
@@ -430,6 +457,20 @@ def maybe_apply_pre_load_patches(
                 # controller's exploration costs ~10% throughput vs fixed
                 # depth 1 on it.
                 set_mtp_depth(1)
+            elif model_type == "gemma4":
+                # The fused multi-row verify kernel keeps gemma4 global-layer
+                # attention near-flat in L, so depths 4..8 are genuinely
+                # competitive on predictable text (26B code hit 1.89x at d4+
+                # vs 1.53x capped at 3); the controller still settles shallow
+                # on low-accept content.
+                set_mtp_depth(8)
+            elif model_type in ("inkling", "inkling_mm_model"):
+                # The checkpoint ships one MTP block per draft depth; cap
+                # the chain at the shipped depth (8 on Inkling Small).
+                mtp_cfg = config.get("mtp_config") or {}
+                set_mtp_depth(
+                    int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) or 3
+                )
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
@@ -619,6 +660,10 @@ def _has_mtp_heads(config: dict) -> bool:
         return True
     if int(text_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
         return True
+    # Inkling nests the head declaration under a top-level mtp_config.
+    mtp_cfg = config.get("mtp_config") or {}
+    if int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
+        return True
     return False
 
 
@@ -709,9 +754,10 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     """Decide whether the native MTP patch can be applied to this model.
 
     Supports Qwen3.5/3.6 (mlx-lm PR 990), DeepSeek-V4-Flash (Blaizzy/mlx-lm
-    fork PR 15), GLM-5.2 (glm_moe_dsa) and Nemotron-H hybrids (nemotron_h).
-    The model also has to declare MTP heads in the config; otherwise the
-    patch is a no-op.
+    fork PR 15), GLM-5.2 (glm_moe_dsa), Nemotron-H hybrids (nemotron_h) and
+    Gemma 4 merged-assistant checkpoints (gemma4, VLM path only). The model
+    also has to declare MTP heads in the config; otherwise the patch is a
+    no-op.
     """
     if not _has_mtp_heads(config):
         return False
@@ -723,6 +769,8 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
+        or model_type == "gemma4"
+        or model_type in ("inkling", "inkling_mm_model")
     )
 
 

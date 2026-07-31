@@ -39,37 +39,34 @@ def _has_cli_overrides(args) -> bool:
     All argparse defaults are None, so `is not None` means the user
     explicitly passed the flag on the command line.
     """
-    if hasattr(args, "model_dir") and args.model_dir is not None:
+    persisted_fields = (
+        "model_dir",
+        "port",
+        "host",
+        "log_level",
+        "sse_keepalive_mode",
+        "max_concurrent_requests",
+        "embedding_batch_size",
+        "memory_guard",
+        "memory_guard_gb",
+        "paged_ssd_cache_dir",
+        "paged_ssd_cache_max_size",
+        "hot_cache_max_size",
+        "initial_cache_blocks",
+        "mcp_config",
+        "hf_endpoint",
+        "hf_cache_enabled",
+        "ms_endpoint",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "ca_bundle",
+    )
+    if any(getattr(args, field, None) is not None for field in persisted_fields):
         return True
-    if hasattr(args, "port") and args.port is not None:
-        return True
-    if hasattr(args, "host") and args.host is not None:
-        return True
-    if hasattr(args, "log_level") and args.log_level is not None:
-        return True
-    if hasattr(args, "embedding_batch_size") and args.embedding_batch_size is not None:
-        return True
-    if hasattr(args, "memory_guard") and args.memory_guard is not None:
-        return True
-    if hasattr(args, "memory_guard_gb") and args.memory_guard_gb is not None:
-        return True
-    if hasattr(args, "mcp_config") and args.mcp_config is not None:
-        return True
-    if hasattr(args, "hf_endpoint") and args.hf_endpoint is not None:
-        return True
-    if hasattr(args, "hf_cache_enabled") and args.hf_cache_enabled is not None:
-        return True
-    if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
-        return True
-    if hasattr(args, "http_proxy") and args.http_proxy is not None:
-        return True
-    if hasattr(args, "https_proxy") and args.https_proxy is not None:
-        return True
-    if hasattr(args, "no_proxy") and args.no_proxy is not None:
-        return True
-    if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
-        return True
-    return False
+
+    # --no-cache is the only persistable boolean flag with a False default.
+    return bool(getattr(args, "no_cache", False))
 
 
 def serve_command(args):
@@ -178,7 +175,7 @@ def serve_command(args):
     # Save CLI args to settings.json if non-default values provided
     if _has_cli_overrides(args):
         try:
-            settings.save()
+            settings.save_cli_overrides(args)
             print("Saved CLI arguments to settings.json")
         except Exception as e:
             print(f"Warning: Failed to save settings: {e}")
@@ -485,6 +482,39 @@ def launch_command(args, extra_args: list[str] | None = None):
         opus_model = None
         sonnet_model = None
         haiku_model = None
+
+    # Enforce Claude Code's model requirements after all interactive,
+    # automatic, and explicit model paths have resolved. The picker also marks
+    # disabled models, but this central check prevents --model and tier flags
+    # from bypassing the same restriction.
+    if tool_name == "claude":
+        from .integrations.claude import claude_code_model_disabled_reason
+
+        models_to_validate = [
+            ("", model),
+            ("Opus tier ", opus_model),
+            ("Sonnet tier ", sonnet_model),
+            ("Haiku tier ", haiku_model),
+        ]
+        validated_models: set[str] = set()
+        for role, model_id in models_to_validate:
+            if not model_id or model_id in validated_models:
+                continue
+            validated_models.add(model_id)
+            disabled_reason = claude_code_model_disabled_reason(
+                {"id": model_id, **models_status_map.get(model_id, {})}
+            )
+            if disabled_reason:
+                print(
+                    f"Cannot launch {integration.display_name} with "
+                    f"{role}model '{model_id}'."
+                )
+                print(disabled_reason)
+                print(
+                    "Choose a model with at least 48K context or increase its "
+                    "configured max_context_window."
+                )
+                sys.exit(1)
 
     # Resolve model limits from pre-fetched status
     model_info = models_status_map.get(model, {})
