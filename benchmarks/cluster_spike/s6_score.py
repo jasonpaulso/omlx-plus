@@ -61,12 +61,23 @@ SPEEDUP_STEADY_STATE_TOKENS = 256
 
 
 def completion_tokens(rec: dict) -> int:
-    """Prefer server usage; floor via chars/4 -- SSE arrival-count under-counts
-    coalesced/reasoning tokens (see s5_stream_probe.py convention)."""
+    """Server usage is authoritative when present; chars/4 is a FALLBACK for
+    absent usage only (the s5_stream_probe floor guarded against missing
+    usage, not against usage itself). Amended 2026-07-31 BEFORE the speedup
+    cells were run: oMLX streams MiniMax decode as `reasoning_content` and
+    then re-emits the full text as a final `content` block, so
+    text_len + reasoning_len counts the same chars twice (observed
+    text_len == reasoning_len == 694 exactly, usage == arrivals == 128) and
+    max(reported, chars//4) inflated decode rates ~2x. Capacity-gate verdict
+    is invariant under both countings (PASS); dumps predate the amendment and
+    are scored under this corrected rule, with both computations recorded in
+    docs/cluster/s6-measurements.md."""
     usage = rec.get("usage") or {}
     reported = int(usage.get("completion_tokens") or 0)
+    if reported > 0:
+        return reported
     floor = int(rec.get("text_len", 0) or 0) + int(rec.get("reasoning_len", 0) or 0)
-    return max(reported, floor // 4)
+    return floor // 4
 
 
 def live_records(dump: dict) -> list[dict]:

@@ -1,0 +1,2 @@
+ {"id":"chatcmpl-9c5d1896","object":"chat.completion","created":1785523884,"model":"Llama-3.2-1B-Instruct-4bit","choices":[{"index":0,"message":{"role":"assistant","content":"It seems like you're trying to say \"OK\" in different contexts, but"},"finish_reason":"length"}],"usage":{"prompt_tokens":38,"completion_tokens":16,"total_tokens":54,"input_tokens":38,"output_tokens":16,"prompt_tokens_details":{"cached_tokens":0},"total_time":0.09}}
+HTTP 200

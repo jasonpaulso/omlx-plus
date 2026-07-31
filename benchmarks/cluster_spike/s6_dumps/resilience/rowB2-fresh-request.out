@@ -1,0 +1,2 @@
+ {"id":"chatcmpl-a01733bc","object":"chat.completion","created":1785523884,"model":"MiniMax-M2.7-3bit","choices":[{"index":0,"message":{"role":"assistant","content":"The user says \"hi\". It's a conversation. I must respond in a friendly"},"finish_reason":"length"}],"usage":{"prompt_tokens":40,"completion_tokens":16,"total_tokens":56,"input_tokens":40,"output_tokens":16,"prompt_tokens_details":{"cached_tokens":0},"model_load_duration":8.18,"total_time":0.59}}
+HTTP 200
