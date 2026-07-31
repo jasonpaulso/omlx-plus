@@ -13,6 +13,7 @@ import asyncio
 import threading
 import time
 import types
+from dataclasses import replace
 
 import pytest
 
@@ -808,6 +809,188 @@ async def test_stale_dead_rank_heartbeat_does_not_abort_a_reissued_formation(
                 await asyncio.wait_for(load_task, timeout=5.0)
             assert fm._local is None  # the pool's rollback guard ran
         finally:
+            stop.set()
+            await driver
+
+
+# -- S6 D1 AMENDMENT: liveness-scrub member-lost trigger ----------------------
+
+
+def _backdate_liveness(manager, member_id: str) -> None:
+    """Force `manager.scrub()`'s next pass to mark ``member_id`` lost."""
+    live = manager.liveness(member_id)
+    manager._liveness[member_id] = replace(live, last_heartbeat_at=time.time() - 999.0)
+
+
+async def test_serving_formation_degrades_and_tears_down_on_member_lost(tmp_path):
+    """Amendment binding row 1 -- live-rig evidence: killing the worker
+    daemon and its rank together gives D1's original two triggers nothing to
+    see (no dead-rank report -- the reporter died with the rank; no engine
+    EOF -- the head's own rank 0 stayed alive after the mlx ring gave up on
+    the peer). The formation stayed `ready` over a member the head itself
+    had already marked `lost`. The liveness scrub's own transition must
+    independently degrade + tear the formation down."""
+    settings = _head_settings(tmp_path, backend="ring")
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        fm = _formation(manager, spawns)
+        manager._formation = fm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(fm, member, stop, present=True))
+        stub_pool = _RequestUnloadStubPool(fm)
+        set_engine_pool_getter(lambda: stub_pool)
+        try:
+            result = await fm.load("target")
+            assert result["status"] == "ready"
+
+            # No dead-rank report, no engine EOF -- only the scrub noticing
+            # the member has gone silent past `member_timeout_s`.
+            _backdate_liveness(manager, member.id)
+            expired = await manager.scrub()
+            assert expired == [member.id]
+
+            deadline = time.monotonic() + 2.0
+            while (
+                time.monotonic() < deadline and fm.active_engine("target") is not None
+            ):
+                await asyncio.sleep(0.01)
+
+            assert fm.active_engine("target") is None
+            assert stub_pool.calls == ["target"]
+            assert any(job.status == "degraded" for job in fm._jobs)
+            degrade_alarms = [a for a in fm.alarms() if "degraded" in a]
+            assert len(degrade_alarms) == 1
+        finally:
+            set_engine_pool_getter(None)
+            stop.set()
+            await driver
+
+
+async def test_member_lost_kills_an_in_progress_formation_well_inside_the_bound(
+    tmp_path,
+):
+    """Amendment binding row 2 -- a formation blocked in `wait_ready` holds
+    the E6 queue across the whole await (rev3/B1). `scrub()`'s own
+    member-lost detection must never ride that same queue, or a member lost
+    during a stuck load would only be noticed once the load itself resolved
+    (up to `LOAD_TIMEOUT_S`), not bounded by `member_timeout_s` as the
+    amendment promises.
+
+    Mirrors `test_stale_dead_rank_heartbeat_does_not_abort_a_reissued_formation`'s
+    real-wire-path style: drives a REAL `ClusterCommandQueue` and goes
+    through `manager.scrub()` itself, not a `handle_member_lost` shortcut --
+    an implementation that queues the member-lost notification (or the
+    lost-marking that feeds it) fails this test by timing out.
+    """
+    settings = _head_settings(tmp_path, backend="ring")
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        leader = _BlockingLeader()
+        fm = FormationManager(
+            manager,
+            spawn_leader_fn=lambda **kwargs: (spawns.append(kwargs) or leader),
+            engine_factory=lambda **kwargs: FakeEngine(),
+            model_resolver=lambda model_id: "/head/models/target",
+        )
+        manager._formation = fm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(fm, member, stop, present=True))
+        try:
+            load_task = asyncio.create_task(fm.load("target"))
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if fm._local is not None and fm._active_model is None:
+                    break
+                await asyncio.sleep(0.005)
+            assert fm._local is leader, "formation never reached the in-progress state"
+
+            # The E6 queue is now blocked behind `_load` (stuck in
+            # `wait_ready`). A scrub that rides the same queue would hang
+            # here exactly like a queued abort would (rev3/B1).
+            _backdate_liveness(manager, member.id)
+            await asyncio.wait_for(manager.scrub(), timeout=1.0)
+
+            with pytest.raises((RuntimeError, ClusterError)):
+                await asyncio.wait_for(load_task, timeout=5.0)
+
+            assert fm._local is None  # the pool's rollback guard ran
+            assert fm._jobs[-1].status == "failed"
+        finally:
+            stop.set()
+            await driver
+
+
+async def test_member_lost_with_no_formation_is_a_no_op(tmp_path):
+    """Amendment binding row 3: a member the scrub marks `lost` while no
+    formation is active or forming (`_current_member_id` is None) changes
+    nothing -- today's behaviour for a lost member outside a live formation
+    is unaffected."""
+    settings = _head_settings(tmp_path)
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        fm = _formation(manager, spawns)
+        manager._formation = fm
+
+        _backdate_liveness(manager, member.id)
+        expired = await manager.scrub()
+
+        assert expired == [member.id]
+        assert fm._local is None
+        assert fm._active_model is None
+        assert fm.alarms() == []
+
+
+async def test_member_lost_after_dead_rank_already_degraded_is_idempotent(tmp_path):
+    """Amendment binding row 4 -- the rig's second sighting: a dead-rank
+    heartbeat report and the liveness-scrub member-lost trigger can both
+    fire for the same event (an orphaned worker daemon's wedged heartbeats).
+    Once the dead-rank report has already torn the formation down,
+    `_current_member_id` is cleared (`_abort_formation`) -- the scrub's
+    later member-lost notification must be a no-op, not a second
+    teardown/alarm."""
+    settings = _head_settings(tmp_path, backend="ring")
+    async with running_manager(settings) as manager:
+        member = await _activate_member(manager)
+        spawns: list = []
+        fm = _formation(manager, spawns)
+        manager._formation = fm
+
+        stop = asyncio.Event()
+        driver = asyncio.create_task(_drive_worker(fm, member, stop, present=True))
+        stub_pool = _RequestUnloadStubPool(fm)
+        set_engine_pool_getter(lambda: stub_pool)
+        try:
+            result = await fm.load("target")
+            assert result["status"] == "ready"
+
+            fm.handle_dead_rank(member.id, "test: rank 1 process exited")
+
+            deadline = time.monotonic() + 2.0
+            while (
+                time.monotonic() < deadline and fm.active_engine("target") is not None
+            ):
+                await asyncio.sleep(0.01)
+            assert fm.active_engine("target") is None
+            assert stub_pool.calls == ["target"]
+            degrade_alarms_before = [a for a in fm.alarms() if "degraded" in a]
+            assert len(degrade_alarms_before) == 1
+
+            # The SAME member now also goes lost -- the formation this head
+            # already tore down is no longer `_current_member_id`.
+            _backdate_liveness(manager, member.id)
+            await manager.scrub()
+            await asyncio.sleep(0.05)
+
+            assert stub_pool.calls == ["target"]  # not twice
+            degrade_alarms_after = [a for a in fm.alarms() if "degraded" in a]
+            assert degrade_alarms_after == degrade_alarms_before
+        finally:
+            set_engine_pool_getter(None)
             stop.set()
             await driver
 

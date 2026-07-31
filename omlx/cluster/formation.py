@@ -133,6 +133,15 @@ class FormationManager:
         # (killed, torn down, superseded by a fresh load) cannot reach the
         # CURRENT one.
         self._current_job_id: str | None = None
+        # S6 D1 AMENDMENT: the member id hosting ranks in the CURRENT
+        # formation -- set alongside `_current_job_id` (same lifetime: set
+        # in `_form_once`, cleared in `_abort_formation`) so `handle_member_lost`
+        # can tell whether a member the liveness scrub just marked `lost` is
+        # actually part of the live formation (S2: exactly one worker) or an
+        # unrelated/already-departed member, without reaching into
+        # `_active_members()` (which reflects CURRENT liveness, not who this
+        # formation was built with).
+        self._current_member_id: str | None = None
         # S6 D1: model ids currently being auto-torn-down after a dead-rank
         # signal -- a heartbeat report and an engine EOF can both fire for
         # the same model; this makes the teardown idempotent.
@@ -243,6 +252,48 @@ class FormationManager:
                 self._current_job_id,
             )
             return
+        self._kill_or_degrade(member_id, reason)
+
+    def handle_member_lost(self, member_id: str, reason: str) -> None:
+        """S6 D1 AMENDMENT: the liveness scrub's member->``lost`` transition
+        is a third degrade trigger, alongside a dead-rank heartbeat report
+        and an engine EOF.
+
+        Live-rig evidence: killing the worker daemon and its rank together
+        gave neither of the other two triggers anything to see (the
+        reporter died with the rank; the head's own rank 0 stayed alive
+        after the mlx ring gave up on the peer) — the formation stayed
+        ``ready`` over a member the head itself had already marked ``lost``.
+        The liveness scrub already computes ``lost`` head-side, bounded by
+        ``cluster.member_timeout_s`` — this just wires that transition to
+        the SAME reaction `handle_dead_rank` runs.
+
+        Called directly from `ClusterManager.scrub()`'s un-queued
+        lost-marking pass — never from inside a queued op. Same rev3/B1
+        discipline as `handle_dead_rank`: a formation blocked in
+        ``wait_ready`` holds the E6 queue across the whole await, so this
+        must never wait on it either.
+
+        A no-op unless ``member_id`` is hosting ranks in the CURRENT
+        formation (``_current_member_id`` — S2 forms across exactly one
+        worker, set in `_form_once`, cleared in `_abort_formation`): a lost
+        member with no formation at all, or one whose formation this head
+        has already moved past (torn down, superseded), changes nothing.
+        """
+        if member_id != self._current_member_id:
+            return
+        self._kill_or_degrade(member_id, reason)
+
+    def _kill_or_degrade(self, member_id: str, reason: str) -> None:
+        """Shared reaction for both the dead-rank report and member-lost
+        triggers (rev2/D1, amended). Two cases:
+
+        * IN PROGRESS (`_local` set, `_active_model` still None): kills the
+          in-flight `LocalCluster` DIRECTLY (never queued — see
+          `handle_dead_rank`'s docstring for why).
+        * SERVING (`_active_model` set): torn down through the EXISTING S4
+          unload driver, scheduled as a background task.
+        """
         if self._local is not None and self._active_model is None:
             logger.error(
                 "cluster: FORMATION ALARM: dead rank reported by %s (%s) while "
@@ -711,6 +762,11 @@ class FormationManager:
         # job makes across the D7 fallback (`_abort_formation` clears it
         # between attempts; each retry through here re-sets it).
         self._current_job_id = job.id
+        # S6 D1 AMENDMENT: `member` is the single worker this attempt is
+        # forming with (S2) -- recorded so `handle_member_lost` can tell a
+        # scrub-detected loss of THIS member from one about an unrelated or
+        # already-departed member.
+        self._current_member_id = member.id
         ibv = self._ibv_matrix(backend, worker_rdma)
         # Step 3: spawn rank 0 (head child) and wait until it is listening.
         self._local = await self._run_blocking(
@@ -774,6 +830,7 @@ class FormationManager:
         self._active_model = None
         self._active_job = None
         self._current_job_id = None
+        self._current_member_id = None
         if local is not None:
             await self._run_blocking(local.stop)
 

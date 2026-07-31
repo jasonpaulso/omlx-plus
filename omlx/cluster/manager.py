@@ -1309,43 +1309,67 @@ class ClusterManager:
         ones marked lost by this pass. Only ``cluster.lost_member_ttl_s``
         later does a member become a ghost worth revoking (S6 D3) — before
         that, revocation belongs to explicit leave and operator removal.
+
+        S6 D1 AMENDMENT: the lost-marking pass below runs DIRECTLY, never
+        through the E6 queue — like ``record_heartbeat``, it only touches
+        the in-memory liveness maps, not persisted state (module docstring:
+        E6 covers "join, leave, remove, token operations and scrub expiry",
+        not liveness). A formation blocked in ``wait_ready`` holds the E6
+        queue across the whole await (rev3/B1); if lost-marking were queued
+        behind it, a member lost during that window would never be detected
+        until the load itself resolved, defeating the bound
+        ``member_timeout_s`` is meant to give this trigger. Each newly-lost
+        member is reported to the formation manager synchronously, same
+        discipline as ``handle_dead_rank``.
+
+        Only the TTL prune/revoke still goes through the queue — unlike
+        lost-marking it mutates persisted state and must stay serialized
+        against ``join``/``remove_member`` (S6 D3, untouched) — and only
+        when there is actually something to prune, so a scrub tick with
+        nothing to expire never blocks behind an unrelated queued op either.
         """
+        now = time.time()
+        timeout = float(self.settings.member_timeout_s)
+        expired: list[str] = []
+        for member in self._state.members:
+            live = self._liveness.get(member.id)
+            if live is None or live.status != "active":
+                continue
+            if now - live.last_heartbeat_at > timeout:
+                self._liveness[member.id] = replace(live, status="lost")
+                self._lost_since[member.id] = now
+                expired.append(member.id)
+                logger.warning(
+                    "Cluster member timed out: id=%s endpoint=%s",
+                    member.id,
+                    member.endpoint,
+                )
+        if self._formation is not None:
+            for member_id in expired:
+                self._formation.handle_member_lost(
+                    member_id, f"member {member_id} timed out (lost)"
+                )
+        if self._doomed_lost_members(now):
 
-        async def _apply() -> list[str]:
-            now = time.time()
-            timeout = float(self.settings.member_timeout_s)
-            expired: list[str] = []
-            for member in self._state.members:
-                live = self._liveness.get(member.id)
-                if live is None or live.status != "active":
-                    continue
-                if now - live.last_heartbeat_at > timeout:
-                    self._liveness[member.id] = replace(live, status="lost")
-                    self._lost_since[member.id] = now
-                    expired.append(member.id)
-                    logger.warning(
-                        "Cluster member timed out: id=%s endpoint=%s",
-                        member.id,
-                        member.endpoint,
-                    )
-            self._expire_lost_members(now)
-            return expired
+            async def _expire() -> None:
+                self._expire_lost_members(now)
 
-        return await self._queue.submit("scrub", _apply)
+            await self._queue.submit("scrub_expire", _expire)
+        return expired
 
-    def _expire_lost_members(self, now: float) -> None:
-        """Prune members lost longer than the TTL and revoke them (S6 D3).
+    def _doomed_lost_members(self, now: float) -> list[tuple[Member, float]]:
+        """Members past ``cluster.lost_member_ttl_s`` since they went lost.
 
-        Runs inside :meth:`scrub`'s queued op, so it never races a join.
-        Untouched: anything active, anything whose loss is still inside the
-        TTL, and anything with no ``lost_since`` at all. The defensive
-        non-positive check matters because ``ClusterSettings`` is a plain
-        mutable dataclass — a zero written straight onto the instance must
-        not revoke every lost member on the next pass.
+        Pure read, shared by :meth:`scrub` (to decide whether the queued
+        expiry pass is worth submitting at all) and :meth:`_expire_lost_members`
+        itself. The defensive non-positive check matters because
+        ``ClusterSettings`` is a plain mutable dataclass — a zero written
+        straight onto the instance must not revoke every lost member on the
+        next pass.
         """
         ttl = float(self.settings.lost_member_ttl_s)
         if ttl <= 0:
-            return
+            return []
         doomed: list[tuple[Member, float]] = []
         for member in self._state.members:
             since = self._lost_since.get(member.id)
@@ -1357,8 +1381,19 @@ class ClusterManager:
             age = now - since
             if age > ttl:
                 doomed.append((member, age))
+        return doomed
+
+    def _expire_lost_members(self, now: float) -> None:
+        """Prune members lost longer than the TTL and revoke them (S6 D3).
+
+        Runs inside :meth:`scrub`'s queued expiry op, so it never races a
+        join. Untouched: anything active, anything whose loss is still
+        inside the TTL, and anything with no ``lost_since`` at all.
+        """
+        doomed = self._doomed_lost_members(now)
         if not doomed:
             return
+        ttl = float(self.settings.lost_member_ttl_s)
         doomed_ids = {member.id for member, _ in doomed}
         digests = dict(self._state.member_digests)
         for member_id in doomed_ids:
