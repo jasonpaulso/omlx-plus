@@ -157,6 +157,20 @@ Best distributed 26.88 vs best single 18.67 = **1.439× ≥ 1.3×** → PASS. Ev
 record hit the 256-token steady-state floor. (Ring distributed cells not needed — the gate
 passed on jaccl; ring remains available headroom.)
 
+## Verification (spec acceptance row 7)
+
+A fresh-context verifier independently confirmed (2026-07-31): the four route-guard /
+preview tests fail behaviorally on pre-fix source in an isolated worktree (200-vs-400 on
+all three routes; preview `reject`+ineligible) with import-resolution proven (worktree's
+own `omlx` loaded, new symbols absent) and pass 20/20 at tip; the committed dumps
+recompute to both PASS verdicts via the pinned scorer; scoped gate 807 reproduced
+first-try. Two extra probes: the counting amendment is NOT load-bearing (capacity passes
+at 178.3 inflated / 66.7 corrected; speedup 1.448× / 1.439×), and the two excluded
+bare-id single-node dumps would have given a HIGHER ratio (1.527×) — the committed
+pairing uses the harder baseline. Named residual: `s6_score.py --selftest` never
+exercises the no-usage fallback branch of the amended counting rule (every synthetic
+record carries usage), so the selftest proves gate falsifiability, not that fallback.
+
 ## Defects found by this run (both fixed on this branch, after the cells)
 
 1. **Preview ignored the opt-in** — `GET /v1/cluster/placement` called `plan_placement`
