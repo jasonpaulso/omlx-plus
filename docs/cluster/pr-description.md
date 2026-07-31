@@ -74,13 +74,11 @@ run) with a pinned, falsifiable scorer committed alongside the measurement doc:
   interplay — scored by `s4_score.py`, selftested against five must-fail shapes first.
 - `docs/cluster/s5-measurements.md` — S5: model transfer (peer + HF fan-out), mid-transfer
   kill + file-granular resume, digest-mismatch re-fetch — scored by `s5_score.py`.
-- `docs/cluster/s6-measurements.md` — S6: resilience matrix (rank kill, worker-daemon kill,
-  head restart, rejoin) and the two acceptance anchors (capacity, speedup). **Not written as
-  of this draft** — S6 P1's code (rank-death propagation, backoff, rejoin dedup/expiry,
-  `language_model_only` eligibility) is landed and unit/integration-tested, but the live-rig
-  proof and the anchor measurements are a separate, not-yet-executed step. This PR
-  description will be revised once that doc lands; do not merge on this draft's claims
-  alone for the S6 rows.
+- `docs/cluster/s6-measurements.md` — S6: resilience matrix (rank kill, worker-daemon kill
+  mid-flood, head restart, rejoin dedup/supersede — 5/5 PASS on the live pair) and the two
+  acceptance anchors, both PASS (capacity: best cell 66.7 tok/s ≥ 43, jaccl batch-4;
+  speedup: 1.439× ≥ 1.3×), scored by `s6_score.py` over committed raw dumps and
+  independently re-confirmed by a fresh-context verification pass.
 
 ## Honest residuals (recorded, not fixed in this PR)
 
@@ -109,6 +107,15 @@ run) with a pinned, falsifiable scorer committed alongside the measurement doc:
   `/v1/messages`, `/v1/responses`) — never silently served as text. Proper multimodal
   distribution (vision tower head-resident, text decoder sharded) is deferred to a
   future version by explicit decision.
+- **Models with fewer KV heads than the world size cannot distribute** — the divisibility
+  gate follows mlx-lm's tensor-parallel sharding, which splits KV heads across ranks.
+  MQA/MLA-family checkpoints (e.g. DeepSeek V4's single latent KV head,
+  `num_key_value_heads: 1`) are therefore refused with a named reason, even when memory
+  would otherwise allow it. The standard remedy — replicate the KV projection on every
+  rank and shard only the query heads — is a recorded follow-on, not implemented here.
+  Relatedly, v1's equal-share TP means the weakest node's ceiling caps the largest
+  distributable model (the head's surplus memory is unused); memory-weighted unequal
+  sharding is out of scope for v1.
 
 ## Tests
 
