@@ -1,9 +1,11 @@
 # PR description draft — Distributed Serving (cluster v1)
 
-**Status: DRAFT.** Not opened, not pushed anywhere. This text is prepared ahead of the
-`cluster-v1-pr` branch cut (branch cut happens after S6 P1c lands and the live-rig
-acceptance in `docs/cluster/s6-measurements.md` is written — neither has happened yet as
-of this draft). Written from branch `feat/cluster-v1` at `00e44cd0`.
+**Status: READY (not opened, not pushed).** Live-rig acceptance is complete —
+`docs/cluster/s6-measurements.md` records the full resilience matrix (5/5 PASS) and both
+D4 anchors passing (capacity best cell 66.7 tok/s ≥ 43; speedup 1.439× ≥ 1.3×). Updated
+from branch `feat/cluster-v1` at `37f3c38f`; the `cluster-v1-pr` branch is cut from that
+tip with the fork-only exclusions below. Opening the PR / pushing anywhere remains a
+user decision.
 
 ---
 
@@ -94,17 +96,19 @@ run) with a pinned, falsifiable scorer committed alongside the measurement doc:
 - **HF-watchdog cancel vs `to_thread(snapshot_download)` staging race**: staging can in
   principle be removed under a still-writing background thread; the orphan sweep is the
   backstop, not a fix.
-- **Most local model inventory classifies as VLM and stays refused for distributed
-  placement** (multimodal checkpoints, by design — distributing a vision-language model
-  text-only would silently drop served capability). Eligibility trusts the checkpoint's own
-  declared `language_model_only: true` config flag; it does **not** cross-check that flag
-  against the actual weight file list. A checkpoint that mislabels itself
-  `language_model_only: true` while still shipping vision-tower weights would be wrongly
-  accepted for text-only distribution — recorded here as a real gap, not closed by this PR.
-  (`mlx-community/Qwen3.6-27B-bf16`, the originally intended speedup-anchor model, was found
-  during S6 to declare `language_model_only: false` with 333 live `vision_tower.*` weights,
-  so it is correctly refused today — but that correctness is incidental to the config being
-  honest, not to any weight inspection.)
+- **Multimodal checkpoints stay refused for distributed placement by default** —
+  distributing a vision-language model text-only would silently drop served capability.
+  Eligibility does NOT trust the declared `language_model_only` flag alone: it
+  cross-checks the checkpoint's own safetensors index for real vision-tower weights
+  (`has_vision_tower_weights()`, prefix set derived from mlx_vlm's source), so a
+  mislabeled checkpoint is refused with the real reason named. An explicit
+  `cluster.allow_text_only_distribution` opt-in (default OFF) permits text-only
+  distribution of any vlm-classified checkpoint; image/audio-bearing requests against a
+  model distributed that way are rejected with a clean named 400
+  (`cluster_non_goal`) at the route layer — on all three API surfaces (chat completions,
+  `/v1/messages`, `/v1/responses`) — never silently served as text. Proper multimodal
+  distribution (vision tower head-resident, text decoder sharded) is deferred to a
+  future version by explicit decision.
 
 ## Tests
 
@@ -116,8 +120,10 @@ run) with a pinned, falsifiable scorer committed alongside the measurement doc:
   scorer scripts per slice (`s3_compute.py`, `s3_tax.py`, `s4_score.py`, `s5_score.py`,
   `s6_score.py`), each with a `--selftest` proving the gate can actually fail before it is
   trusted to pass. `s6_anchors.py` + `s6_score.py` are the S6 acceptance-anchor harness
-  (capacity: MiniMax-M2.7-3bit distributed, best of ring/jaccl x batch1/batch4 >= 43 tok/s;
-  speedup: a to-be-selected dense model, distributed best >= 1.3x single-node best).
+  (capacity: MiniMax-M2.7-3bit distributed, best of ring/jaccl x batch1/batch4 >= 43 tok/s
+  — measured best 66.7 tok/s, jaccl batch-4, PASS; speedup: Qwen3.6-27B-bf16 under
+  `cluster.allow_text_only_distribution`, distributed best >= 1.3x single-node best —
+  measured 1.439x, PASS; full tables in `docs/cluster/s6-measurements.md`).
 - Linters: `black`, `ruff`, `mypy omlx` (the latter does not cover `benchmarks/`).
 
 ## Upstream drift (facts only, as of this draft)
