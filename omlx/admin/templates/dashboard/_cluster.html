@@ -288,11 +288,17 @@
             },
             async loadModelIds() {
                 // The head's own discovered models (S4 D6 model picker).
+                // /admin/api/models returns {"models": [...]}, not a bare
+                // array -- .map on the dict threw and the catch below ate it,
+                // leaving the picker permanently empty.
                 try {
                     const resp = await fetch('/admin/api/models');
                     if (!resp.ok) return;
-                    const models = await resp.json();
-                    this.modelIds = (models || []).map((m) => m.id).sort();
+                    const body = await resp.json();
+                    const models = Array.isArray(body)
+                        ? body
+                        : (body && body.models) || [];
+                    this.modelIds = models.map((m) => m.id).sort();
                 } catch (e) {
                     // Best-effort: the picker just stays empty.
                 }
